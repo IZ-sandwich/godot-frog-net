@@ -6,7 +6,7 @@ C# Godot Addon that facilitates creating robust multiplayer games using the Clie
 ---
 
 > [!WARNING]
-> VERY IMPORTANT! MonkeNet uses its [own fork of Godot!!!](https://github.com/grazianobolla/godot-monke) for networked physics!!! Right now due to current limitations on Godot Physics and the Jolt module it is almost impossible to step the physics world manually. I had to expose some internal Jolt methods that allow to do exactly that. Compile the `godot-monke` fork with C# bindings! It is a very simple and easy process, if you have any trouble join the discord channel and I'll help you out! The Godot-Monke fork will always aim at the latest stable release (currently Godot 4.4!), so everything will be the same as the official build for that version.
+> VERY IMPORTANT! Right now MonkeNet uses its [own fork of Godot!!!](https://github.com/grazianobolla/godot) for networked physics!!! Due to current limitations on Godot Physics and the Jolt module it is impossible to step the physics world manually in vanilla Godot. In order to do this you have to build Godot including this PR. [Add PhysicsServer2/3D::space_step() to step physics simulation manually](https://github.com/godotengine/godot/pull/76462) It is a very simple and easy process, if you have any trouble join the discord channel and I'll help you out!
 
 ## 📚 Background
 After many years since my first attempt at making a functional multiplayer game, I came to one conclusion: developing multiplayer games is hard, specially when leaving the P2P architecture and opting for a more "competitive" approach like having an authoritative server. This project aims to provide a starting point that can be used to speed up the time it takes to go from idea to reality, utilizing its features like:

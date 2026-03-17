@@ -101,8 +101,8 @@ public partial class PredictionManager : InternalClientComponent
 				predictableEntity.ResimulateTick(remainingInput.Input);
 			}
 
-			JoltPhysicsServer3D.GetSingleton().SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
-			JoltPhysicsServer3D.GetSingleton().SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
+			PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
+			PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
 
 			foreach (IPredictableEntity predictableEntity in remainingInput.Entities.Keys)
 			{

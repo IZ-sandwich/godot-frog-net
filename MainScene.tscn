@@ -1,4 +1,4 @@
-[gd_scene load_steps=8 format=3 uid="uid://rauc3mu03xvj"]
+[gd_scene format=3 uid="uid://rauc3mu03xvj"]
 
 [ext_resource type="Script" uid="uid://b26awixuhuq6l" path="res://demo/MainScene.cs" id="1_a3xwa"]
 [ext_resource type="Script" uid="uid://dh3ajfu6hll6t" path="res://addons/monke-net/src/Shared/MonkeNetManager/MonkeNetConfig.cs" id="2_3laxn"]
@@ -12,14 +12,14 @@ albedo_color = Color(0.101961, 0.101961, 0.101961, 1)
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_obp5r"]
 albedo_color = Color(0.344328, 1, 0.126361, 1)
 
-[node name="MainScene" type="Node3D"]
+[node name="MainScene" type="Node3D" unique_id=27712328]
 script = ExtResource("1_a3xwa")
 
-[node name="MonkeNetConfig" type="Node" parent="." node_paths=PackedStringArray("EntitySpawner")]
+[node name="MonkeNetConfig" type="Node" parent="." unique_id=171810071 node_paths=PackedStringArray("EntitySpawner")]
 script = ExtResource("2_3laxn")
 EntitySpawner = NodePath("../EntitySpawner")
 
-[node name="Menu" type="Control" parent="."]
+[node name="Menu" type="Control" parent="." unique_id=796659374]
 layout_mode = 3
 anchors_preset = 15
 anchor_right = 1.0
@@ -27,80 +27,80 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 
-[node name="SpawnButton" type="Button" parent="Menu"]
+[node name="SpawnButton" type="Button" parent="Menu" unique_id=81406506]
 layout_mode = 0
 offset_left = 456.0
 offset_right = 602.0
 offset_bottom = 31.0
 text = "Spawn Player"
 
-[node name="HostButton" type="Button" parent="Menu"]
+[node name="HostButton" type="Button" parent="Menu" unique_id=2000725900]
 layout_mode = 0
 offset_right = 152.0
 offset_bottom = 31.0
 text = "Host Server"
 
-[node name="ConnectButton" type="Button" parent="Menu"]
+[node name="ConnectButton" type="Button" parent="Menu" unique_id=127255530]
 layout_mode = 0
 offset_top = 32.0
 offset_right = 152.0
 offset_bottom = 63.0
 text = "Connect to Server"
 
-[node name="Map" type="Node" parent="."]
+[node name="Map" type="Node" parent="." unique_id=719413025]
 
-[node name="Floor" type="CSGBox3D" parent="Map"]
+[node name="Floor" type="CSGBox3D" parent="Map" unique_id=961545461]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -2.5, 0)
 use_collision = true
 size = Vector3(30, 1, 30)
 material = SubResource("StandardMaterial3D_lcinv")
 
-[node name="Wall1" type="CSGBox3D" parent="Map"]
+[node name="Wall1" type="CSGBox3D" parent="Map" unique_id=1607275291]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -9.5, -1, 0)
 use_collision = true
 size = Vector3(2, 2, 12)
 material = ExtResource("2_kwgue")
 
-[node name="Wall2" type="CSGBox3D" parent="Map"]
+[node name="Wall2" type="CSGBox3D" parent="Map" unique_id=1891960389]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -7.5, -1, -1)
 use_collision = true
 size = Vector3(2, 2, 2)
 material = ExtResource("2_kwgue")
 
-[node name="DirectionalLight3D" type="DirectionalLight3D" parent="Map"]
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="Map" unique_id=1298610788]
 transform = Transform3D(0.686106, 0.361498, -0.63133, 0.109382, 0.806681, 0.580776, 0.719232, -0.46753, 0.513927, 0, 8, 10)
 shadow_enabled = true
 directional_shadow_mode = 0
 
-[node name="Ramp1" type="CSGPolygon3D" parent="Map"]
+[node name="Ramp1" type="CSGPolygon3D" parent="Map" unique_id=111048860]
 transform = Transform3D(1.31134e-07, 0, 1, 0, 1, 0, -1, 0, 1.31134e-07, -8.5, -1, -6)
 use_collision = true
 polygon = PackedVector2Array(0, -1, 0, 1, 4, -1, 3, -1)
 depth = 2.0
 material = ExtResource("2_kwgue")
 
-[node name="Ramp2" type="CSGPolygon3D" parent="Map"]
+[node name="Ramp2" type="CSGPolygon3D" parent="Map" unique_id=1954690372]
 transform = Transform3D(1, 0, -1.74845e-07, 0, 1, 0, 1.74845e-07, 0, 1, -6.5, -1, 0)
 use_collision = true
 polygon = PackedVector2Array(0, -1, 0, 1, 4, -1, 3, -1)
 depth = 2.0
 material = ExtResource("2_kwgue")
 
-[node name="WorldEnvironment" type="WorldEnvironment" parent="Map"]
+[node name="WorldEnvironment" type="WorldEnvironment" parent="Map" unique_id=1998058048]
 environment = ExtResource("4_4tv7j")
 
-[node name="MenuCamera" type="Camera3D" parent="Map"]
+[node name="MenuCamera" type="Camera3D" parent="Map" unique_id=1253539839]
 transform = Transform3D(1, 0, 0, 0, -4.37114e-08, 1, 0, -1, -4.37114e-08, 0, 5, 0)
 projection = 1
 size = 30.0
 
-[node name="CSGCylinder3D" type="CSGCylinder3D" parent="Map"]
+[node name="CSGCylinder3D" type="CSGCylinder3D" parent="Map" unique_id=240737546]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -7.5, -1, -4)
 use_collision = true
 radius = 1.0
 material = SubResource("StandardMaterial3D_obp5r")
 
-[node name="EntitySpawner" type="Node" parent="."]
+[node name="EntitySpawner" type="Node" parent="." unique_id=1375437158]
 script = ExtResource("4_7cfa4")
 
 [connection signal="pressed" from="Menu/SpawnButton" to="." method="OnSpawnButtonPressed"]

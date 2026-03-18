@@ -6,6 +6,10 @@
 [ext_resource type="Environment" uid="uid://c5xw5iwomn8qo" path="res://demo/map/DefaultEnvironment.tres" id="4_4tv7j"]
 [ext_resource type="Script" uid="uid://b71f06wr0o6iq" path="res://demo/GameEntitySpawner.cs" id="4_7cfa4"]
 
+[sub_resource type="SphereMesh" id="SphereMesh_rf2cd"]
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_a814b"]
+
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_lcinv"]
 albedo_color = Color(0.101961, 0.101961, 0.101961, 1)
 
@@ -48,6 +52,15 @@ offset_bottom = 63.0
 text = "Connect to Server"
 
 [node name="Map" type="Node" parent="." unique_id=719413025]
+
+[node name="RigidBody3D" type="RigidBody3D" parent="Map" unique_id=203137625]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -6.424172, 1.3222408, -1.0746036)
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="Map/RigidBody3D" unique_id=135477484]
+mesh = SubResource("SphereMesh_rf2cd")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Map/RigidBody3D" unique_id=272457805]
+shape = SubResource("SphereShape3D_a814b")
 
 [node name="Floor" type="CSGBox3D" parent="Map" unique_id=961545461]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -2.5, 0)

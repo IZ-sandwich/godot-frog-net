@@ -2,6 +2,7 @@ using Godot;
 using ImGuiNET;
 using MonkeNet.NetworkMessages;
 using MonkeNet.Serializer;
+using MonkeNet.Shared;
 using System.Collections.Generic;
 
 namespace MonkeNet.Server;

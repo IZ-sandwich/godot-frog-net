@@ -1,14 +1,13 @@
 using Godot;
 using MonkeNet.Client;
-using MonkeNet.Shared;
 
-namespace MonkeNet;
+namespace MonkeNet.Shared;
 
 /// <summary>
 /// Main MonkeNet configuration singleton.
 /// </summary>
 [GlobalClass, Icon("res://addons/monke-net/resources/circle_nodes_solid.png")]
-public partial class MonkeNetConfig : Node
+public partial class MonkeNetConfig : MonkeNetNode
 {
     public static MonkeNetConfig Instance { get; set; } = null;
 

@@ -1,8 +1,8 @@
 [gd_scene format=3 uid="uid://rauc3mu03xvj"]
 
 [ext_resource type="Script" uid="uid://b26awixuhuq6l" path="res://demo/MainScene.cs" id="1_a3xwa"]
-[ext_resource type="Script" uid="uid://dh3ajfu6hll6t" path="res://addons/monke-net/src/Shared/MonkeNetManager/MonkeNetConfig.cs" id="2_3laxn"]
 [ext_resource type="Material" uid="uid://bqguau4l77phy" path="res://demo/map/Obstacles1.tres" id="2_kwgue"]
+[ext_resource type="Script" uid="uid://dnkbivw2aixxo" path="res://addons/monke-net/src/Shared/Nodes/MonkeNetConfig.cs" id="2_rf2cd"]
 [ext_resource type="Environment" uid="uid://c5xw5iwomn8qo" path="res://demo/map/DefaultEnvironment.tres" id="4_4tv7j"]
 [ext_resource type="Script" uid="uid://b71f06wr0o6iq" path="res://demo/GameEntitySpawner.cs" id="4_7cfa4"]
 
@@ -19,9 +19,10 @@ albedo_color = Color(0.344328, 1, 0.126361, 1)
 [node name="MainScene" type="Node3D" unique_id=27712328]
 script = ExtResource("1_a3xwa")
 
-[node name="MonkeNetConfig" type="Node" parent="." unique_id=171810071 node_paths=PackedStringArray("EntitySpawner")]
-script = ExtResource("2_3laxn")
+[node name="MonkeNetConfig" type="Node" parent="." unique_id=1801734743 node_paths=PackedStringArray("EntitySpawner")]
+script = ExtResource("2_rf2cd")
 EntitySpawner = NodePath("../EntitySpawner")
+metadata/_custom_type_script = "uid://dnkbivw2aixxo"
 
 [node name="Menu" type="Control" parent="." unique_id=796659374]
 layout_mode = 3

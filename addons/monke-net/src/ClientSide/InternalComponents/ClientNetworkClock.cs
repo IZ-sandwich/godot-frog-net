@@ -53,7 +53,7 @@ public partial class ClientNetworkClock : InternalClientComponent
         _lastOffset = 0;
     }
 
-    public int GetCurrentRemoteTick()
+    public int GetCurrentTick()
     {
         return _currentTick + _averageLatencyInTicks + _jitterInTicks + _fixedTickMargin;
     }
@@ -87,7 +87,7 @@ public partial class ClientNetworkClock : InternalClientComponent
             _jitterInTicks = _latencyValues[^1] - _latencyValues[0];
             _averageLatencyInTicks = SmoothAverage(_latencyValues, _minLatencyInTicks);
 
-            EmitSignal(SignalName.LatencyCalculated, GetCurrentRemoteTick(), _averageLatencyInTicks, _jitterInTicks);
+            EmitSignal(SignalName.LatencyCalculated, GetCurrentTick(), _averageLatencyInTicks, _jitterInTicks);
 
             _offsetValues.Clear();
             _latencyValues.Clear();
@@ -148,7 +148,7 @@ public partial class ClientNetworkClock : InternalClientComponent
     {
         if (ImGui.CollapsingHeader("Network Clock"))
         {
-            ImGui.Text($"Synced Tick {GetCurrentRemoteTick()}");
+            ImGui.Text($"Synced Tick {GetCurrentTick()}");
             ImGui.Text($"Immediate Latency {_immediateLatencyMsec}ms");
             ImGui.Text($"Average Latency {_averageLatencyInTicks} ticks");
             ImGui.Text($"Latency Jitter {_jitterInTicks} ticks");

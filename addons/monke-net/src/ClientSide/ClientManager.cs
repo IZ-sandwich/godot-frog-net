@@ -56,16 +56,16 @@ public partial class ClientManager : Node
     {
         // Advance Clock
         _clock.ProcessTick();
-        int currentRemoteTick = _clock.GetCurrentRemoteTick();
+        int currentTick = _clock.GetCurrentTick();
 
-        var input = _inputManager.GenerateAndTransmitInputs(currentRemoteTick);         // Read and send produced input to the server
-        EntitiesCallProcessTick(currentRemoteTick, input);                 // Call OnProcessTick on all entities, pass current input so they can simulate
-        EmitSignal(SignalName.ClientTick, currentRemoteTick);
+        var input = _inputManager.GenerateAndTransmitInputs(currentTick);         // Read and send produced input to the server
+        EntitiesCallProcessTick(currentTick, input);                 // Call OnProcessTick on all entities, pass current input so they can simulate
+        EmitSignal(SignalName.ClientTick, currentTick);
 
         PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
         PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
 
-        _PredictionManager.RegisterPrediction(currentRemoteTick, input);               // Register all local predictions
+        _PredictionManager.RegisterPrediction(currentTick, input);               // Register all local predictions
     }
 
     // Calls OnProcessTick on all entities

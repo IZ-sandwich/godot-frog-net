@@ -23,7 +23,7 @@ public partial class MonkeNetManager : Node
     public override void _Ready()
     {
         if (MonkeNetConfig.Instance == null)
-            throw new MonkeNetException("Missing MonkeNetConfig instance!");
+            throw new MonkeNetException("Missing MonkeNet configuration node! Please add the MonkeNetConfig node to your main scene.");
 
         _networkManager = GetNode<INetworkManager>("NetworkManagerEnet");
         EntitySpawner = GetNode<EntitySpawner>("EntitySpawner");

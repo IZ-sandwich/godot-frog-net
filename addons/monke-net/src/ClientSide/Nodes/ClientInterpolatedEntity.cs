@@ -12,7 +12,8 @@ public partial class ClientInterpolatedEntity : MonkeNetNode
 
     public override void _Ready()
     {
-        NetworkBehaviour = GetComponent<NetworkBehaviour>() ?? throw new MonkeNetException($"Could not find {typeof(NetworkBehaviour).Name}!");
+        NetworkBehaviour = GetComponent<NetworkBehaviour>()
+            ?? throw new MonkeNetException($"Could not find {typeof(NetworkBehaviour).Name}!");
     }
 
 }

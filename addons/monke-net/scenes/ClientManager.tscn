@@ -1,11 +1,11 @@
-[gd_scene load_steps=8 format=3 uid="uid://eykxehuqerja"]
+[gd_scene format=3 uid="uid://eykxehuqerja"]
 
 [ext_resource type="Script" uid="uid://casrvfpellwtf" path="res://addons/monke-net/src/ClientSide/ClientManager.cs" id="1_nwfjc"]
 [ext_resource type="Script" uid="uid://b1sc6i887bw7n" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientNetworkClock.cs" id="2_d4j3l"]
-[ext_resource type="Script" uid="uid://b1lgrqxl3f36l" path="res://addons/monke-net/src/ClientSide/InternalComponents/SnapshotInterpolator.cs" id="3_uqx2a"]
+[ext_resource type="Script" uid="uid://b1lgrqxl3f36l" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientSnapshotInterpolator.cs" id="3_uqx2a"]
 [ext_resource type="Script" uid="uid://cxj2orx36voh3" path="res://addons/monke-net/src/Shared/Network/NetworkDebug.cs" id="4_qtu4m"]
 [ext_resource type="Script" uid="uid://bv5seqcb7v4du" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientEntityManager.cs" id="5_likij"]
-[ext_resource type="Script" uid="uid://c4cxooque8n8p" path="res://addons/monke-net/src/ClientSide/InternalComponents/PredictionManager.cs" id="6_tbs0l"]
+[ext_resource type="Script" uid="uid://c4cxooque8n8p" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientPredictionManager.cs" id="6_tbs0l"]
 [ext_resource type="Script" uid="uid://dccenqrwxd8np" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientInputManager.cs" id="7_geb5y"]
 
 [node name="ClientManager" type="Node"]

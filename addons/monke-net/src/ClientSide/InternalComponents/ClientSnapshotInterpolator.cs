@@ -11,7 +11,7 @@ namespace MonkeNet.Client;
 /// Receives and presents the Player the snapshots emmited by the server
 /// </summary>
 [GlobalClass]
-public partial class SnapshotInterpolator : InternalClientComponent
+public partial class ClientSnapshotInterpolator : InternalClientComponent
 {
     [Export] private int _minBufferTime = 2;
 

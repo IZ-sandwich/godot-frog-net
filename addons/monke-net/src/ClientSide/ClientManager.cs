@@ -22,12 +22,12 @@ public partial class ClientManager : Node
     public static ClientManager Instance { get; private set; }
 
     private INetworkManager _networkManager;
-    private SnapshotInterpolator _snapshotInterpolator;
+    private ClientSnapshotInterpolator _snapshotInterpolator;
     private ClientNetworkClock _clock;
     private NetworkDebug _networkDebug;
     private ClientEntityManager _entityManager;
     private ClientInputManager _inputManager;
-    private PredictionManager _PredictionManager;
+    private ClientPredictionManager _PredictionManager;
 
     private bool _networkReady = false;
 
@@ -40,10 +40,10 @@ public partial class ClientManager : Node
     {
         _networkDebug = GetNode<NetworkDebug>("NetworkDebug");
         _clock = GetNode<ClientNetworkClock>("ClientNetworkClock");
-        _snapshotInterpolator = GetNode<SnapshotInterpolator>("SnapshotInterpolator");
+        _snapshotInterpolator = GetNode<ClientSnapshotInterpolator>("SnapshotInterpolator");
         _entityManager = GetNode<ClientEntityManager>("ClientEntityManager");
         _inputManager = GetNode<ClientInputManager>("ClientInputManager");
-        _PredictionManager = GetNode<PredictionManager>("PredictionManager");
+        _PredictionManager = GetNode<ClientPredictionManager>("PredictionManager");
     }
 
     public override void _Process(double delta)

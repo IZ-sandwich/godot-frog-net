@@ -11,7 +11,7 @@ namespace MonkeNet.Client;
 /// Stores predicted game states for entities, upon receiving an snapshot, will check for deviation and perform rollback and re-simulation if needed.
 /// </summary>
 [GlobalClass]
-public partial class PredictionManager : InternalClientComponent
+public partial class ClientPredictionManager : InternalClientComponent
 {
     private readonly List<PredictedState> _predictedStates = [];
     private int _lastTickReceived = 0;

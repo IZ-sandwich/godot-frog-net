@@ -26,7 +26,7 @@ public partial class LocalPlayerPrediction : ClientPredictedEntity
     }
 
     // Check if we have misspredicted
-    public override bool HasMisspredicted(IEntityStateData receivedState, Vector3 savedPosition)
+    public override bool HasMisspredicted(int tick, IEntityStateData receivedState, Vector3 savedPosition)
     {
         EntityStateMessage state = (EntityStateMessage)receivedState;
         return (state.Position - savedPosition).LengthSquared() > _maxDeviationAllowedSquared;

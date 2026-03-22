@@ -74,7 +74,7 @@ public partial class ClientPredictionManager : InternalClientComponent
             var predictedState = predictedStateData.Entities[predictableEntity];
             var authoritativeState = FindStateForEntityId(predictableEntity.NetworkBehaviour.EntityId, receivedSnapshot.States);
 
-            if (predictableEntity.HasMisspredicted(authoritativeState, predictedState))
+            if (predictableEntity.HasMisspredicted(receivedSnapshot.Tick, authoritativeState, predictedState))
             {
                 _misspredictionsCount++;
                 RollbackAndResimulate(receivedSnapshot.States, predictedStateData);

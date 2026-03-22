@@ -13,6 +13,8 @@ public partial class ServerInputReceiver : InternalServerComponent
     private readonly Dictionary<int, Dictionary<IServerSyncedEntity, IPackableElement>> _pendingInputs = [];
     private readonly Dictionary<IServerSyncedEntity, IPackableElement> _lastInputStored = []; // Used for re-running old inputs in case no new inputs are received
 
+    private int _missedInput = 0;
+
     public IPackableElement GetInputForEntityTick(IServerSyncedEntity serverEntity, int tick)
     {
         // TODO: use something else, not try/catch
@@ -24,6 +26,8 @@ public partial class ServerInputReceiver : InternalServerComponent
         }
         catch
         {
+            _missedInput++;
+
             // Reuse last input
             if (_lastInputStored.TryGetValue(serverEntity, out IPackableElement input))
             {
@@ -85,6 +89,7 @@ public partial class ServerInputReceiver : InternalServerComponent
         if (ImGui.CollapsingHeader("Input Receiver"))
         {
             ImGui.Text($"Input Queue {_pendingInputs.Count}");
+            ImGui.Text($"Missed Inputs {_missedInput}");
         }
     }
 }

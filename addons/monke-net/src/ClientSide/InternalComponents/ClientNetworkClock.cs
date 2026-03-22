@@ -15,7 +15,7 @@ namespace MonkeNet.Client;
 public partial class ClientNetworkClock : InternalClientComponent
 {
     // Called every time latency is calculated
-    [Signal] public delegate void LatencyCalculatedEventHandler(int currentTick, int latencyAverageTicks, int jitterAverageTicks);
+    [Signal] public delegate void LatencyCalculatedEventHandler(int currentTick, int latencyAverageTicks, int jitterAverageTicks, int averageClockOffset);
 
     [Export] private int _sampleSize = 11;
     [Export] private float _sampleRateMs = 1000;
@@ -88,7 +88,7 @@ public partial class ClientNetworkClock : InternalClientComponent
             _jitterInTicks = _latencyValues[^1] - _latencyValues[0];
             _averageLatencyInTicks = SmoothAverage(_latencyValues, _minLatencyInTicks);
 
-            EmitSignal(SignalName.LatencyCalculated, GetCurrentTick(), _averageLatencyInTicks, _jitterInTicks);
+            EmitSignal(SignalName.LatencyCalculated, GetCurrentTick(), _averageLatencyInTicks, _jitterInTicks, _averageOffsetInTicks);
 
             _offsetValues.Clear();
             _latencyValues.Clear();

@@ -96,11 +96,7 @@ public partial class SnapshotInterpolator : InternalClientComponent
                     ?? throw new MonkeNetException($"Entity {futureState.EntityId} not found!");
 
                 ClientInterpolatedEntity clientInterpolator = networkBehaviour.GetComponent<ClientInterpolatedEntity>();
-
-                if (clientInterpolator != null)
-                {
-                    clientInterpolator.HandleStateInterpolation(pastState, futureState, (float)_interpolationFactor);
-                }
+                clientInterpolator?.HandleStateInterpolation(pastState, futureState, (float)_interpolationFactor);
             }
         }
     }

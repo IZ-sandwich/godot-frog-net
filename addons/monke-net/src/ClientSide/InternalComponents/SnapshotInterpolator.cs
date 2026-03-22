@@ -95,7 +95,7 @@ public partial class SnapshotInterpolator : InternalClientComponent
                 NetworkBehaviour networkBehaviour = EntitySpawner.Instance.GetEntityById(futureState.EntityId)
                     ?? throw new MonkeNetException($"Entity {futureState.EntityId} not found!");
 
-                ClientInterpolatedEntity clientInterpolator = networkBehaviour.GetComponent<ClientInterpolatedEntity>();
+                ClientInterpolatedEntity clientInterpolator = networkBehaviour.GetComponent<ClientInterpolatedEntity>(); //FIXME: instead of searching for the component, I should already have a reference for it somewhere
                 clientInterpolator?.HandleStateInterpolation(pastState, futureState, (float)_interpolationFactor);
             }
         }

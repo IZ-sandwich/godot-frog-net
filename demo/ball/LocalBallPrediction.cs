@@ -9,6 +9,7 @@ public partial class LocalBallPrediction : ClientPredictedEntity
 {
     [Export] private float _maxDeviationAllowedSquared = 0.001f;
     [Export] private RigidBody3D _rigidBody;
+
     public override void OnProcessTick(int tick, IPackableElement input) { }
 
     public override Vector3 GetPosition()

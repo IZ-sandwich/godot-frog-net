@@ -20,7 +20,6 @@ public partial class MainScene : Node3D
     private void OnSpawnButtonPressed()
     {
         ClientManager.Instance.MakeEntityRequest((byte)0);
-        ClientManager.Instance.MakeEntityRequest((byte)1);
         GetNode("Menu/SpawnButton").QueueFree();
     }
 

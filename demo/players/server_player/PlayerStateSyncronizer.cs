@@ -24,7 +24,7 @@ public partial class PlayerStateSyncronizer : ServerStateSyncronizer
     {
         return new EntityStateMessage
         {
-            EntityId = this.NetworkBehaviour.EntityId,
+            EntityId = this.EntityId,
             Yaw = this.Yaw,
             Position = _characterBody.Position,
             Velocity = _characterBody.Velocity

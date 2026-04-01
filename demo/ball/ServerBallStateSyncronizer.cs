@@ -12,7 +12,7 @@ public partial class ServerBallStateSyncronizer : ServerStateSyncronizer
     {
         return new EntityStateMessage
         {
-            EntityId = this.NetworkBehaviour.EntityId,
+            EntityId = this.EntityId,
             Yaw = 0,
             Position = _rigidBody.Position,
             Rotation = _rigidBody.Rotation,

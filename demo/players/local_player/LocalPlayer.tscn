@@ -1,7 +1,6 @@
 [gd_scene format=3 uid="uid://b8b17u47wg4nh"]
 
 [ext_resource type="Script" uid="uid://cmx6bbcdxu6wo" path="res://demo/players/local_player/LocalPlayer.cs" id="1_vcufi"]
-[ext_resource type="Script" uid="uid://d4b1e6581aumb" path="res://addons/monke-net/src/Shared/Nodes/NetworkBehaviour.cs" id="2_2pevh"]
 [ext_resource type="Script" uid="uid://bqe2nbydcn6ye" path="res://demo/players/local_player/FirstPersonCameraController.cs" id="2_q1b5c"]
 [ext_resource type="Script" uid="uid://cnv1cfcupuk13" path="res://demo/players/SharedPlayerMovement.cs" id="3_4xwgn"]
 [ext_resource type="Script" uid="uid://def61bnkcb1ty" path="res://demo/players/local_player/LocalPlayerPrediction.cs" id="3_w0b8v"]
@@ -11,10 +10,6 @@
 
 [node name="LocalPlayer" type="CharacterBody3D" unique_id=1000739421]
 script = ExtResource("1_vcufi")
-
-[node name="NetworkBehaviour" type="Node" parent="." unique_id=1589185210]
-script = ExtResource("2_2pevh")
-metadata/_custom_type_script = "uid://d4b1e6581aumb"
 
 [node name="ClientPredictedEntity" type="Node" parent="." unique_id=1274239566 node_paths=PackedStringArray("_playerMovement", "_characterBody")]
 script = ExtResource("3_w0b8v")

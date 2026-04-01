@@ -81,7 +81,7 @@ public partial class ClientPredictionManager : InternalClientComponent
         {
             // Get predicted and authoritative state for the entity
             var predictedState = predictedStateData.Entities[predictableEntity];
-            var authoritativeState = FindStateForEntityId(predictableEntity.NetworkBehaviour.EntityId, receivedSnapshot.States);
+            var authoritativeState = FindStateForEntityId(predictableEntity.EntityId, receivedSnapshot.States);
 
             if (predictableEntity.HasMisspredicted(receivedSnapshot.Tick, authoritativeState, predictedState))
             {
@@ -97,7 +97,7 @@ public partial class ClientPredictionManager : InternalClientComponent
         // Set all entities to authoritative state
         foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
         {
-            var authoritativeState = FindStateForEntityId(predictableEntity.NetworkBehaviour.EntityId, authoritativeStates);
+            var authoritativeState = FindStateForEntityId(predictableEntity.EntityId, authoritativeStates);
             predictableEntity.HandleReconciliation(authoritativeState);
         }
 

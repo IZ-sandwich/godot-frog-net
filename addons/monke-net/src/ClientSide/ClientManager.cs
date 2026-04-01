@@ -27,7 +27,7 @@ public partial class ClientManager : Node
     private NetworkDebug _networkDebug;
     private ClientEntityManager _entityManager;
     private ClientInputManager _inputManager;
-    private ClientPredictionManager _PredictionManager;
+    private ClientPredictionManager _predictionManager;
 
     private bool _networkReady = false;
 
@@ -43,7 +43,7 @@ public partial class ClientManager : Node
         _snapshotInterpolator = GetNode<ClientSnapshotInterpolator>("SnapshotInterpolator");
         _entityManager = GetNode<ClientEntityManager>("ClientEntityManager");
         _inputManager = GetNode<ClientInputManager>("ClientInputManager");
-        _PredictionManager = GetNode<ClientPredictionManager>("PredictionManager");
+        _predictionManager = GetNode<ClientPredictionManager>("PredictionManager");
     }
 
     public override void _Process(double delta)
@@ -70,9 +70,10 @@ public partial class ClientManager : Node
         PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
         PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
 
-        _PredictionManager.RegisterPrediction(currentTick, input);               // Register all local predictions
+        _predictionManager.RegisterPrediction(currentTick, input);               // Register all local predictions
     }
 
+    //TODO: this is crap
     private static void EntitiesCallProcessTick(int currentTick, IPackableElement input)
     {
         foreach (var node in MonkeNetManager.Instance.EntitySpawner.Entities)
@@ -144,7 +145,7 @@ public partial class ClientManager : Node
             _networkDebug.DisplayDebugInformation();
             _snapshotInterpolator.DisplayDebugInformation();
             _inputManager.DisplayDebugInformation();
-            _PredictionManager.DisplayDebugInformation();
+            _predictionManager.DisplayDebugInformation();
             ImGui.End();
         }
     }

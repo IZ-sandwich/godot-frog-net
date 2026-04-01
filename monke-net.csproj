@@ -11,7 +11,4 @@
   <ItemGroup>
     <PackageReference Include="ImGui.NET" Version="1.91.0.1" />
   </ItemGroup>
-  <ItemGroup>
-    <Folder Include="addons\monke-net\src\ServerSide\Entities\" />
-  </ItemGroup>
 </Project>

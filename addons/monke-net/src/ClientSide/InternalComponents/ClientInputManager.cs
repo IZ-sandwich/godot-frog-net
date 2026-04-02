@@ -8,12 +8,13 @@ using System.Collections.Generic;
 namespace MonkeNet.Client;
 
 /// <summary>
-/// Reads and transmits inputs to the server. Will adjust and send redundant inputs to compensate for bad network conditions.
+/// Reads and transmits inputs to the server.
+/// Will adjust and send redundant inputs to compensate for bad network conditions.
 /// </summary>
 [GlobalClass]
 public partial class ClientInputManager : InternalClientComponent
 {
-    private readonly List<ProducedInput> _producedInputs = [];
+    private readonly List<ProducedInputForTick> _producedInputs = [];
     private int _lastReceivedTick = 0;
 
     public IPackableElement GenerateAndTransmitInputs(int currentTick)
@@ -25,7 +26,7 @@ public partial class ClientInputManager : InternalClientComponent
             return null;
         }
 
-        ProducedInput producedInput = new()
+        ProducedInputForTick producedInput = new()
         {
             Tick = currentTick,
             Input = input
@@ -71,7 +72,7 @@ public partial class ClientInputManager : InternalClientComponent
         }
     }
 
-    private struct ProducedInput
+    private struct ProducedInputForTick
     {
         public int Tick;
         public IPackableElement Input;

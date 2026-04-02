@@ -10,22 +10,24 @@ namespace MonkeNet.Client;
 /// </summary>
 public partial class ClientManager : Node
 {
-    [Signal] public delegate void ClientTickEventHandler(int currentTick);
     [Signal] public delegate void LatencyCalculatedEventHandler(int latencyAverageTicks, int jitterAverageTicks);
     [Signal] public delegate void NetworkReadyEventHandler();
 
     public delegate void CommandReceivedEventHandler(IPackableMessage command); // Using a C# signal here because the Godot signal wouldn't accept NetworkMessages.IPackableMessage
     public event CommandReceivedEventHandler CommandReceived;
 
+    public delegate void ClientTickEventHandler(int tick, IPackableElement command); // Using a C# signal here because the Godot signal wouldn't accept NetworkMessages.IPackableMessage
+    public event ClientTickEventHandler ClientTick;
+
     public static ClientManager Instance { get; private set; }
 
     private INetworkManager _networkManager;
-    private SnapshotInterpolator _snapshotInterpolator;
+    private ClientSnapshotInterpolator _snapshotInterpolator;
     private ClientNetworkClock _clock;
     private NetworkDebug _networkDebug;
     private ClientEntityManager _entityManager;
     private ClientInputManager _inputManager;
-    private PredictionManager _PredictionManager;
+    private ClientPredictionManager _predictionManager;
 
     private bool _networkReady = false;
 
@@ -38,10 +40,10 @@ public partial class ClientManager : Node
     {
         _networkDebug = GetNode<NetworkDebug>("NetworkDebug");
         _clock = GetNode<ClientNetworkClock>("ClientNetworkClock");
-        _snapshotInterpolator = GetNode<SnapshotInterpolator>("SnapshotInterpolator");
+        _snapshotInterpolator = GetNode<ClientSnapshotInterpolator>("SnapshotInterpolator");
         _entityManager = GetNode<ClientEntityManager>("ClientEntityManager");
         _inputManager = GetNode<ClientInputManager>("ClientInputManager");
-        _PredictionManager = GetNode<PredictionManager>("PredictionManager");
+        _predictionManager = GetNode<ClientPredictionManager>("PredictionManager");
     }
 
     public override void _Process(double delta)
@@ -58,26 +60,18 @@ public partial class ClientManager : Node
         _clock.ProcessTick();
         int currentTick = _clock.GetCurrentTick();
 
-        var input = _inputManager.GenerateAndTransmitInputs(currentTick);         // Read and send produced input to the server
-        EntitiesCallProcessTick(currentTick, input);                 // Call OnProcessTick on all entities, pass current input so they can simulate
-        EmitSignal(SignalName.ClientTick, currentTick);
+        // Read and send produced input to the server
+        var input = _inputManager.GenerateAndTransmitInputs(currentTick);
+
+        // Call OnProcessTick on all entities, pass current input so they can simulate
+        _predictionManager.Predict(currentTick, input);
+        ClientTick?.Invoke(currentTick, input);
 
         PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
         PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
 
-        _PredictionManager.RegisterPrediction(currentTick, input);               // Register all local predictions
-    }
-
-    // Calls OnProcessTick on all entities
-    private static void EntitiesCallProcessTick(int currentTick, IPackableElement input)
-    {
-        foreach (var node in MonkeNetManager.Instance.EntitySpawner.Entities)
-        {
-            if (node is IClientEntity clientEntity)
-            {
-                clientEntity.OnProcessTick(currentTick, input);
-            }
-        }
+        // Register all local predictions
+        _predictionManager.RegisterPrediction(currentTick, input);
     }
 
     public void Initialize(INetworkManager networkManager, string address, int port)
@@ -115,9 +109,9 @@ public partial class ClientManager : Node
         return _networkManager.GetNetworkId();
     }
 
-    private void OnLatencyCalculated(int currentTick, int latencyAverageTicks, int jitterAverageTicks)
+    private void OnLatencyCalculated(int currentTick, int latencyAverageTicks, int jitterAverageTicks, int averageClockOffset)
     {
-        GD.Print($"At tick {currentTick}, latency calculations done. Avg. Latency {latencyAverageTicks} ticks, Jitter {jitterAverageTicks}");
+        GD.Print($"At tick {currentTick}, latency calculations done. Avg. Latency {latencyAverageTicks} ticks, Jitter {jitterAverageTicks}, Offset {averageClockOffset}");
         EmitSignal(SignalName.LatencyCalculated, latencyAverageTicks, jitterAverageTicks);
         EmitSignal(SignalName.NetworkReady); //TODO: calculate this in other way, this should only be emmited once and
                                              //right now it will be emitted every time the colck calculates latency
@@ -139,7 +133,7 @@ public partial class ClientManager : Node
             _networkDebug.DisplayDebugInformation();
             _snapshotInterpolator.DisplayDebugInformation();
             _inputManager.DisplayDebugInformation();
-            _PredictionManager.DisplayDebugInformation();
+            _predictionManager.DisplayDebugInformation();
             ImGui.End();
         }
     }

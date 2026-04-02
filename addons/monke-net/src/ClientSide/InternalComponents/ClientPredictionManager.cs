@@ -11,7 +11,7 @@ namespace MonkeNet.Client;
 /// Stores predicted game states for entities, upon receiving an snapshot, will check for deviation and perform rollback and re-simulation if needed.
 /// </summary>
 [GlobalClass]
-public partial class PredictionManager : InternalClientComponent
+public partial class ClientPredictionManager : InternalClientComponent
 {
     private readonly List<PredictedState> _predictedStates = [];
     private int _lastTickReceived = 0;
@@ -33,6 +33,15 @@ public partial class PredictionManager : InternalClientComponent
         }
     }
 
+    public void Predict(int tick, IPackableElement input)
+    {
+        MonkeNetManager.Instance.EntitySpawner.Entities.ForEach(entity =>
+        {
+            var clientPredictedEntity = entity.GetComponent<ClientPredictedEntity>();
+            clientPredictedEntity?.OnProcessTick(tick, input);
+        });
+    }
+
     public void RegisterPrediction(int tick, IPackableElement input)
     {
         var predictedState = new PredictedState
@@ -44,13 +53,14 @@ public partial class PredictionManager : InternalClientComponent
 
         _predictedStates.Add(predictedState);
 
-        //TODO: use array of IPredictableEntity that updates each time a new entity is spawned/despawned
+        //TODO: use array of ClientPredictedEntity that updates each time a new entity is spawned/despawned
         //TODO: store entity state inside entity itself instead of having everything here on PredictionManager
         MonkeNetManager.Instance.EntitySpawner.Entities.ForEach(entity =>
         {
-            if (entity is IPredictableEntity predictableEntity)
+            var clientPredictedEntity = entity.GetComponent<ClientPredictedEntity>();
+            if (clientPredictedEntity != null)
             {
-                predictedState.Entities.Add(predictableEntity, predictableEntity.Position);
+                predictedState.Entities.Add(clientPredictedEntity, clientPredictedEntity.GetPosition());
             }
         });
     }
@@ -67,14 +77,13 @@ public partial class PredictionManager : InternalClientComponent
         }
 
         // Iterate all entities saved for the tick
-        foreach (IPredictableEntity predictableEntity in predictedStateData.Entities.Keys)
+        foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
         {
             // Get predicted and authoritative state for the entity
             var predictedState = predictedStateData.Entities[predictableEntity];
             var authoritativeState = FindStateForEntityId(predictableEntity.EntityId, receivedSnapshot.States);
 
-            predictableEntity.OnReceivedState(authoritativeState);
-            if (predictableEntity.HasMisspredicted(authoritativeState, predictedState))
+            if (predictableEntity.HasMisspredicted(receivedSnapshot.Tick, authoritativeState, predictedState))
             {
                 _misspredictionsCount++;
                 RollbackAndResimulate(receivedSnapshot.States, predictedStateData);
@@ -86,7 +95,7 @@ public partial class PredictionManager : InternalClientComponent
     private void RollbackAndResimulate(IEntityStateData[] authoritativeStates, PredictedState predictedStateData)
     {
         // Set all entities to authoritative state
-        foreach (IPredictableEntity predictableEntity in predictedStateData.Entities.Keys)
+        foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
         {
             var authoritativeState = FindStateForEntityId(predictableEntity.EntityId, authoritativeStates);
             predictableEntity.HandleReconciliation(authoritativeState);
@@ -96,7 +105,7 @@ public partial class PredictionManager : InternalClientComponent
         for (int i = 0; i < _predictedStates.Count; i++)
         {
             var remainingInput = _predictedStates[i];
-            foreach (IPredictableEntity predictableEntity in remainingInput.Entities.Keys)
+            foreach (ClientPredictedEntity predictableEntity in remainingInput.Entities.Keys)
             {
                 predictableEntity.ResimulateTick(remainingInput.Input);
             }
@@ -104,16 +113,23 @@ public partial class PredictionManager : InternalClientComponent
             PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
             PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
 
-            foreach (IPredictableEntity predictableEntity in remainingInput.Entities.Keys)
+            foreach (ClientPredictedEntity predictableEntity in remainingInput.Entities.Keys)
             {
-                remainingInput.Entities[predictableEntity] = predictableEntity.Position;
+                remainingInput.Entities[predictableEntity] = predictableEntity.GetPosition();
             }
         }
     }
 
     private static IEntityStateData FindStateForEntityId(int entityId, IEntityStateData[] authStates)
     {
-        foreach (IEntityStateData state in authStates) { if (state.EntityId == entityId) { return state; } }
+        foreach (IEntityStateData state in authStates)
+        {
+            if (state.EntityId == entityId)
+            {
+                return state;
+            }
+        }
+
         return null;
     }
 
@@ -131,6 +147,6 @@ public partial class PredictionManager : InternalClientComponent
     {
         public int Tick;                                            // Tick at which the input was taken
         public IPackableElement Input;                              // Input message sent to the server
-        public Dictionary<IPredictableEntity, Vector3> Entities;
+        public Dictionary<ClientPredictedEntity, Vector3> Entities;
     }
 }

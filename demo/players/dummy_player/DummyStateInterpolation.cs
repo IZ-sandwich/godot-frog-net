@@ -4,28 +4,19 @@ using MonkeNet.Shared;
 
 namespace GameDemo;
 
-// Dummy player (other players in the game)
-public partial class DummyPlayer : Node3D, INetworkedEntity, IInterpolatedEntity
+public partial class DummyStateInterpolation : ClientInterpolatedEntity
 {
+    [Export] private Node3D _parent;
     [Export] private Node3D _skeleton;
     [Export] private AnimationTree _animTree;
 
-    public int EntityId { get; set; }
-    public byte EntityType { get; set; }
-    public int Authority { get; set; }
-    public string Metadata { get; set; }
-
-    public void EntitySpawned()
-    { }
-
-    // Called by the Snapshot Interpolator every frame, here you solve how to interpolate received states
-    public void HandleStateInterpolation(IEntityStateData past, IEntityStateData future, float interpolationFactor)
+    public override void HandleStateInterpolation(IEntityStateData past, IEntityStateData future, float interpolationFactor)
     {
         var pastState = (EntityStateMessage)past;
         var futureState = (EntityStateMessage)future;
 
         // Interpolate position
-        this.Position = pastState.Position.Lerp(futureState.Position, interpolationFactor);
+        _parent.Position = pastState.Position.Lerp(futureState.Position, interpolationFactor);
 
         // Interpolate Yaw
         var rotation = Mathf.LerpAngle(pastState.Yaw, futureState.Yaw, interpolationFactor);

@@ -1,41 +1,41 @@
-[gd_scene load_steps=8 format=3 uid="uid://eykxehuqerja"]
+[gd_scene format=3 uid="uid://eykxehuqerja"]
 
 [ext_resource type="Script" uid="uid://casrvfpellwtf" path="res://addons/monke-net/src/ClientSide/ClientManager.cs" id="1_nwfjc"]
 [ext_resource type="Script" uid="uid://b1sc6i887bw7n" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientNetworkClock.cs" id="2_d4j3l"]
-[ext_resource type="Script" uid="uid://b1lgrqxl3f36l" path="res://addons/monke-net/src/ClientSide/InternalComponents/SnapshotInterpolator.cs" id="3_uqx2a"]
+[ext_resource type="Script" uid="uid://b1lgrqxl3f36l" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientSnapshotInterpolator.cs" id="3_uqx2a"]
 [ext_resource type="Script" uid="uid://cxj2orx36voh3" path="res://addons/monke-net/src/Shared/Network/NetworkDebug.cs" id="4_qtu4m"]
 [ext_resource type="Script" uid="uid://bv5seqcb7v4du" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientEntityManager.cs" id="5_likij"]
-[ext_resource type="Script" uid="uid://c4cxooque8n8p" path="res://addons/monke-net/src/ClientSide/InternalComponents/PredictionManager.cs" id="6_tbs0l"]
+[ext_resource type="Script" uid="uid://c4cxooque8n8p" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientPredictionManager.cs" id="6_tbs0l"]
 [ext_resource type="Script" uid="uid://dccenqrwxd8np" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientInputManager.cs" id="7_geb5y"]
 
-[node name="ClientManager" type="Node"]
+[node name="ClientManager" type="Node" unique_id=1088341092]
 script = ExtResource("1_nwfjc")
 
-[node name="NetworkDebug" type="Node" parent="."]
+[node name="NetworkDebug" type="Node" parent="." unique_id=742129674]
 script = ExtResource("4_qtu4m")
 
-[node name="ClientNetworkClock" type="Node" parent="."]
+[node name="ClientNetworkClock" type="Node" parent="." unique_id=894440927]
 script = ExtResource("2_d4j3l")
 _sampleSize = 3
-metadata/_custom_type_script = ExtResource("2_d4j3l")
+metadata/_custom_type_script = "uid://b1sc6i887bw7n"
 
-[node name="Timer" type="Timer" parent="ClientNetworkClock"]
+[node name="Timer" type="Timer" parent="ClientNetworkClock" unique_id=314449627]
 autostart = true
 
-[node name="ClientEntityManager" type="Node" parent="."]
+[node name="ClientEntityManager" type="Node" parent="." unique_id=1357283034]
 script = ExtResource("5_likij")
-metadata/_custom_type_script = ExtResource("5_likij")
+metadata/_custom_type_script = "uid://bv5seqcb7v4du"
 
-[node name="ClientInputManager" type="Node" parent="."]
+[node name="ClientInputManager" type="Node" parent="." unique_id=1695138999]
 script = ExtResource("7_geb5y")
-metadata/_custom_type_script = ExtResource("7_geb5y")
+metadata/_custom_type_script = "uid://dccenqrwxd8np"
 
-[node name="SnapshotInterpolator" type="Node" parent="."]
+[node name="SnapshotInterpolator" type="Node" parent="." unique_id=1441759773]
 script = ExtResource("3_uqx2a")
-metadata/_custom_type_script = ExtResource("3_uqx2a")
+metadata/_custom_type_script = "uid://b1lgrqxl3f36l"
 
-[node name="PredictionManager" type="Node" parent="."]
+[node name="PredictionManager" type="Node" parent="." unique_id=210606670]
 script = ExtResource("6_tbs0l")
-metadata/_custom_type_script = ExtResource("6_tbs0l")
+metadata/_custom_type_script = "uid://c4cxooque8n8p"
 
 [connection signal="timeout" from="ClientNetworkClock/Timer" to="ClientNetworkClock" method="OnTimerOut"]

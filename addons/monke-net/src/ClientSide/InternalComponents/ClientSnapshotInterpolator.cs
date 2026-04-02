@@ -11,7 +11,7 @@ namespace MonkeNet.Client;
 /// Receives and presents the Player the snapshots emmited by the server
 /// </summary>
 [GlobalClass]
-public partial class SnapshotInterpolator : InternalClientComponent
+public partial class ClientSnapshotInterpolator : InternalClientComponent
 {
     [Export] private int _minBufferTime = 2;
 
@@ -35,7 +35,7 @@ public partial class SnapshotInterpolator : InternalClientComponent
         InterpolateStates(tickToProcess);
     }
 
-    protected override void OnProcessTick(int currentTick)
+    protected override void OnProcessTick(int currentTick, IPackableElement input)
     {
         _currentTick = currentTick;
     }
@@ -92,12 +92,11 @@ public partial class SnapshotInterpolator : InternalClientComponent
                 IEntityStateData futureState = nextSnapshot.States[i];
                 IEntityStateData pastState = pastSnapshot.States[i];
 
-                var entity = EntitySpawner.Instance.GetNodeOrNull<Node>(futureState.EntityId.ToString()); // FIXME: remove GetNode for the love of god
+                NetworkBehaviour networkBehaviour = EntitySpawner.Instance.GetEntityById(futureState.EntityId)
+                    ?? throw new MonkeNetException($"Entity {futureState.EntityId} not found!");
 
-                if (entity != null && entity is IInterpolatedEntity interpolatedEntity)
-                {
-                    interpolatedEntity.HandleStateInterpolation(pastState, futureState, (float)_interpolationFactor);
-                }
+                ClientInterpolatedEntity clientInterpolator = networkBehaviour.GetComponent<ClientInterpolatedEntity>(); //FIXME: instead of searching for the component, I should already have a reference for it somewhere
+                clientInterpolator?.HandleStateInterpolation(pastState, futureState, (float)_interpolationFactor);
             }
         }
     }

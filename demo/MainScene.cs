@@ -23,6 +23,13 @@ public partial class MainScene : Node3D
         GetNode("Menu/SpawnButton").QueueFree();
     }
 
+    // When the client clicks "Spawn Ball" we request the server to spawn a Ball entity for us
+    private void OnSpawnBallButtonPressed()
+    {
+        ClientManager.Instance.MakeEntityRequest((byte)1);
+        GetNode("Menu/SpawnBallButton").QueueFree();
+    }
+
     // Creates game server
     private void OnHostButtonPressed()
     {

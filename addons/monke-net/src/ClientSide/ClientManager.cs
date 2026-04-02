@@ -70,7 +70,8 @@ public partial class ClientManager : Node
         PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
         PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
 
-        _predictionManager.RegisterPrediction(currentTick, input);               // Register all local predictions
+        // Register all local predictions
+        _predictionManager.RegisterPrediction(currentTick, input);
     }
 
     public void Initialize(INetworkManager networkManager, string address, int port)

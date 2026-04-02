@@ -8,6 +8,11 @@ public partial class ServerBallStateSyncronizer : ServerStateSyncronizer
 {
     [Export] private RigidBody3D _rigidBody;
 
+    public override void OnEntitySpawned()
+    {
+        GetParent<Node3D>().Position = new Vector3(0, 10, 0);
+    }
+
     public override IEntityStateData PackEntityState()
     {
         return new EntityStateMessage

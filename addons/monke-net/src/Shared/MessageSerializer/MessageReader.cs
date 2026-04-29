@@ -44,6 +44,11 @@ public class MessageReader(MemoryStream stream) : BinaryReader(stream)
         return new(ReadSingle(), ReadSingle(), ReadSingle());
     }
 
+    public Quaternion ReadQuaternion()
+    {
+        return new(ReadSingle(), ReadSingle(), ReadSingle(), ReadSingle());
+    }
+
     public Transform3D ReadTransform()
     {
         return new()

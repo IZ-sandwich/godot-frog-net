@@ -1,3 +1,4 @@
+using BidirectionalDict;
 using Godot;
 using MonkeNet.Shared;
 using System;
@@ -28,6 +29,7 @@ public interface IPackableElement : IPackableMessage
 public class MessageSerializer
 {
     private static readonly Dictionary<IPackableMessage, byte> Types = [];
+    private static readonly BiDictionary<byte, Type> TypeMap = [];
 
     /// <summary>
     /// Takes a IPackableMessage <paramref name="message"/> and packs it into a byte array as <paramref name="messageType"/>.
@@ -46,13 +48,13 @@ public class MessageSerializer
     }
 
     /// <summary>
-    /// Reads from a byte array <paramref name="bin"/> and produces an IPackableMessage.
+    /// Reads from a byte array <paramref name="byteArray"/> and produces an IPackableMessage.
     /// </summary>
-    /// <param name="bin"></param>
+    /// <param name="byteArray"></param>
     /// <returns></returns>
-    public static IPackableMessage Deserialize(byte[] bin)
+    public static IPackableMessage Deserialize(byte[] byteArray)
     {
-        using var stream = new MemoryStream(bin);
+        using var stream = new MemoryStream(byteArray);
         using var reader = new MessageReader(stream);
 
         byte typeByte = reader.ReadByte();
@@ -65,24 +67,20 @@ public class MessageSerializer
         return instance;
     }
 
-    //TODO: this should bo some type of hash map, not this foreach shit
     public static IPackableMessage GetMessageFromByteType(byte type)
     {
-        foreach (var t in Types)
-        {
-            if (t.Value == type) return t.Key;
-        }
+        if (TypeMap.Contains(type)) {
+            return Activator.CreateInstance(TypeMap[type]) as IPackableMessage;
+		}
 
         throw new MonkeNetException($"Couldn't find type {type}");
     }
 
-    //TODO: this should bo some type of hash map, not this foreach shit
     public static byte GetByteTypeFromMessage(IPackableMessage message)
     {
-        foreach (var t in Types)
-        {
-            if (t.Key.GetType() == message.GetType()) return t.Value;
-        }
+        if (TypeMap.Contains(message.GetType())) {
+            return TypeMap[message.GetType()];
+		}
 
         throw new MonkeNetException($"Couldn't find message {message}");
     }
@@ -95,8 +93,8 @@ public class MessageSerializer
 
         foreach (Type t in registeredMessages)
         {
-            var messageInstance = Activator.CreateInstance(t) as IPackableMessage;
-            Types.Add(messageInstance, key++);
+            TypeMap.AddOrUpdate(key, t);
+            key++;
             GD.Print($"Registered network message {t.FullName}");
         }
     }

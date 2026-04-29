@@ -43,6 +43,14 @@ public class MessageWriter(MemoryStream stream) : BinaryWriter(stream)
         Write(vector.Z);
     }
 
+    public void Write(Quaternion quaternion)
+    {
+        Write(quaternion.X);
+        Write(quaternion.Y);
+        Write(quaternion.Z);
+        Write(quaternion.W);
+    }
+
     public void Write(Transform3D transform)
     {
         Write(transform.Origin);

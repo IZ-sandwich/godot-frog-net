@@ -11,7 +11,7 @@ public partial class ServerNetworkClock : InternalServerComponent
 {
     [Signal] public delegate void NetworkProcessTickEventHandler(double delta);
 
-    [Export] private int _netTickrate = 30;
+    [Export] private int _netTickrate = 60;
     private double _netTickCounter = 0;
     private int _currentTick = 0;
 

@@ -31,7 +31,6 @@ public partial class MonkeNetManager : Node
 
     public void CreateClient(string address, int port)
     {
-        IsServer = false;
         var clientManagerScene = GD.Load<PackedScene>("res://addons/monke-net/scenes/ClientManager.tscn");
         var clientManager = clientManagerScene.Instantiate() as Client.ClientManager;
         AddChild(clientManager);
@@ -47,7 +46,6 @@ public partial class MonkeNetManager : Node
 
     public void CreateServer(int port)
     {
-        IsServer = true;
         var serverManagerScene = GD.Load<PackedScene>("res://addons/monke-net/scenes/ServerManager.tscn");
         var serverManager = serverManagerScene.Instantiate() as Server.ServerManager;
         AddChild(serverManager);
@@ -60,4 +58,15 @@ public partial class MonkeNetManager : Node
         // TODO: pass configurations as struct/.ini
         serverManager.Initialize(_networkManager, port);
     }
+
+    public void CreateListenServer(int port)
+    {
+        CreateServer(port);
+        CreateClient("localhost", port);
+    }
+
+    public bool IsServer()
+	{
+        return Multiplayer.GetUniqueId() == 1;
+	}
 }

@@ -44,4 +44,12 @@ public partial class MainScene : Node3D
         GetNode("Menu/HostButton").QueueFree();
         GetNode("Menu/ConnectButton").QueueFree();
     }
+    // Host and connect to self
+    private void OnHostAndConnectButtonPressed()
+    {
+        MonkeNetManager.Instance.CreateServer(9999);
+        MonkeNetManager.Instance.CreateClient("localhost", 9999);
+        GetNode("Menu/HostButton").QueueFree();
+        GetNode("Menu/ConnectButton").QueueFree();
+    }
 }

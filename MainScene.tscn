@@ -80,7 +80,18 @@ offset_right = 152.0
 offset_bottom = 63.0
 text = "Connect to Server"
 
+<<<<<<< HEAD
 [node name="Map" type="Node" parent="." unique_id=719413025]
+=======
+[node name="HostAndConnectButton" type="Button" parent="Menu"]
+layout_mode = 0
+offset_top = 62.0
+offset_right = 152.0
+offset_bottom = 93.0
+text = "Host and Connect"
+
+[node name="Map" type="Node" parent="."]
+>>>>>>> 64c2104 (initial commit making templates for co-op game)
 
 [node name="Floor" type="CSGBox3D" parent="Map" unique_id=961545461]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -2.5, 0)
@@ -161,3 +172,4 @@ material = SubResource("StandardMaterial3D_obp5r")
 [connection signal="pressed" from="Menu/SpawnBallButton" to="." method="OnSpawnBallButtonPressed"]
 [connection signal="pressed" from="Menu/HostButton" to="." method="OnHostButtonPressed"]
 [connection signal="pressed" from="Menu/ConnectButton" to="." method="OnConnectButtonPressed"]
+[connection signal="pressed" from="Menu/HostAndConnectButton" to="." method="OnHostAndConnectButtonPressed"]

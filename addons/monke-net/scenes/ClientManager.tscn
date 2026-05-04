@@ -7,6 +7,7 @@
 [ext_resource type="Script" uid="uid://bv5seqcb7v4du" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientEntityManager.cs" id="5_likij"]
 [ext_resource type="Script" uid="uid://c4cxooque8n8p" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientPredictionManager.cs" id="6_tbs0l"]
 [ext_resource type="Script" uid="uid://dccenqrwxd8np" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientInputManager.cs" id="7_geb5y"]
+[ext_resource type="Script" uid="uid://dy44at3x2o4wx" path="res://addons/monke-net/src/ClientSide/InternalComponents/ClientConnectionMonitor.cs" id="8_connmon"]
 
 [node name="ClientManager" type="Node" unique_id=1088341092]
 script = ExtResource("1_nwfjc")
@@ -37,5 +38,9 @@ metadata/_custom_type_script = "uid://b1lgrqxl3f36l"
 [node name="PredictionManager" type="Node" parent="." unique_id=210606670]
 script = ExtResource("6_tbs0l")
 metadata/_custom_type_script = "uid://c4cxooque8n8p"
+
+[node name="ClientConnectionMonitor" type="Node" parent="." unique_id=855161104]
+script = ExtResource("8_connmon")
+metadata/_custom_type_script = "uid://dy44at3x2o4wx"
 
 [connection signal="timeout" from="ClientNetworkClock/Timer" to="ClientNetworkClock" method="OnTimerOut"]

@@ -35,6 +35,7 @@ public partial class ClientPredictionManager : InternalClientComponent
 
     public void Predict(int tick, IPackableElement input)
     {
+        if (input == null) return;
         EntitySpawner.Instance.ClientEntities.ForEach(entity =>
         {
             var clientPredictedEntity = entity.GetComponent<ClientPredictedEntity>();
@@ -44,6 +45,7 @@ public partial class ClientPredictionManager : InternalClientComponent
 
     public void RegisterPrediction(int tick, IPackableElement input)
     {
+        if (input == null) return;
         var predictedState = new PredictedState
         {
             Tick = tick,

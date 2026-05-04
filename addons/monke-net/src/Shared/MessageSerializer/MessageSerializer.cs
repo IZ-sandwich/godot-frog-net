@@ -95,15 +95,21 @@ public class MessageSerializer
         {
             TypeMap.AddOrUpdate(key, t);
             key++;
-            GD.Print($"Registered network message {t.FullName}");
+            MonkeLogger.Info($"Registered network message {t.FullName}");
         }
     }
 
     private static Type[] GetTypesImplementingInterface(Type type)
     {
-        return Assembly.GetExecutingAssembly()
-                       .GetTypes()
-                       .Where(t => type.IsAssignableFrom(t) && !t.IsAbstract)
-                       .ToArray();
+        // Scan all loaded assemblies so that types defined in test projects or
+        // other referenced assemblies are discovered correctly.
+        return AppDomain.CurrentDomain.GetAssemblies()
+                        .SelectMany(a =>
+                        {
+                            try { return a.GetTypes(); }
+                            catch { return Array.Empty<Type>(); }
+                        })
+                        .Where(t => type.IsAssignableFrom(t) && !t.IsAbstract)
+                        .ToArray();
     }
 }

@@ -1,0 +1,18 @@
+; Engine configuration file.
+; Minimal Godot project for GdUnit4 runtime test execution.
+; The test adapter requires project.godot to be alongside the test .csproj.
+
+config_version=5
+
+[application]
+
+config/features=PackedStringArray("4.7", "C#", "Forward Plus")
+config/name="MonkeNetTests"
+
+[autoload]
+
+MonkeNet="*uid://bchfwceouveq2"
+
+[dotnet]
+
+project/assembly_name="MonkeNetTests"

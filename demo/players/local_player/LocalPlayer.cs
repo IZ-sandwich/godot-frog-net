@@ -7,6 +7,7 @@ public partial class LocalPlayer : CharacterBody3D
 {
     public override void _Process(double delta)
     {
+        if (!GetTree().Root.HasNode("ImGuiRoot")) return;
         if (ImGui.Begin("Player Information"))
         {
             ImGui.Text("Use `C` to free/capture your cursor.");

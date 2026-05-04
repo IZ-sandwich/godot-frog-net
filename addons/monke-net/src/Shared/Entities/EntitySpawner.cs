@@ -3,6 +3,7 @@ using MonkeNet.Client;
 using MonkeNet.NetworkMessages;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace MonkeNet.Shared;
 
@@ -26,6 +27,12 @@ public partial class EntitySpawner : Node
         Instance = this;
     }
 
+    public override void _ExitTree()
+    {
+        if (Instance == this)
+            Instance = null;
+    }
+
     //TODO: do not cast, make Entities a list of INetworkedEntity directly
     public NetworkBehaviour GetEntityById(int entityId)
     {
@@ -37,6 +44,16 @@ public partial class EntitySpawner : Node
             if (e.EntityId == entityId) return e;
 
         throw new MonkeNetException($"Couldn't find entity by id {entityId}");
+    }
+
+    // Returns null when the entity doesn't exist yet (e.g. snapshot arrived before EntityEventMessage.Created).
+    public NetworkBehaviour TryGetEntityById(int entityId)
+    {
+        foreach (var e in ClientEntities)
+            if (e.EntityId == entityId) return e;
+        foreach (var e in Entities)
+            if (e.EntityId == entityId) return e;
+        return null;
     }
 
     // Can be called from both the server or a client, so it needs to handle both scenarios.
@@ -88,16 +105,75 @@ public partial class EntitySpawner : Node
         string layerInfo = instance is CollisionObject3D co
             ? $" Layer={co.CollisionLayer} Mask={co.CollisionMask}"
             : "";
-        GD.Print($"Spawned entity:{@event.EntityId} ({@event.EntityType}) Auth:{@event.Authority} ServerSpawn:{isServerSpawn}{layerInfo}");
+        MonkeLogger.Info($"Spawned entity:{@event.EntityId} ({@event.EntityType}) Auth:{@event.Authority} ServerSpawn:{isServerSpawn}{layerInfo}");
         return instance;
     }
 
     public void DestroyEntity(EntityEventMessage @event)
     {
-        //    var entity = GetNode<NetworkBehaviour>(@event.EntityId.ToString());
-        //    entity.Free();
-        //    Entities.Remove(entity);
-        throw new NotImplementedException();
+        var serverEntity = Entities.Find(e => e.EntityId == @event.EntityId);
+        if (serverEntity != null)
+        {
+            Entities.Remove(serverEntity);
+            FreeEntityRoot(serverEntity);
+            MonkeLogger.Info($"Destroyed server entity {serverEntity.EntityId}");
+            return;
+        }
+
+        var clientEntity = ClientEntities.Find(e => e.EntityId == @event.EntityId);
+        if (clientEntity != null)
+        {
+            ClientEntities.Remove(clientEntity);
+            FreeEntityRoot(clientEntity);
+            MonkeLogger.Info($"Destroyed client entity {clientEntity.EntityId}");
+            return;
+        }
+
+        MonkeLogger.Error($"DestroyEntity: entity {@event.EntityId} not found");
+    }
+
+    public void DestroyClientEntity(EntityEventMessage @event)
+    {
+        var clientEntity = ClientEntities.Find(e => e.EntityId == @event.EntityId);
+        if (clientEntity != null)
+        {
+            ClientEntities.Remove(clientEntity);
+            FreeEntityRoot(clientEntity);
+            MonkeLogger.Info($"Destroyed client entity {clientEntity.EntityId}");
+            return;
+        }
+        MonkeLogger.Error($"DestroyClientEntity: entity {@event.EntityId} not found in ClientEntities");
+    }
+
+    public void ClearClientEntities()
+    {
+        foreach (var entity in ClientEntities.ToList())
+            FreeEntityRoot(entity);
+        ClientEntities.Clear();
+    }
+
+    public void ClearServerEntities()
+    {
+        foreach (var entity in Entities.ToList())
+            FreeEntityRoot(entity);
+        Entities.Clear();
+    }
+
+    public Node3D GetEntityRoot(NetworkBehaviour entity)
+    {
+        Node current = entity;
+        while (current.GetParent() != this && current.GetParent() != null)
+            current = current.GetParent();
+        return current as Node3D;
+    }
+
+    private void FreeEntityRoot(NetworkBehaviour entity)
+    {
+        // Walk up until we find the direct child of EntitySpawner, then free it
+        Node current = entity;
+        while (current.GetParent() != this && current.GetParent() != null)
+            current = current.GetParent();
+        current.QueueFree();
     }
 
     public List<int> GetAllEntitiesByAuthority(int authority)

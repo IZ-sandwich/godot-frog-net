@@ -92,8 +92,9 @@ public partial class ClientSnapshotInterpolator : InternalClientComponent
                 IEntityStateData futureState = nextSnapshot.States[i];
                 IEntityStateData pastState = pastSnapshot.States[i];
 
-                NetworkBehaviour networkBehaviour = EntitySpawner.Instance.GetEntityById(futureState.EntityId)
-                    ?? throw new MonkeNetException($"Entity {futureState.EntityId} not found!");
+                // Entity may not exist yet if snapshot arrived before EntityEventMessage.Created (reliable channel delay).
+                NetworkBehaviour networkBehaviour = EntitySpawner.Instance.TryGetEntityById(futureState.EntityId);
+                if (networkBehaviour == null) continue;
 
                 ClientInterpolatedEntity clientInterpolator = networkBehaviour.GetComponent<ClientInterpolatedEntity>(); //FIXME: instead of searching for the component, I should already have a reference for it somewhere
                 clientInterpolator?.HandleStateInterpolation(pastState, futureState, (float)_interpolationFactor);

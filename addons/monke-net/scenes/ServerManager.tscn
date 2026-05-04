@@ -4,6 +4,7 @@
 [ext_resource type="Script" uid="uid://y4oqtpls34mr" path="res://addons/monke-net/src/ServerSide/InternalComponents/ServerNetworkClock.cs" id="2_jgjwk"]
 [ext_resource type="Script" uid="uid://b6notwourqxgf" path="res://addons/monke-net/src/ServerSide/InternalComponents/ServerEntityManager.cs" id="3_e5hxh"]
 [ext_resource type="Script" uid="uid://c3qoup1ef6qx2" path="res://addons/monke-net/src/ServerSide/InternalComponents/ServerInputReceiver.cs" id="4_ktnf1"]
+[ext_resource type="Script" uid="uid://djg6dw7b3qlvv" path="res://addons/monke-net/src/ServerSide/InternalComponents/ServerConnectionMonitor.cs" id="5_connmon"]
 
 [node name="ServerManager" type="Node" unique_id=812389524]
 script = ExtResource("1_sjtyc")
@@ -23,5 +24,8 @@ metadata/_custom_type_script = "uid://y4oqtpls34mr"
 [node name="Timer" type="Timer" parent="ServerNetworkClock" unique_id=1773190966]
 wait_time = 5.0
 autostart = true
+
+[node name="ServerConnectionMonitor" type="Node" parent="." unique_id=1063482751]
+script = ExtResource("5_connmon")
 
 [connection signal="timeout" from="ServerNetworkClock/Timer" to="ServerNetworkClock" method="OnTimerTimeout"]

@@ -122,3 +122,27 @@ public struct PackedClientInputMessage : IPackableMessage
         Inputs = reader.ReadSingleTypeArray<IPackableElement>();
     }
 }
+
+public enum DisconnectEntityMode { RemoveEntity, KeepEntity }
+
+public struct SessionTokenMessage : IPackableMessage
+{
+    public required string Token { get; set; }
+
+    public void ReadBytes(MessageReader reader) { Token = reader.ReadString(); }
+    public readonly void WriteBytes(MessageWriter writer) { writer.Write(Token); }
+}
+
+public struct DisconnectNotificationMessage : IPackableMessage
+{
+    public void ReadBytes(MessageReader reader) { }
+    public readonly void WriteBytes(MessageWriter writer) { }
+}
+
+public struct ReclaimEntityMessage : IPackableMessage
+{
+    public required string Token { get; set; }
+
+    public void ReadBytes(MessageReader reader) { Token = reader.ReadString(); }
+    public readonly void WriteBytes(MessageWriter writer) { writer.Write(Token); }
+}

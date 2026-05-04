@@ -118,8 +118,14 @@ Call `MonkeNetManager.Instance.CreateListenServer(port)` instead of separate `Cr
 | Layer | Value | Who |
 |---|---|---|
 | Environment | `1` | Static geometry (default) |
-| ClientPlayers | `2` | LocalPlayer, DummyPlayer |
-| ServerPlayers | `32768` (layer 16) | ServerPlayer (hidden, mask=1 only) |
+| ClientPlayers | `2` | LocalPlayer, DummyPlayer, LocalBall, DummyBall |
+| ServerPlayers | `32768` (layer 16) | ServerPlayer, ServerBall (hidden) |
+
+**Mask values:**
+- Server entities (ServerPlayer, ServerBall): `mask = 32769` (layer 1 + layer 16) — collide with environment AND with each other so the server's authoritative simulation can resolve player–prop interactions.
+- Client entities (LocalPlayer, LocalBall, DummyPlayer, DummyBall): `mask = 3` (layer 1 + layer 2) — collide with environment AND with each other so client prediction matches.
+
+A server entity with `mask = 1` only sees the environment and silently passes through every other server entity — this looks like "the player can't push the ball". Don't use that pattern unless you specifically want the entity to be untouchable by other server entities.
 
 ---
 

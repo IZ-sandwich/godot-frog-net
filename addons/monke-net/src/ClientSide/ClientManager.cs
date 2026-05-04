@@ -1,5 +1,6 @@
 using Godot;
 using ImGuiNET;
+using MonkeNet.NetworkMessages;
 using MonkeNet.Serializer;
 using MonkeNet.Shared;
 
@@ -12,12 +13,20 @@ public partial class ClientManager : Node
 {
     [Signal] public delegate void LatencyCalculatedEventHandler(int latencyAverageTicks, int jitterAverageTicks);
     [Signal] public delegate void NetworkReadyEventHandler();
+    [Signal] public delegate void ServerDisconnectedEventHandler();
+    [Signal] public delegate void ConnectionLostEventHandler();
+    [Signal] public delegate void ConnectionFailedEventHandler();
+    [Signal] public delegate void ServerSilentEventHandler();
+    [Signal] public delegate void ServerRespondedEventHandler();
 
     public delegate void CommandReceivedEventHandler(IPackableMessage command); // Using a C# signal here because the Godot signal wouldn't accept NetworkMessages.IPackableMessage
     public event CommandReceivedEventHandler CommandReceived;
 
     public delegate void ClientTickEventHandler(int tick, IPackableElement command); // Using a C# signal here because the Godot signal wouldn't accept NetworkMessages.IPackableMessage
     public event ClientTickEventHandler ClientTick;
+
+    public delegate void ServerDisconnectedInternalHandler();
+    public event ServerDisconnectedInternalHandler ServerDisconnectedInternal;
 
     public static ClientManager Instance { get; private set; }
 
@@ -32,9 +41,37 @@ public partial class ClientManager : Node
     private bool _networkReady = false;
     public bool IsNetworkReady => _networkReady;
 
+    // Tracks whether we currently have an established server connection.
+    // Used to suppress duplicate ServerDisconnected events during reconnect attempts,
+    // since each failed ENet connection attempt fires PeerDisconnected(1).
+    private bool _serverConnected = false;
+
+    // Set to true between Initialize() and the first PeerConnected(1) so that a failed
+    // connection attempt (ENet fires PeerDisconnected(1) on timeout) emits ConnectionFailed.
+    private bool _connecting = false;
+
+    // Set to true when we initiate a voluntary disconnect so that the resulting
+    // PeerDisconnected(1) does not trigger the ConnectionLost path.
+    private bool _disconnecting = false;
+
     public override void _EnterTree()
     {
         Instance = this;
+    }
+
+    public override void _ExitTree()
+    {
+        if (Instance == this)
+            Instance = null;
+
+        if (_networkManager != null)
+        {
+            _networkManager.PacketReceived -= OnPacketReceived;
+            _networkManager.ClientConnected -= OnPeerConnected;
+            _networkManager.ClientDisconnected -= OnPeerDisconnected;
+        }
+        if (_clock != null)
+            _clock.LatencyCalculated -= OnLatencyCalculated;
     }
 
     public override void _Ready()
@@ -49,7 +86,9 @@ public partial class ClientManager : Node
 
     public override void _Process(double delta)
     {
-        DisplayDebugInformation();
+        // ImGuiRoot autoload is only present in the main project, not in headless/test mode.
+        if (GetTree().Root.HasNode("ImGuiRoot"))
+            DisplayDebugInformation();
     }
 
     // TODO: I don't know if manually stepping physics inside _PhysicsProcess is a good idea,
@@ -70,7 +109,7 @@ public partial class ClientManager : Node
 
         // In listen-server mode the ServerManager already stepped physics this frame;
         // stepping it again here would advance it twice and cause double-speed movement.
-        if (!MonkeNetManager.Instance.IsServer)
+        if (MonkeNetManager.Instance != null && !MonkeNetManager.Instance.IsServer)
         {
             PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
             PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
@@ -88,9 +127,79 @@ public partial class ClientManager : Node
         _clock.LatencyCalculated += OnLatencyCalculated;
 
         _networkManager.PacketReceived += OnPacketReceived;
+        _networkManager.ClientConnected += OnPeerConnected;
+        _networkManager.ClientDisconnected += OnPeerDisconnected;
         _networkManager.CreateClient(address, port);
+        _connecting = true;
 
-        GD.Print("Client Manager Initialized");
+        MonkeLogger.Info("Client Manager Initialized");
+    }
+
+    private void OnPeerConnected(long id)
+    {
+        if (id != 1) return;
+        _connecting = false;
+        _serverConnected = true;
+        MonkeLogger.Info("Connected to server");
+    }
+
+    private void OnPeerDisconnected(long id)
+    {
+        if (id != 1) return; // 1 is always the server's peer ID on the client
+
+        if (!_serverConnected)
+        {
+            if (_connecting) { _connecting = false; EmitSignal(SignalName.ConnectionFailed); }
+            _disconnecting = false;
+            return;
+        }
+
+        bool voluntary = _disconnecting;
+        _disconnecting = false;
+        _serverConnected = false;
+        _networkReady = false;
+        ServerDisconnectedInternal?.Invoke();
+
+        if (voluntary)
+        {
+            MonkeLogger.Info("Disconnected from server");
+            EmitSignal(SignalName.ServerDisconnected);
+        }
+        else
+        {
+            MonkeLogger.Info("Connection to server lost");
+            EmitSignal(SignalName.ConnectionLost);
+        }
+    }
+
+    // Closes the connection without sending DisconnectNotificationMessage.
+    // The server receives no notification and applies TimeoutDisconnectMode entity retention.
+    public void DisconnectUngraceful()
+    {
+        _connecting = false;
+        Callable.From(_networkManager.Disconnect).CallDeferred();
+    }
+
+    public void Disconnect()
+    {
+        _connecting = false;
+        _disconnecting = true;
+
+        if (_serverConnected)
+        {
+            _serverConnected = false;
+            _networkReady = false;
+            MonkeLogger.Info("Disconnecting from server");
+            ServerDisconnectedInternal?.Invoke();
+            EmitSignal(SignalName.ServerDisconnected);
+        }
+
+        // Send disconnect notification while the ENet peer is still open, then close it.
+        // Cleanup above is done synchronously because Close() only fires PeerDisconnected on
+        // the next ENet poll cycle — by which time the scene may already be reloading.
+        SendCommandToServer(new DisconnectNotificationMessage(),
+            INetworkManager.PacketModeEnum.Reliable, (int)ChannelEnum.GameReliable);
+        Callable.From(_networkManager.Disconnect).CallDeferred();
     }
 
     public void SendCommandToServer(IPackableMessage command, INetworkManager.PacketModeEnum mode, int channel)
@@ -117,7 +226,7 @@ public partial class ClientManager : Node
 
     private void OnLatencyCalculated(int currentTick, int latencyAverageTicks, int jitterAverageTicks, int averageClockOffset)
     {
-        GD.Print($"At tick {currentTick}, latency calculations done. Avg. Latency {latencyAverageTicks} ticks, Jitter {jitterAverageTicks}, Offset {averageClockOffset}");
+        // MonkeLogger.Info($"At tick {currentTick}, latency calculations done. Avg. Latency {latencyAverageTicks} ticks, Jitter {jitterAverageTicks}, Offset {averageClockOffset}");
         EmitSignal(SignalName.LatencyCalculated, latencyAverageTicks, jitterAverageTicks);
         EmitSignal(SignalName.NetworkReady); //TODO: calculate this in other way, this should only be emmited once and
                                              //right now it will be emitted every time the clock calculates latency
@@ -132,7 +241,9 @@ public partial class ClientManager : Node
                 | ImGuiWindowFlags.NoResize
                 | ImGuiWindowFlags.AlwaysAutoResize))
         {
-            ImGui.Text($"Network ID {Multiplayer.GetUniqueId()}");
+            ImGui.Text($"Network ID {_networkManager?.GetNetworkId() ?? 0}");
+            string tok = MonkeLogger.CurrentToken?.Length >= 4 ? MonkeLogger.CurrentToken[^4..] : "----";
+            ImGui.Text($"Session Token  ...{tok}");
             ImGui.Text($"Framerate {Engine.GetFramesPerSecond()}fps");
             ImGui.Text($"Physics Tick {Engine.PhysicsTicksPerSecond}hz");
             _clock.DisplayDebugInformation();

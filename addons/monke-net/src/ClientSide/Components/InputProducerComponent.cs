@@ -10,11 +10,17 @@ namespace MonkeNet.Client;
 [GlobalClass, Icon("res://addons/monke-net/resources/gamepad_solid.png")]
 public abstract partial class InputProducerComponent : ClientComponent
 {
-    [Export] private bool _current = true;
+    private bool _current = true;
 
     public override void _Ready()
     {
         Current = true;
+    }
+
+    public override void _ExitTree()
+    {
+        if (MonkeNetConfig.Instance?.InputProducer == this)
+            MonkeNetConfig.Instance.InputProducer = null;
     }
 
     /// <summary>
@@ -28,7 +34,7 @@ public abstract partial class InputProducerComponent : ClientComponent
         get { return _current; }
         set
         {
-            if (_current) { MonkeNetConfig.Instance.InputProducer = this; }
+            if (_current && MonkeNetConfig.Instance != null) { MonkeNetConfig.Instance.InputProducer = this; }
             _current = value;
         }
     }

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Godot;
 
 namespace MonkeNet.Shared;
@@ -15,6 +16,7 @@ public partial class NetworkManagerEnet : Node, INetworkManager
 
     private int _networkId = 0;
     private SceneMultiplayer _multiplayer;
+    private readonly HashSet<int> _connectedPeers = new();
 
     public event INetworkManager.ClientConnectedEventHandler ClientConnected;
     public event INetworkManager.ClientDisconnectedEventHandler ClientDisconnected;
@@ -29,6 +31,9 @@ public partial class NetworkManagerEnet : Node, INetworkManager
     // does not share a peer with the server-side NetworkManagerEnet.
     public void UseCustomMultiplayer(SceneMultiplayer multiplayer)
     {
+        // Close the current peer cleanly before discarding the old SceneMultiplayer,
+        // so the server receives a proper disconnect notification.
+        (_multiplayer?.MultiplayerPeer as ENetMultiplayerPeer)?.Close();
         SubscribeToMultiplayer(multiplayer);
     }
 
@@ -48,33 +53,86 @@ public partial class NetworkManagerEnet : Node, INetworkManager
 
     public void CreateServer(int port, int maxClients = 32)
     {
+        // Null out the old peer so SceneMultiplayer releases its reference before we bind the
+        // port again. Keeping the closed peer assigned can prevent the OS socket from being
+        // reused on the next CreateServer call on the same port.
+        (_multiplayer.MultiplayerPeer as ENetMultiplayerPeer)?.Close();
+        _multiplayer.MultiplayerPeer = null;
+        _connectedPeers.Clear();
         ENetMultiplayerPeer enet = new();
-        enet.CreateServer(port, maxClients);
+        var err = enet.CreateServer(port, maxClients);
+        if (err != Error.Ok)
+        {
+            MonkeLogger.Error($"Failed to create server on port {port}: {err}");
+            return;
+        }
         _multiplayer.MultiplayerPeer = enet;
         _networkId = _multiplayer.GetUniqueId();
-        GD.Print($"Created server, Port:{port} Max Clients:{maxClients}");
+        MonkeLogger.Info($"Created server, Port:{port} Max Clients:{maxClients}");
     }
 
     public void CreateClient(string address, int port)
     {
+        (_multiplayer.MultiplayerPeer as ENetMultiplayerPeer)?.Close();
+        _multiplayer.MultiplayerPeer = null;
+        _connectedPeers.Clear();
         ENetMultiplayerPeer enet = new();
-        enet.CreateClient(address, port);
+        var err = enet.CreateClient(address, port);
+        if (err != Error.Ok)
+        {
+            MonkeLogger.Error($"Failed to connect to {address}:{port}: {err}");
+            return;
+        }
         _multiplayer.MultiplayerPeer = enet;
         _networkId = _multiplayer.GetUniqueId();
-        GD.Print($"Client {_multiplayer.GetUniqueId()} connected to {address}:{port}");
+        MonkeLogger.Info($"Connecting to {address}:{port}");
+    }
+
+    public void Disconnect()
+    {
+        (_multiplayer.MultiplayerPeer as ENetMultiplayerPeer)?.Close();
+        _multiplayer.MultiplayerPeer = null;
+        _connectedPeers.Clear();
     }
 
     public void SendBytes(byte[] bin, int id, int channel, INetworkManager.PacketModeEnum mode)
     {
         if (_multiplayer.MultiplayerPeer?.GetConnectionStatus() != MultiplayerPeer.ConnectionStatus.Connected)
             return;
-        MultiplayerPeer.TransferModeEnum m = mode == INetworkManager.PacketModeEnum.Reliable ? MultiplayerPeer.TransferModeEnum.Reliable : MultiplayerPeer.TransferModeEnum.Unreliable;
-        _multiplayer.SendBytes(bin, id, m, channel);
+        var m = mode == INetworkManager.PacketModeEnum.Reliable
+            ? MultiplayerPeer.TransferModeEnum.Reliable
+            : MultiplayerPeer.TransferModeEnum.Unreliable;
+
+        // When broadcasting (id=0) over ENet, iterate tracked peers individually and skip any
+        // that are not in Connected state. ENet resets channelCount before Godot fires
+        // PeerDisconnected, so a raw broadcast to id=0 can hit a zombie peer and log an error.
+        if (id == 0 && _multiplayer.MultiplayerPeer is ENetMultiplayerPeer enetPeer)
+        {
+            foreach (var peerId in _connectedPeers)
+            {
+                if (enetPeer.GetPeer(peerId)?.GetState() == ENetPacketPeer.PeerState.Connected)
+                    _multiplayer.SendBytes(bin, peerId, m, channel);
+            }
+        }
+        else
+        {
+            _multiplayer.SendBytes(bin, id, m, channel);
+        }
     }
 
     public int PopStatistic(INetworkManager.NetworkStatisticEnum statistic)
     {
-        var enetHost = (_multiplayer.MultiplayerPeer as ENetMultiplayerPeer).Host;
+        // The ENet host is torn down on disconnect. Accessing .Host on an inactive peer
+        // prints a native error and returns null, so bail out early in that case.
+        if (_multiplayer.MultiplayerPeer is not ENetMultiplayerPeer enetPeer)
+            return 0;
+
+        if (enetPeer.GetConnectionStatus() == MultiplayerPeer.ConnectionStatus.Disconnected)
+            return 0;
+
+        var enetHost = enetPeer.Host;
+        if (enetHost == null)
+            return 0;
 
         return statistic switch
         {
@@ -86,18 +144,31 @@ public partial class NetworkManagerEnet : Node, INetworkManager
         };
     }
 
-    public int GetNetworkId()
+    public void DisconnectClient(int clientId, bool force = false)
     {
-        return _networkId;
+        (_multiplayer.MultiplayerPeer as ENetMultiplayerPeer)?.DisconnectPeer(clientId, force);
+    }
+
+    public int GetNetworkId() => _networkId;
+
+    public IReadOnlyCollection<int> GetConnectedPeerIds() => _connectedPeers;
+
+    public int GetPeerRtt(int peerId)
+    {
+        if (_multiplayer.MultiplayerPeer is not ENetMultiplayerPeer enetPeer) return 0;
+        return (int)(enetPeer.GetPeer(peerId)
+            ?.GetStatistic(ENetPacketPeer.PeerStatistic.RoundTripTime) ?? 0);
     }
 
     private void OnPeerConnected(long id)
     {
+        _connectedPeers.Add((int)id);
         ClientConnected?.Invoke(id);
     }
 
     private void OnPeerDisconnected(long id)
     {
+        _connectedPeers.Remove((int)id);
         ClientDisconnected?.Invoke(id);
     }
 

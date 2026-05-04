@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://b7m3xwoaqrktv"]
+
+[ext_resource type="Script" uid="uid://dr62o27fiu7ve" path="res://addons/monke-net/src/Shared/MonkeLogger.cs" id="1_lg9fa"]
+
+[node name="MonkeLogger" type="Node" unique_id=1893745621]
+script = ExtResource("1_lg9fa")

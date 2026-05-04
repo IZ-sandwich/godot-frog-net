@@ -10,6 +10,7 @@
 [ext_resource type="Script" uid="uid://1rpyl54svogx" path="res://addons/monke-net/src/Shared/Nodes/Entities/EntitySpawnConfiguration.cs" id="6_p5x2j"]
 [ext_resource type="PackedScene" uid="uid://cdm6b7x3omwnr" path="res://demo/ball/LocalBall.tscn" id="7_torvr"]
 [ext_resource type="PackedScene" uid="uid://dr73i1u4dj11g" path="res://demo/ball/ServerBall.tscn" id="9_yvb8b"]
+[ext_resource type="PackedScene" uid="uid://dp8a4isumyhew" path="res://demo/ball/DummyBall.tscn" id="10_dumby"]
 
 [sub_resource type="Resource" id="Resource_yvb8b"]
 script = ExtResource("6_p5x2j")
@@ -22,7 +23,7 @@ metadata/_custom_type_script = "uid://1rpyl54svogx"
 script = ExtResource("6_p5x2j")
 EntityType = 1
 ClientAuthorityScene = ExtResource("7_torvr")
-ClientDummyScene = ExtResource("7_torvr")
+ClientDummyScene = ExtResource("10_dumby")
 ServerScene = ExtResource("9_yvb8b")
 metadata/_custom_type_script = "uid://1rpyl54svogx"
 
@@ -52,18 +53,26 @@ grow_horizontal = 2
 grow_vertical = 2
 
 [node name="SpawnButton" type="Button" parent="Menu" unique_id=81406506]
-layout_mode = 0
-offset_left = 456.0
-offset_right = 602.0
+layout_mode = 1
+anchors_preset = 5
+anchor_left = 0.5
+anchor_right = 0.5
+offset_left = -73.0
+offset_right = 73.0
 offset_bottom = 31.0
+grow_horizontal = 2
 text = "Spawn Player"
 
 [node name="SpawnBallButton" type="Button" parent="Menu" unique_id=1672447597]
-layout_mode = 0
-offset_left = 456.0
-offset_top = 31.0
-offset_right = 602.0
-offset_bottom = 62.0
+layout_mode = 1
+anchors_preset = 5
+anchor_left = 0.5
+anchor_right = 0.5
+offset_left = -73.0
+offset_top = 33.0
+offset_right = 73.0
+offset_bottom = 64.0
+grow_horizontal = 2
 text = "Spawn Ball
 "
 
@@ -87,6 +96,22 @@ offset_right = 152.0
 offset_bottom = 93.0
 text = "Host and Connect"
 
+[node name="DisconnectButton" type="Button" parent="Menu" unique_id=396112843]
+visible = false
+layout_mode = 0
+offset_top = 96.0
+offset_right = 152.0
+offset_bottom = 127.0
+text = "Disconnect"
+
+[node name="SimulateTimeoutButton" type="Button" parent="Menu" unique_id=734826195]
+visible = false
+layout_mode = 0
+offset_top = 128.0
+offset_right = 152.0
+offset_bottom = 159.0
+text = "Simulate Timeout"
+
 [node name="ConnectingLabel" type="Label" parent="Menu" unique_id=312984756]
 visible = false
 layout_mode = 1
@@ -104,6 +129,32 @@ grow_vertical = 2
 text = "Connecting..."
 horizontal_alignment = 1
 vertical_alignment = 1
+
+[node name="CancelButton" type="Button" parent="Menu" unique_id=523847219]
+visible = false
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -50.0
+offset_top = 16.0
+offset_right = 50.0
+offset_bottom = 47.0
+grow_horizontal = 2
+grow_vertical = 2
+text = "Cancel"
+
+[node name="StopServerButton" type="Button" parent="Menu" unique_id=654321987]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -152.0
+offset_bottom = 31.0
+grow_horizontal = 0
+text = "Stop Server"
 
 [node name="Map" type="Node" parent="." unique_id=719413025]
 
@@ -182,8 +233,40 @@ use_collision = true
 radius = 1.0
 material = SubResource("StandardMaterial3D_obp5r")
 
+[node name="NetworkStatusPanel" type="VBoxContainer" parent="." unique_id=550312741]
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -200.0
+offset_bottom = 80.0
+grow_horizontal = 0
+grow_vertical = 2
+mouse_filter = 2
+
+[node name="HighPingLabel" type="Label" parent="NetworkStatusPanel" unique_id=620183451]
+visible = false
+layout_mode = 2
+text = "⚠ High Ping"
+horizontal_alignment = 2
+
+[node name="PacketLossLabel" type="Label" parent="NetworkStatusPanel" unique_id=730294562]
+visible = false
+layout_mode = 2
+text = "⚠ Packet Loss"
+horizontal_alignment = 2
+
+[node name="NoResponseLabel" type="Label" parent="NetworkStatusPanel" unique_id=840405673]
+visible = false
+layout_mode = 2
+text = "⚠ No Server Response"
+horizontal_alignment = 2
+
 [connection signal="pressed" from="Menu/SpawnButton" to="." method="OnSpawnButtonPressed"]
 [connection signal="pressed" from="Menu/SpawnBallButton" to="." method="OnSpawnBallButtonPressed"]
 [connection signal="pressed" from="Menu/HostButton" to="." method="OnHostButtonPressed"]
 [connection signal="pressed" from="Menu/ConnectButton" to="." method="OnConnectButtonPressed"]
 [connection signal="pressed" from="Menu/HostAndConnectButton" to="." method="OnHostAndConnectButtonPressed"]
+[connection signal="pressed" from="Menu/DisconnectButton" to="." method="OnDisconnectButtonPressed"]
+[connection signal="pressed" from="Menu/SimulateTimeoutButton" to="." method="OnSimulateTimeoutButtonPressed"]
+[connection signal="pressed" from="Menu/CancelButton" to="." method="OnCancelButtonPressed"]
+[connection signal="pressed" from="Menu/StopServerButton" to="." method="OnStopServerButtonPressed"]

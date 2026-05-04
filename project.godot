@@ -24,6 +24,7 @@ config/icon="res://icon.svg"
 [autoload]
 
 ImGuiRoot="*uid://dugmpnsxaagba"
+MonkeLogger="*uid://b7m3xwoaqrktv"
 MonkeNet="*uid://bchfwceouveq2"
 
 [display]

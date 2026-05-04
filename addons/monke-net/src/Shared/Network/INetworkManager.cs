@@ -1,4 +1,6 @@
-﻿namespace MonkeNet.Shared;
+﻿using System.Collections.Generic;
+
+namespace MonkeNet.Shared;
 
 public interface INetworkManager
 {
@@ -24,8 +26,12 @@ public interface INetworkManager
 
     public void CreateServer(int port, int maxClients = 32);
     public void CreateClient(string address, int port);
+    public void Disconnect();
     public void SendBytes(byte[] bin, int id, int channel, PacketModeEnum mode);
+    public void DisconnectClient(int clientId, bool force = false);
     public int GetNetworkId();
+    public IReadOnlyCollection<int> GetConnectedPeerIds();
+    public int GetPeerRtt(int peerId);
 
     #region Statistics
     public int PopStatistic(NetworkStatisticEnum statistic);

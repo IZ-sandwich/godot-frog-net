@@ -19,7 +19,7 @@ public partial class ServerEntityManager : InternalServerComponent
 
     public override void _EnterTree()
     {
-        _entitySpawner = MonkeNetManager.Instance.EntitySpawner;
+        _entitySpawner = MonkeNetManager.Instance?.EntitySpawner;
     }
 
     public void SendSnapshotData(int currentTick)
@@ -34,6 +34,41 @@ public partial class ServerEntityManager : InternalServerComponent
         {
             SpawnEntity<Node3D>(entityRequest.EntityType, clientId);
         }
+
+        if (command is ReclaimEntityMessage reclaimMsg)
+        {
+            var monitor = GetParent().GetNode<ServerConnectionMonitor>("ServerConnectionMonitor");
+            var entityIds = monitor.ConsumeReclaimToken(reclaimMsg.Token);
+            if (entityIds == null) return;
+
+            foreach (int entityId in entityIds)
+            {
+                var entity = _entitySpawner.Entities.Find(e => e.EntityId == entityId);
+                if (entity == null || entity.Authority != 0) continue;
+
+                entity.Authority = clientId;
+                var entityRoot = _entitySpawner.GetEntityRoot(entity);
+                SendCommandToClient(clientId, new EntityEventMessage
+                {
+                    Event = EntityEventEnum.Destroyed,
+                    EntityId = entity.EntityId,
+                    EntityType = entity.EntityType,
+                    Authority = 0,
+                    Metadata = entity.Metadata
+                }, INetworkManager.PacketModeEnum.Reliable, (int)ChannelEnum.EntityEvent);
+                SendCommandToClient(clientId, new EntityEventMessage
+                {
+                    Event = EntityEventEnum.Created,
+                    EntityId = entity.EntityId,
+                    EntityType = entity.EntityType,
+                    Authority = clientId,
+                    Position = entityRoot?.GlobalPosition ?? Vector3.Zero,
+                    Yaw = entityRoot?.GlobalRotation.Y ?? 0f,
+                    Metadata = entity.Metadata
+                }, INetworkManager.PacketModeEnum.Reliable, (int)ChannelEnum.EntityEvent);
+                MonkeLogger.Info($"ServerEntityManager: entity {entityId} reclaimed by client {clientId}");
+            }
+        }
     }
 
     protected override void OnClientConnected(int clientId)
@@ -41,14 +76,21 @@ public partial class ServerEntityManager : InternalServerComponent
         SyncWorldState(clientId);
     }
 
-    protected override void OnClientDisconnected(int clientId)
+    public List<int> GetEntityIdsForClient(int clientId) =>
+        _entitySpawner.GetAllEntitiesByAuthority(clientId);
+
+    public void DestroyEntitiesForClient(int clientId)
     {
-        //TODO: this will send 1 packet for each entity, do in bulk, same as sync should be done
-        List<int> entitiesGeneratedByAuthority = _entitySpawner.GetAllEntitiesByAuthority(clientId);
-        foreach (int entityId in entitiesGeneratedByAuthority)
-        {
-            DestroyEntity(entityId, (int)NetworkManagerEnet.AudienceMode.Broadcast);
-        }
+        var ids = _entitySpawner.GetAllEntitiesByAuthority(clientId);
+        foreach (int id in ids)
+            DestroyEntity(id, (int)NetworkManagerEnet.AudienceMode.Broadcast);
+    }
+
+    public void OrphanEntitiesForClient(int clientId)
+    {
+        foreach (var entity in _entitySpawner.Entities)
+            if (entity.Authority == clientId)
+                entity.Authority = 0;
     }
 
     /// <summary>

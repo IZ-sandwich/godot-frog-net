@@ -14,12 +14,18 @@ namespace MonkeNet.Client;
 [GlobalClass]
 public partial class ClientInputManager : InternalClientComponent
 {
+    // Maximum number of redundant inputs packed into a single unreliable packet.
+    // ENet's unreliable MTU is 1392 bytes; exceeding it causes higher packet loss.
+    // 15 ticks ≈ 250ms at 60Hz — enough redundancy for realistic packet loss scenarios.
+    [Export] public int MaxRedundantInputs { get => _maxRedundantInputs; set => _maxRedundantInputs = value; }
+    private int _maxRedundantInputs = 15;
+
     private readonly List<ProducedInputForTick> _producedInputs = [];
     private int _lastReceivedTick = 0;
 
     public IPackableElement GenerateAndTransmitInputs(int currentTick)
     {
-        IPackableElement input = MonkeNetConfig.Instance.InputProducer?.GenerateCurrentInput();
+        IPackableElement input = MonkeNetConfig.Instance?.InputProducer?.GenerateCurrentInput();
 
         if (input == null)
         {
@@ -37,18 +43,22 @@ public partial class ClientInputManager : InternalClientComponent
         return input;
     }
 
-    // Pack and send current input + all non acked inputs (redundant inputs).
+    // Pack and send current input + recent non-acked inputs (redundant inputs).
+    // Capped at MaxRedundantInputs to stay within the unreliable MTU.
     private void SendInputsToServer(int currentTick)
     {
+        int start = System.Math.Max(0, _producedInputs.Count - _maxRedundantInputs);
+        int count = _producedInputs.Count - start;
+
         var userCmd = new PackedClientInputMessage
         {
             Tick = currentTick,
-            Inputs = new IPackableElement[_producedInputs.Count]
+            Inputs = new IPackableElement[count]
         };
 
-        for (int i = 0; i < _producedInputs.Count; i++)
+        for (int i = 0; i < count; i++)
         {
-            userCmd.Inputs[i] = _producedInputs[i].Input;
+            userCmd.Inputs[i] = _producedInputs[start + i].Input;
         }
 
         SendCommandToServer(userCmd, INetworkManager.PacketModeEnum.Unreliable, (int)ChannelEnum.ClientInput);

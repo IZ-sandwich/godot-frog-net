@@ -66,15 +66,11 @@ namespace BidirectionalDict
 		/// <inheritdoc/>
 		public void AddOrUpdate(TFirst first, TSecond second)
 		{
-			if (!_firstToSecond.TryAdd(first, second))
-			{
-				_firstToSecond[first] = second;
-			}
+			if (_firstToSecond.TryGetValue(first, out var oldSecond))
+				_secondToFirst.Remove(oldSecond);
 
-			if (!_secondToFirst.TryAdd(second, first))
-			{
-				_secondToFirst[second] = first;
-			}
+			_firstToSecond[first] = second;
+			_secondToFirst[second] = first;
 		}
 
 		/// <inheritdoc/>

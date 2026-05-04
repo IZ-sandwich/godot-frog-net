@@ -16,6 +16,7 @@ public enum InputFlags
 public partial class SharedPlayerMovement : Node
 {
     [Export] private CharacterBody3D _characterBody;
+    [Export] private float _rigidBodyPushStrength = 1.0f;
     public static readonly float MaxRunSpeed = 5;
     public static readonly float MaxWalkSpeed = 2;
     public static readonly float Gravity = 9.8f;
@@ -26,8 +27,29 @@ public partial class SharedPlayerMovement : Node
         Vector3 newVelocity = CalculateVelocity(_characterBody, input);
         _characterBody.Velocity = newVelocity;
         PhysicsUtils.MoveAndSlide(_characterBody);
-        if (input.MoveX != 0 || input.MoveY != 0 || ReadInput(input.Keys, InputFlags.Space))
-            GD.Print($"[Movement] IsOnFloor={_characterBody.IsOnFloor()} Vel=({newVelocity.X:0.0},{newVelocity.Y:0.0},{newVelocity.Z:0.0}) Pos=({_characterBody.GlobalPosition.X:0.0},{_characterBody.GlobalPosition.Y:0.0},{_characterBody.GlobalPosition.Z:0.0})");
+        PushRigidBodies();
+    }
+
+    // CharacterBody3D.MoveAndSlide does not push RigidBody3Ds it slides against — it just
+    // resolves the collision against the player. To push the ball, apply impulse along the
+    // collision normal scaled by how fast the player is moving into the body.
+    private void PushRigidBodies()
+    {
+        int count = _characterBody.GetSlideCollisionCount();
+        for (int i = 0; i < count; i++)
+        {
+            var collision = _characterBody.GetSlideCollision(i);
+            if (collision.GetCollider() is not RigidBody3D rb)
+                continue;
+
+            Vector3 pushDir = -collision.GetNormal();
+            float speedIntoBody = _characterBody.Velocity.Dot(pushDir);
+            if (speedIntoBody <= 0f)
+                continue;
+
+            Vector3 contactOffset = collision.GetPosition() - rb.GlobalPosition;
+            rb.ApplyImpulse(pushDir * speedIntoBody * _rigidBodyPushStrength, contactOffset);
+        }
     }
 
     public static Vector3 CalculateVelocity(CharacterBody3D body, CharacterInputMessage input)

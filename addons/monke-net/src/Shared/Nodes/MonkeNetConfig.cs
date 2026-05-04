@@ -41,6 +41,12 @@ public partial class MonkeNetConfig : MonkeNetNode
         Instance = this;
     }
 
+    public override void _ExitTree()
+    {
+        if (Instance == this)
+            Instance = null;
+    }
+
     public EntitySpawnConfiguration GetSpawnConfigurationForEntityType(byte type)
     {
         return EntitySpawnConfiguration

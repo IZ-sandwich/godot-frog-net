@@ -1,0 +1,26 @@
+<Project Sdk="Godot.NET.Sdk/4.7.0-dev">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>MonkeNet.Tests</RootNamespace>
+    <!-- Godot.NET.Sdk redirects IntermediateOutputPath to .godot/mono/temp/obj/ but
+         BaseIntermediateOutputPath stays at obj/, so the default glob exclusion misses the
+         generated AssemblyInfo.cs/.NETCoreApp files and they get compiled twice. -->
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+  </PropertyGroup>
+
+  <!-- Addon sources are compiled directly into MonkeNetTests.dll via the tests/addons junction.
+       This lets Godot's source generators register ServerManager, ClientManager, etc. in the
+       primary assembly so res:// scene loading works at runtime. No ProjectReference needed. -->
+  <ItemGroup>
+    <PackageReference Include="ImGui.NET" Version="1.91.0.1" />
+    <PackageReference Include="gdUnit4.api" Version="5.*" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.*" />
+    <PackageReference Include="gdUnit4.test.adapter" Version="3.*" />
+  </ItemGroup>
+</Project>

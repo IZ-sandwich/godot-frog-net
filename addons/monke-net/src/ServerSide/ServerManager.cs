@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Godot;
 using ImGuiNET;
 using MonkeNet.Serializer;
@@ -22,6 +23,7 @@ public partial class ServerManager : Node
     private ServerNetworkClock _serverClock;
     private ServerEntityManager _entityManager;
     private ServerInputReceiver _inputReceiver;
+    private ServerConnectionMonitor _connectionMonitor;
 
     private int _currentTick = 0;
 
@@ -35,10 +37,26 @@ public partial class ServerManager : Node
         Engine.MaxFps = 120; // Should be enough...
     }
 
+    public override void _ExitTree()
+    {
+        if (Instance == this)
+            Instance = null;
+
+        if (_networkManager != null)
+        {
+            _networkManager.ClientConnected -= OnClientConnected;
+            _networkManager.ClientDisconnected -= OnClientDisconnected;
+            _networkManager.PacketReceived -= OnPacketReceived;
+        }
+        if (_serverClock != null)
+            _serverClock.NetworkProcessTick -= OnNetworkProcess;
+    }
+
     public override void _Ready()
     {
         _entityManager = GetNode<ServerEntityManager>("ServerEntityManager");
         _inputReceiver = GetNode<ServerInputReceiver>("ServerInputReceiver");
+        _connectionMonitor = GetNode<ServerConnectionMonitor>("ServerConnectionMonitor");
     }
 
     public void Initialize(INetworkManager networkManager, int port)
@@ -54,12 +72,14 @@ public partial class ServerManager : Node
         _networkManager.PacketReceived += OnPacketReceived;
 
         EmitSignal(SignalName.ServerReady);
-        GD.Print("Initialized Server Manager");
+        MonkeLogger.Info("Initialized Server Manager");
     }
 
     public override void _Process(double delta)
     {
-        DisplayDebugInformation();
+        // ImGuiRoot autoload is only present in the main project, not in headless/test mode.
+        if (GetTree().Root.HasNode("ImGuiRoot"))
+            DisplayDebugInformation();
     }
 
     // TODO: I don't know if manually stepping physics inside _PhysicsProcess is a good idea,
@@ -67,6 +87,7 @@ public partial class ServerManager : Node
     // causing multiple calls to the same PhysicsServer methods
     public override void _PhysicsProcess(double delta)
     {
+        if (_serverClock == null) return; // Not yet initialized via Initialize()
         _currentTick = _serverClock.ProcessTick();
 
         EmitSignal(SignalName.ServerTick, _currentTick);
@@ -74,14 +95,18 @@ public partial class ServerManager : Node
 
         _inputReceiver.DropOutdatedInputs(_currentTick); // Delete all inputs that we don't need anymore
 
-        PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
-        PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
+        if (MonkeNetManager.Instance != null)
+        {
+            PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
+            PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
+        }
 
         _entityManager.SendSnapshotData(_currentTick);
     }
 
     private void EntitiesCallProcessTick(int currentTick)
     {
+        if (MonkeNetManager.Instance?.EntitySpawner == null) return;
         foreach (var node in MonkeNetManager.Instance.EntitySpawner.Entities)
         {
             if (node is NetworkBehaviour serverEntity)
@@ -99,7 +124,7 @@ public partial class ServerManager : Node
 
     private void OnTimerTimeout()
     {
-        GD.Print($"Server Status: Tick {_currentTick}, Framerate {Engine.GetFramesPerSecond()}, Physics Tick {Engine.PhysicsTicksPerSecond}hz");
+        MonkeLogger.Info($"Server Status: Tick {_currentTick}, Framerate {Engine.GetFramesPerSecond()}, Physics Tick {Engine.PhysicsTicksPerSecond}hz");
     }
 
     private void OnNetworkProcess(double delta)
@@ -118,6 +143,8 @@ public partial class ServerManager : Node
         return _networkManager.GetNetworkId();
     }
 
+    public ServerEntityManager EntityManager => _entityManager;
+
     public T SpawnEntity<T>(byte entityType, int authority, string metadata = "") where T : Node3D
     {
         return _entityManager.SpawnEntity<T>(entityType, authority, metadata);
@@ -127,6 +154,16 @@ public partial class ServerManager : Node
     {
         _entityManager.DestroyEntity(entityId, targetId);
     }
+
+    public void DisconnectClient(int clientId, bool force = false)
+    {
+        _networkManager.DisconnectClient(clientId, force);
+    }
+
+    public IReadOnlyCollection<int> GetConnectedPeerIds() =>
+        _networkManager.GetConnectedPeerIds();
+
+    public int GetPeerRtt(int peerId) => _networkManager.GetPeerRtt(peerId);
 
     // Route received Input package to the correspondant Network ID
     private void OnPacketReceived(long id, byte[] bin)
@@ -138,13 +175,13 @@ public partial class ServerManager : Node
     private void OnClientConnected(long clientId)
     {
         EmitSignal(SignalName.ClientConnected, (int)clientId);
-        GD.Print($"Client {clientId} connected");
+        MonkeLogger.Info($"Client {clientId} connected");
     }
 
     private void OnClientDisconnected(long clientId)
     {
         EmitSignal(SignalName.ClientDisconnected, (int)clientId);
-        GD.Print($"Client {clientId} disconnected");
+        MonkeLogger.Info($"Client {clientId} disconnected");
     }
 
     private void DisplayDebugInformation()
@@ -160,6 +197,7 @@ public partial class ServerManager : Node
             _serverClock.DisplayDebugInformation();
             _inputReceiver.DisplayDebugInformation();
             _entityManager.DisplayDebugInformation();
+            _connectionMonitor?.DisplayDebugInformation(_inputReceiver);
             ImGui.End();
         }
 

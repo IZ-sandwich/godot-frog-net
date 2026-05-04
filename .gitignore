@@ -426,3 +426,12 @@ TestResults/
 .user
 .old*
 *.old.*
+
+.claude/*
+
+# tests/ junction points — these directories are Windows junctions back to the
+# root addons/ and demo/ dirs, which are already tracked at the repo root.
+# Without this exclusion git follows the junction and commits every source file twice.
+tests/addons/
+tests/demo/
+tests/resources/

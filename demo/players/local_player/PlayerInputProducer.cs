@@ -2,6 +2,7 @@ using GameDemo;
 using Godot;
 using MonkeNet.Client;
 using MonkeNet.Serializer;
+using MonkeNet.Shared;
 
 public partial class PlayerInputProducer : InputProducerComponent
 {
@@ -22,8 +23,8 @@ public partial class PlayerInputProducer : InputProducerComponent
         float moveX = Input.GetAxis("left", "right");
         float moveY = Input.GetAxis("forward", "backward");
         byte keys = GetCurrentPressedKeys();
-        if (moveX != 0 || moveY != 0 || keys != 0)
-            GD.Print($"[InputProducer] MoveX={moveX:0.00} MoveY={moveY:0.00} Keys={keys} Yaw={_cameraController.GetLateralRotationAngle():0.00}");
+        // if (moveX != 0 || moveY != 0 || keys != 0)
+        //     MonkeLogger.Info($"[InputProducer] MoveX={moveX:0.00} MoveY={moveY:0.00} Keys={keys} Yaw={_cameraController.GetLateralRotationAngle():0.00}");
         return new CharacterInputMessage
         {
             MoveX = moveX,

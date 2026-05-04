@@ -9,20 +9,47 @@ public partial class FirstPersonCameraController : Node3D
     [Export] private float _maxVerticalAngle = 90;
 
     private Node3D _rotationHelperY;
+    private ClientManager _subscribedManager;
+    private Callable _networkReadyCallable;
+    private bool _networkReadySubscribed;
 
     public override void _Ready()
     {
         _rotationHelperY = GetParent<Node3D>();
-        if (ClientManager.Instance?.IsNetworkReady == true)
+        var cm = ClientManager.Instance;
+        if (cm?.IsNetworkReady == true)
+        {
             Input.MouseMode = Input.MouseModeEnum.Captured;
-        else if (ClientManager.Instance != null)
-            ClientManager.Instance.NetworkReady += OnNetworkReady;
+        }
+        else if (cm != null)
+        {
+            _networkReadyCallable = Callable.From(OnNetworkReady);
+            _networkReadySubscribed = true;
+            _subscribedManager = cm;
+            cm.Connect(ClientManager.SignalName.NetworkReady, _networkReadyCallable);
+        }
+    }
+
+    public override void _ExitTree()
+    {
+        Input.MouseMode = Input.MouseModeEnum.Visible;
+        if (_networkReadySubscribed && _subscribedManager != null && IsInstanceValid(_subscribedManager))
+        {
+            _subscribedManager.Disconnect(ClientManager.SignalName.NetworkReady, _networkReadyCallable);
+            _networkReadySubscribed = false;
+        }
+        _subscribedManager = null;
     }
 
     private void OnNetworkReady()
     {
         Input.MouseMode = Input.MouseModeEnum.Captured;
-        ClientManager.Instance.NetworkReady -= OnNetworkReady;
+        if (_networkReadySubscribed && _subscribedManager != null)
+        {
+            _subscribedManager.Disconnect(ClientManager.SignalName.NetworkReady, _networkReadyCallable);
+            _networkReadySubscribed = false;
+            _subscribedManager = null;
+        }
     }
 
     public override void _Input(InputEvent @event)
@@ -35,6 +62,11 @@ public partial class FirstPersonCameraController : Node3D
             Vector3 cameraRot = RotationDegrees;
             cameraRot.X = Mathf.Clamp(cameraRot.X, -_maxVerticalAngle, _maxVerticalAngle);
             RotationDegrees = cameraRot;
+
+            // Camera is transformed outside _PhysicsProcess; reset so Godot's built-in
+            // physics interpolation doesn't lerp back to the previous physics-frame pose.
+            ResetPhysicsInterpolation();
+            _rotationHelperY.ResetPhysicsInterpolation();
         }
 
         if (@event is InputEventKey keyEvent)

@@ -2,6 +2,7 @@
 
 [ext_resource type="Script" uid="uid://88nwa67lqidu" path="res://demo/ball/ServerBallStateSyncronizer.cs" id="2_n0w01"]
 [ext_resource type="Script" uid="uid://o8fwa7kmma11" path="res://addons/monke-net/src/Shared/PredictionRigidbody3D.cs" id="3_predrb"]
+[ext_resource type="Script" uid="uid://df8rhrcg15uax" path="res://addons/monke-net/src/Shared/OfflineRigidbody3D.cs" id="4_offrb"]
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_blueball"]
 albedo_color = Color(0.18, 0.45, 0.95, 1)
@@ -37,3 +38,8 @@ metadata/_custom_type_script = "uid://o8fwa7kmma11"
 script = ExtResource("2_n0w01")
 _predictionRb = NodePath("../PredictionRigidbody")
 metadata/_custom_type_script = "uid://clh4o8hlbokjg"
+
+[node name="OfflineRigidbody" type="Node" parent="." unique_id=1602080502 node_paths=PackedStringArray("Body")]
+script = ExtResource("4_offrb")
+Body = NodePath("..")
+metadata/_custom_type_script = "uid://df8rhrcg15uax"

@@ -13,6 +13,14 @@ public partial class ServerManager : Node
     [Signal] public delegate void ServerNetworkTickEventHandler(int currentTick);
     [Signal] public delegate void ClientConnectedEventHandler(int clientId);
     [Signal] public delegate void ClientDisconnectedEventHandler(int clientId);
+    /// <summary>
+    /// Fires after this tick's <see cref="PhysicsServer3D.SpaceStep"/> runs but BEFORE
+    /// <see cref="ServerEntityManager.SendSnapshotData"/>. Listen-server uses this to let
+    /// <see cref="MonkeNet.Client.ClientPredictionManager"/> register its prediction once
+    /// the post-step body state is final, so the snapshot's tick T and the client's
+    /// recorded prediction for tick T reflect the same physics state.
+    /// </summary>
+    [Signal] public delegate void PostPhysicsTickEventHandler(int currentTick);
 
     public delegate void CommandReceivedEventHandler(int clientId, IPackableMessage command); // Using a C# signal here because the Godot signal wouldn't accept NetworkMessages.IPackableMessage
     public event CommandReceivedEventHandler CommandReceived;
@@ -100,6 +108,11 @@ public partial class ServerManager : Node
             PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
             PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
         }
+
+        // Fire BEFORE SendSnapshotData so the listen-server client's deferred
+        // RegisterPrediction commits with the post-step body state, in lockstep with the
+        // snapshot the server is about to dispatch. Has no listeners in pure-server mode.
+        EmitSignal(SignalName.PostPhysicsTick, _currentTick);
 
         _entityManager.SendSnapshotData(_currentTick);
     }

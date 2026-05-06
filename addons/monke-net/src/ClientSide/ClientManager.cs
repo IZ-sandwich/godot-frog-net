@@ -57,6 +57,14 @@ public partial class ClientManager : Node
     public override void _EnterTree()
     {
         Instance = this;
+        // In listen-server mode this manager and ServerManager are siblings under
+        // MonkeNetManager. We must run our _PhysicsProcess (which calls Predict and
+        // queues client-side forces) BEFORE ServerManager's _PhysicsProcess (which runs
+        // the single shared SpaceStep). With the default order ServerManager runs first,
+        // its SpaceStep integrates this frame's server forces but NOT the client's not-
+        // yet-queued ones — the client's impulses lag by a tick and trigger continuous
+        // mispredictions. Lower process_priority = runs earlier.
+        ProcessPriority = -1;
     }
 
     public override void _ExitTree()
@@ -103,20 +111,32 @@ public partial class ClientManager : Node
         // Read and send produced input to the server
         var input = _inputManager.GenerateAndTransmitInputs(currentTick);
 
-        // Call OnProcessTick on all entities, pass current input so they can simulate
+        // Call OnProcessTick on all entities, pass current input so they can simulate.
+        // This queues forces on rigid bodies (and runs MoveAndSlide on the player, which
+        // applies push impulses to networked rigid bodies via SharedPlayerMovement).
         _predictionManager.Predict(currentTick, input);
         ClientTick?.Invoke(currentTick, input);
 
-        // In listen-server mode the ServerManager already stepped physics this frame;
-        // stepping it again here would advance it twice and cause double-speed movement.
-        if (MonkeNetManager.Instance != null && !MonkeNetManager.Instance.IsServer)
+        bool isListenServer = MonkeNetManager.Instance != null && MonkeNetManager.Instance.IsServer;
+
+        if (!isListenServer)
         {
+            // Pure-client mode: this manager owns the SpaceStep. Run it now so forces
+            // queued in Predict integrate, then RegisterPrediction reads post-step state.
             PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
             PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
+            _predictionManager.RegisterPrediction(currentTick, input);
         }
-
-        // Register all local predictions
-        _predictionManager.RegisterPrediction(currentTick, input);
+        else
+        {
+            // Listen-server: the SpaceStep happens in ServerManager._PhysicsProcess,
+            // which runs after this method (we set ProcessPriority = -1 in _EnterTree).
+            // RegisterPrediction must wait for that step to complete so it records
+            // post-step body state — defer it via the PostPhysicsTick signal that
+            // ServerManager fires after its SpaceStep. The stash here makes the deferred
+            // call use the input/tick from THIS frame.
+            _predictionManager.StashForLatePrediction(currentTick, input);
+        }
     }
 
     public void Initialize(INetworkManager networkManager, string address, int port)

@@ -34,6 +34,14 @@ public partial class ClientPredictionManager : InternalClientComponent
     private int _mispredictionLogsThisWindow;
     private const int MispredictionLogsPerSecond = 5;
 
+    // Listen-server: when ClientManager defers RegisterPrediction (because the SpaceStep
+    // happens in ServerManager later this frame), the input + tick are stashed here and
+    // committed by OnServerPostPhysicsTick after the step.
+    private int _pendingTick;
+    private IPackableElement _pendingInput;
+    private bool _hasPendingPrediction;
+    private Server.ServerManager _subscribedServer;
+
     public override void _Ready()
     {
         base._Ready();
@@ -43,6 +51,13 @@ public partial class ClientPredictionManager : InternalClientComponent
         _subscribedSpawner = EntitySpawner.Instance;
         if (_subscribedSpawner != null)
             _subscribedSpawner.EntityDestroyed += OnEntityDestroyed;
+
+        // In listen-server mode, ServerManager exists in the same process and its
+        // _PhysicsProcess runs after ClientManager's. Subscribe to PostPhysicsTick so we
+        // can commit the deferred prediction after the shared SpaceStep.
+        _subscribedServer = Server.ServerManager.Instance;
+        if (_subscribedServer != null)
+            _subscribedServer.PostPhysicsTick += OnServerPostPhysicsTick;
     }
 
     public override void _ExitTree()
@@ -50,6 +65,33 @@ public partial class ClientPredictionManager : InternalClientComponent
         if (_subscribedSpawner != null && IsInstanceValid(_subscribedSpawner))
             _subscribedSpawner.EntityDestroyed -= OnEntityDestroyed;
         _subscribedSpawner = null;
+
+        if (_subscribedServer != null && IsInstanceValid(_subscribedServer))
+            _subscribedServer.PostPhysicsTick -= OnServerPostPhysicsTick;
+        _subscribedServer = null;
+
+        base._ExitTree();
+    }
+
+    /// <summary>
+    /// Listen-server only: ClientManager calls this in place of <see cref="RegisterPrediction"/>
+    /// while the SpaceStep is still pending in ServerManager. The actual RegisterPrediction
+    /// fires from <see cref="OnServerPostPhysicsTick"/> after the step completes.
+    /// </summary>
+    public void StashForLatePrediction(int tick, IPackableElement input)
+    {
+        _pendingTick = tick;
+        _pendingInput = input;
+        _hasPendingPrediction = true;
+    }
+
+    private void OnServerPostPhysicsTick(int serverTick)
+    {
+        if (!_hasPendingPrediction) return;
+        _hasPendingPrediction = false;
+        var input = _pendingInput;
+        _pendingInput = null;
+        RegisterPrediction(_pendingTick, input);
     }
 
     private void OnEntityDestroyed(int entityId)

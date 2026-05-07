@@ -42,6 +42,7 @@ public partial class MainScene : Node3D
     private Button _spawnButton;
     private Button _spawnBallButton;
     private Button _spawnVehicleButton;
+    private Button _spawnRigidPlayerButton;
     private Button _claimVehicleButton;
     private Button _disconnectButton;
     private Button _simulateTimeoutButton;
@@ -72,6 +73,7 @@ public partial class MainScene : Node3D
         _spawnButton = GetNode<Button>("Menu/SpawnButton");
         _spawnBallButton = GetNode<Button>("Menu/SpawnBallButton");
         _spawnVehicleButton = GetNode<Button>("Menu/SpawnVehicleButton");
+        _spawnRigidPlayerButton = GetNode<Button>("Menu/SpawnRigidPlayerButton");
         _claimVehicleButton = GetNode<Button>("Menu/ClaimVehicleButton");
         _disconnectButton = GetNode<Button>("Menu/DisconnectButton");
         _simulateTimeoutButton = GetNode<Button>("Menu/SimulateTimeoutButton");
@@ -91,6 +93,7 @@ public partial class MainScene : Node3D
         _spawnButton.Hide();
         _spawnBallButton.Hide();
         _spawnVehicleButton.Hide();
+        _spawnRigidPlayerButton.Hide();
         _claimVehicleButton.Hide();
         _highPingLabel = GetNode<Label>("NetworkStatusPanel/HighPingLabel");
         _packetLossLabel = GetNode<Label>("NetworkStatusPanel/PacketLossLabel");
@@ -208,6 +211,13 @@ public partial class MainScene : Node3D
         if (ClientManager.Instance == null) return;
         ClientManager.Instance.MakeEntityRequest(1);
         _spawnBallButton.Hide();
+    }
+
+    private void OnSpawnRigidPlayerButtonPressed()
+    {
+        if (ClientManager.Instance == null) return;
+        ClientManager.Instance.MakeEntityRequest(3);
+        _spawnRigidPlayerButton.Hide();
     }
 
     // Spawn a vehicle owned by the server (not by the requesting client). The framework's
@@ -347,6 +357,7 @@ public partial class MainScene : Node3D
         _spawnButton.Show();
         _spawnBallButton.Show();
         _spawnVehicleButton.Show();
+        _spawnRigidPlayerButton.Show();
         _claimVehicleButton.Show();
     }
 
@@ -358,6 +369,7 @@ public partial class MainScene : Node3D
         _spawnButton.Hide();
         _spawnBallButton.Hide();
         _spawnVehicleButton.Hide();
+        _spawnRigidPlayerButton.Hide();
         _claimVehicleButton.Hide();
         MonkeLogger.Info("Connection lost. Returning to main menu.");
         _connectingLabel.Text = "Connection lost.";
@@ -372,6 +384,7 @@ public partial class MainScene : Node3D
         _spawnButton.Hide();
         _spawnBallButton.Hide();
         _spawnVehicleButton.Hide();
+        _spawnRigidPlayerButton.Hide();
         _claimVehicleButton.Hide();
         _connectingLabel.Text = "Failed to connect.";
         GetTree().CreateTimer(2.0f).Timeout += () =>

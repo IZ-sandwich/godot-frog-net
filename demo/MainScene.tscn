@@ -15,6 +15,9 @@
 [ext_resource type="PackedScene" uid="uid://b6sqb51sprj38" path="res://demo/vehicle/ServerVehicle.tscn" id="12_sveh"]
 [ext_resource type="PackedScene" uid="uid://ccbcx6qy3sqf8" path="res://demo/vehicle/DummyVehicle.tscn" id="13_dveh"]
 [ext_resource type="Script" uid="uid://df8rhrcg15uax" path="res://addons/monke-net/src/Shared/OfflineRigidbody3D.cs" id="14_offrb"]
+[ext_resource type="PackedScene" uid="uid://cxytv2su15ym8" path="res://demo/players/rigid_player/LocalRigidPlayer.tscn" id="15_lrp"]
+[ext_resource type="PackedScene" uid="uid://d1a7s0xyfwt6u" path="res://demo/players/rigid_player/ServerRigidPlayer.tscn" id="16_srp"]
+[ext_resource type="PackedScene" uid="uid://66l4uc615yvc" path="res://demo/players/rigid_player/DummyRigidPlayer.tscn" id="17_drp"]
 
 [sub_resource type="Resource" id="Resource_yvb8b"]
 script = ExtResource("6_p5x2j")
@@ -37,6 +40,14 @@ EntityType = 2
 ClientAuthorityScene = ExtResource("11_lveh")
 ClientDummyScene = ExtResource("13_dveh")
 ServerScene = ExtResource("12_sveh")
+metadata/_custom_type_script = "uid://1rpyl54svogx"
+
+[sub_resource type="Resource" id="Resource_rplyr"]
+script = ExtResource("6_p5x2j")
+EntityType = 3
+ClientAuthorityScene = ExtResource("15_lrp")
+ClientDummyScene = ExtResource("17_drp")
+ServerScene = ExtResource("16_srp")
 metadata/_custom_type_script = "uid://1rpyl54svogx"
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_lcinv"]
@@ -65,7 +76,7 @@ script = ExtResource("1_a3xwa")
 
 [node name="MonkeNetConfig" type="Node" parent="." unique_id=1801734743]
 script = ExtResource("2_rf2cd")
-EntitySpawnConfiguration = Array[Object]([SubResource("Resource_yvb8b"), SubResource("Resource_3hf6u"), SubResource("Resource_veh")])
+EntitySpawnConfiguration = Array[Object]([SubResource("Resource_yvb8b"), SubResource("Resource_3hf6u"), SubResource("Resource_veh"), SubResource("Resource_rplyr")])
 metadata/_custom_type_script = "uid://dnkbivw2aixxo"
 
 [node name="Menu" type="Control" parent="." unique_id=796659374]
@@ -108,7 +119,7 @@ offset_bottom = 95.0
 grow_horizontal = 0
 text = "Spawn Vehicle"
 
-[node name="ClaimVehicleButton" type="Button" parent="Menu" unique_id=1672447599]
+[node name="SpawnRigidPlayerButton" type="Button" parent="Menu" unique_id=1672447600]
 layout_mode = 1
 anchors_preset = 1
 anchor_left = 1.0
@@ -116,6 +127,17 @@ anchor_right = 1.0
 offset_left = -160.0
 offset_top = 96.0
 offset_bottom = 127.0
+grow_horizontal = 0
+text = "Spawn Rigid Player"
+
+[node name="ClaimVehicleButton" type="Button" parent="Menu" unique_id=1672447599]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -160.0
+offset_top = 128.0
+offset_bottom = 159.0
 grow_horizontal = 0
 text = "Claim Vehicle"
 
@@ -363,6 +385,7 @@ horizontal_alignment = 2
 [connection signal="pressed" from="Menu/SpawnButton" to="." method="OnSpawnButtonPressed"]
 [connection signal="pressed" from="Menu/SpawnBallButton" to="." method="OnSpawnBallButtonPressed"]
 [connection signal="pressed" from="Menu/SpawnVehicleButton" to="." method="OnSpawnVehicleButtonPressed"]
+[connection signal="pressed" from="Menu/SpawnRigidPlayerButton" to="." method="OnSpawnRigidPlayerButtonPressed"]
 [connection signal="pressed" from="Menu/ClaimVehicleButton" to="." method="OnClaimVehicleButtonPressed"]
 [connection signal="pressed" from="Menu/HostButton" to="." method="OnHostButtonPressed"]
 [connection signal="pressed" from="Menu/ConnectButton" to="." method="OnConnectButtonPressed"]

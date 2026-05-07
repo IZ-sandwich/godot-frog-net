@@ -29,6 +29,9 @@ public partial class LocalVehiclePrediction : ClientPredictedEntity
 
     public override Vector3 GetPosition() => _predictionRb.Body.GlobalPosition;
 
+    public override Vector3 ExtractAuthoritativePosition(IEntityStateData state) =>
+        ((EntityStateMessage)state).Position;
+
     public override bool HasMisspredicted(int tick, IEntityStateData receivedState, Vector3 savedState)
     {
         EntityStateMessage state = (EntityStateMessage)receivedState;

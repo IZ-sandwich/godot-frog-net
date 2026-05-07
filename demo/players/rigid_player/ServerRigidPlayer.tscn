@@ -1,0 +1,38 @@
+[gd_scene format=3 uid="uid://d1a7s0xyfwt6u"]
+
+[ext_resource type="Script" uid="uid://1qt6b47c1pn1" path="res://demo/players/rigid_player/ServerRigidPlayerStateSyncronizer.cs" id="1_srps"]
+[ext_resource type="Script" uid="uid://o8fwa7kmma11" path="res://addons/monke-net/src/Shared/PredictionRigidbody3D.cs" id="2_predrb"]
+[ext_resource type="Script" uid="uid://df8rhrcg15uax" path="res://addons/monke-net/src/Shared/OfflineRigidbody3D.cs" id="3_offrb"]
+
+[sub_resource type="CapsuleMesh" id="CapsuleMesh_srplyr"]
+
+[sub_resource type="CapsuleShape3D" id="CapsuleShape3D_srplyr"]
+
+[node name="ServerRigidPlayer" type="RigidBody3D" unique_id=1602080720]
+collision_layer = 32768
+collision_mask = 32769
+mass = 1.0
+lock_rotation = true
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="." unique_id=1602080721]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0)
+mesh = SubResource("CapsuleMesh_srplyr")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=1602080722]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0)
+shape = SubResource("CapsuleShape3D_srplyr")
+
+[node name="PredictionRigidbody" type="Node" parent="." unique_id=1602080723 node_paths=PackedStringArray("_body")]
+script = ExtResource("2_predrb")
+_body = NodePath("..")
+metadata/_custom_type_script = "uid://o8fwa7kmma11"
+
+[node name="ServerStateSyncronizer" type="Node" parent="." unique_id=1602080724 node_paths=PackedStringArray("_predictionRb")]
+script = ExtResource("1_srps")
+_predictionRb = NodePath("../PredictionRigidbody")
+metadata/_custom_type_script = "uid://clh4o8hlbokjg"
+
+[node name="OfflineRigidbody" type="Node" parent="." unique_id=1602080725 node_paths=PackedStringArray("Body")]
+script = ExtResource("3_offrb")
+Body = NodePath("..")
+metadata/_custom_type_script = "uid://df8rhrcg15uax"

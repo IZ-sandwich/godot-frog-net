@@ -1,0 +1,41 @@
+[gd_scene format=3 uid="uid://cxytv2su15ym8"]
+
+[ext_resource type="Script" uid="uid://7mgo6go2n7rc" path="res://demo/players/rigid_player/LocalRigidPlayerPrediction.cs" id="1_lrpp"]
+[ext_resource type="Script" uid="uid://o8fwa7kmma11" path="res://addons/monke-net/src/Shared/PredictionRigidbody3D.cs" id="2_predrb"]
+[ext_resource type="Script" uid="uid://bqe2nbydcn6ye" path="res://demo/players/local_player/FirstPersonCameraController.cs" id="3_camera"]
+[ext_resource type="Script" uid="uid://pmpqsvm3qlvu" path="res://demo/players/local_player/PlayerInputProducer.cs" id="4_input"]
+
+[sub_resource type="CapsuleShape3D" id="CapsuleShape3D_rplyr"]
+
+[node name="LocalRigidPlayer" type="RigidBody3D" unique_id=1602080700]
+collision_layer = 2
+collision_mask = 3
+mass = 1.0
+lock_rotation = true
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=1602080701]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0)
+shape = SubResource("CapsuleShape3D_rplyr")
+
+[node name="PredictionRigidbody" type="Node" parent="." unique_id=1602080702 node_paths=PackedStringArray("_body")]
+script = ExtResource("2_predrb")
+_body = NodePath("..")
+metadata/_custom_type_script = "uid://o8fwa7kmma11"
+
+[node name="ClientPredictedEntity" type="Node" parent="." unique_id=1602080703 node_paths=PackedStringArray("_predictionRb")]
+script = ExtResource("1_lrpp")
+_predictionRb = NodePath("../PredictionRigidbody")
+metadata/_custom_type_script = "uid://2rptuj0wp7kx"
+
+[node name="RotationHelperY" type="Node3D" parent="." unique_id=1602080704]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.8, 0)
+metadata/_edit_lock_ = true
+
+[node name="Camera" type="Camera3D" parent="RotationHelperY" unique_id=1602080705]
+current = true
+fov = 90.0
+script = ExtResource("3_camera")
+
+[node name="PlayerInputProducer" type="Node" parent="." unique_id=1602080706 node_paths=PackedStringArray("_cameraController")]
+script = ExtResource("4_input")
+_cameraController = NodePath("../RotationHelperY/Camera")

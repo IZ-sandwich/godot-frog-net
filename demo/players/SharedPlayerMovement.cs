@@ -46,7 +46,7 @@ public partial class SharedPlayerMovement : Node
         // Pass the pre-MoveAndSlide velocity. MoveAndSlide zeroes the component into any
         // surface it slides against, so reading _characterBody.Velocity after the call
         // would always report ~0 component into a head-on collision and we'd never push.
-        PushRigidBodies(newVelocity);
+        // PushRigidBodies(newVelocity);
         PushOfflineProps(newVelocity);
     }
 

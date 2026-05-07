@@ -12,9 +12,12 @@ size = Vector3(2, 1, 4)
 [sub_resource type="SphereShape3D" id="SphereShape3D_interact"]
 radius = 3.0
 
-[node name="DummyVehicle" type="StaticBody3D" unique_id=1602080620]
+[node name="DummyVehicle" type="RigidBody3D" unique_id=1602080620]
 collision_layer = 2
 collision_mask = 3
+linear_damp = 1.0
+angular_damp = 2.0
+physics_interpolation_mode = 2
 
 [node name="MeshInstance3D" type="MeshInstance3D" parent="." unique_id=683380220]
 mesh = SubResource("BoxMesh_veh")
@@ -22,9 +25,9 @@ mesh = SubResource("BoxMesh_veh")
 [node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=2065844220]
 shape = SubResource("BoxShape3D_veh")
 
-[node name="ClientInterpolatedEntity" type="Node" parent="." unique_id=1958913710 node_paths=PackedStringArray("_parent")]
+[node name="ClientInterpolatedEntity" type="Node" parent="." unique_id=1958913710 node_paths=PackedStringArray("_body")]
 script = ExtResource("2_dvsi")
-_parent = NodePath("..")
+_body = NodePath("..")
 metadata/_custom_type_script = "uid://dimg286suceeh"
 
 [node name="InteractionArea" type="Area3D" parent="." unique_id=1602080621]

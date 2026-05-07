@@ -14,6 +14,15 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     public virtual Vector3 GetPosition() { return Vector3.Zero; }
 
     /// <summary>
+    /// Extracts the authoritative position from an <see cref="IEntityStateData"/>.
+    /// The framework uses this only for diagnostic logging — concrete entity types
+    /// know which message struct they use and can cast to it. Default returns
+    /// <see cref="Vector3.Zero"/>; override on each predicted entity that wants
+    /// useful misprediction logs.
+    /// </summary>
+    public virtual Vector3 ExtractAuthoritativePosition(IEntityStateData state) { return Vector3.Zero; }
+
+    /// <summary>
     /// Optional silent-correction hook. Called every snapshot when <see cref="HasMisspredicted"/>
     /// returns false — i.e. divergence is below the hard reconcile threshold but may still be
     /// non-zero from accumulated physics nondeterminism (Jolt collision response, friction

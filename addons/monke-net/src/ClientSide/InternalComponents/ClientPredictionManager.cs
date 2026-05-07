@@ -27,12 +27,16 @@ public partial class ClientPredictionManager : InternalClientComponent
     private int _missedLocalState = 0;
     private int _trimmedTotal = 0;
     private ulong _lastTrimWarningMsec;
+    private bool _wasRecentlyTrimmed;   // set when buffer hits cap; signals degraded network to the next misprediction log
     private EntitySpawner _subscribedSpawner;
     // Per-second cap on misprediction diagnostic logs to avoid log spam at 60Hz when
     // mispredictions are rapid-fire. State counts are kept in _misspredictionsCount.
     private ulong _mispredictionWindowStartMsec;
     private int _mispredictionLogsThisWindow;
     private const int MispredictionLogsPerSecond = 5;
+    // Diffs above this are attributed to an external force (remote player hit, server impulse,
+    // physics-object collision). Below it the drift is consistent with Jolt non-determinism.
+    private const float ExternalForceThresholdM = 0.5f;
 
     // Listen-server: when ClientManager defers RegisterPrediction (because the SpaceStep
     // happens in ServerManager later this frame), the input + tick are stashed here and
@@ -147,6 +151,7 @@ public partial class ClientPredictionManager : InternalClientComponent
             int toRemove = _predictedStates.Count - MaxRollbackTicks;
             _predictedStates.RemoveRange(0, toRemove);
             _trimmedTotal += toRemove;
+            _wasRecentlyTrimmed = true;
             LogTrimWarningThrottled();
         }
 
@@ -164,6 +169,10 @@ public partial class ClientPredictionManager : InternalClientComponent
 
     private void ProcessServerState(GameSnapshotMessage receivedSnapshot)
     {
+        // Capture and clear the trim flag so it applies to this snapshot only.
+        bool networkDegraded = _wasRecentlyTrimmed;
+        _wasRecentlyTrimmed = false;
+
         var predictedStateData = _predictedStates.Find(prediction => prediction.Tick == receivedSnapshot.Tick);
         _predictedStates.RemoveAll(predictedState => predictedState.Tick <= receivedSnapshot.Tick);
 
@@ -183,7 +192,7 @@ public partial class ClientPredictionManager : InternalClientComponent
             if (predictableEntity.HasMisspredicted(receivedSnapshot.Tick, authoritativeState, predictedState))
             {
                 _misspredictionsCount++;
-                LogMispredictionThrottled(predictableEntity, predictedState, receivedSnapshot.Tick);
+                LogMispredictionThrottled(predictableEntity, predictedState, authoritativeState, receivedSnapshot.Tick, networkDegraded);
                 RollbackAndResimulate(receivedSnapshot.States, predictedStateData);
                 return;
             }
@@ -254,7 +263,7 @@ public partial class ClientPredictionManager : InternalClientComponent
         }
     }
 
-    private void LogMispredictionThrottled(ClientPredictedEntity entity, Vector3 predictedPos, int tick)
+    private void LogMispredictionThrottled(ClientPredictedEntity entity, Vector3 predictedPos, IEntityStateData authoritativeState, int tick, bool networkDegraded)
     {
         ulong now = Time.GetTicksMsec();
         if (now - _mispredictionWindowStartMsec >= 1000)
@@ -265,12 +274,31 @@ public partial class ClientPredictionManager : InternalClientComponent
         if (_mispredictionLogsThisWindow >= MispredictionLogsPerSecond) return;
         _mispredictionLogsThisWindow++;
 
-        // ClientPredictedEntity inherits from NetworkBehaviour so EntityType is directly
-        // accessible. The log reads like:
-        //   "Misprediction: entity 5 type 2 tick 1234 predicted (1.2, 0.5, 3.1) now (1.8, 0.5, 3.1)"
-        // — enough to disambiguate which entity class is drifting (player=0, ball=1, vehicle=2).
-        Vector3 currentPos = entity.GetPosition();
-        MonkeLogger.Info($"Misprediction: entity {entity.EntityId} type {entity.EntityType} tick {tick} predicted {predictedPos} now {currentPos}");
+        // Log the actual authoritative-vs-predicted comparison the threshold check
+        // is doing, plus its magnitude, so the log directly shows what triggered
+        // reconcile. Previously this logged entity.GetPosition() — the body's
+        // CURRENT pose, possibly several ticks past the snapshot tick — which made
+        // small steady-state drifts look like the misprediction.
+        Vector3 authPos = entity.ExtractAuthoritativePosition(authoritativeState);
+        Vector3 diff = authPos - predictedPos;
+        string cause = ClassifyMisprediction(diff.Length(), networkDegraded);
+        MonkeLogger.Info($"Misprediction [{cause}]: entity {entity.EntityId} type {entity.EntityType} tick {tick} predicted {predictedPos} authoritative {authPos} diff {diff} |diff|={diff.Length():F3}m");
+    }
+
+    // Heuristic cause label for misprediction log messages, matching the known scenario table:
+    //   degraded-network  — prediction buffer was trimmed before this snapshot arrived,
+    //                       indicating snapshot packet-loss or an RTT spike (server used stale input).
+    //   external-force    — diff well above threshold; another body applied an impulse the
+    //                       client couldn't predict (remote player collision, server-side knockback).
+    //   physics-nondeterminism — small drift near threshold; Jolt cross-process floating-point
+    //                       divergence accumulating over time (expected in solo or low-contact play).
+    private static string ClassifyMisprediction(float diffLength, bool networkDegraded)
+    {
+        if (networkDegraded)
+            return "degraded-network";
+        if (diffLength >= ExternalForceThresholdM)
+            return "external-force";
+        return "physics-nondeterminism";
     }
 
     private void LogTrimWarningThrottled()

@@ -58,6 +58,9 @@ public partial class LocalPlayerPrediction : ClientPredictedEntity
         return _characterBody.Position;
     }
 
+    public override Vector3 ExtractAuthoritativePosition(IEntityStateData state) =>
+        ((EntityStateMessage)state).Position;
+
     public override void ApplySoftCorrection(IEntityStateData receivedState, Vector3 savedPositionAtTick)
     {
         if (_softCorrectionBlend <= 0f) return;

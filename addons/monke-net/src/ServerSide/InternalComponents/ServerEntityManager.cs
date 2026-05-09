@@ -33,6 +33,16 @@ public partial class ServerEntityManager : InternalServerComponent
     public void SendSnapshotData(int currentTick)
     {
         var snapshotCommand = PackSnapshot(currentTick);
+        MonkeLogger.Debug($"[NET-SNAP-TX] tick={currentTick} entities={snapshotCommand.States.Length} -> broadcast");
+        for (int i = 0; i < snapshotCommand.States.Length; i++)
+        {
+            var s = snapshotCommand.States[i];
+            // Cast to GameDemo.EntityStateMessage shape via reflection-free interface check would
+            // require the framework to know the demo type — instead, ToString the boxed struct.
+            // Concrete field formatting comes from each IEntityStateData's own override; default
+            // structs print field names which is good enough for replay/debug.
+            MonkeLogger.Debug($"[NET-SNAP-TX]   eid={s.EntityId} state={s}");
+        }
         SendCommandToClient(0, snapshotCommand, INetworkManager.PacketModeEnum.Unreliable, (int)ChannelEnum.Snapshot);
     }
 

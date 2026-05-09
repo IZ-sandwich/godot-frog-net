@@ -11,6 +11,12 @@
   <ItemGroup>
     <Compile Remove="tests/**/*.cs" />
   </ItemGroup>
+  <!-- The multi-process test harness lives at test-harness/ (NOT tests/) because
+       Godot's parent-project resource scan excludes any directory that's also
+       a .NET sub-project — the tests/.godot/ artifacts cause tests/ to be
+       skipped at runtime, so res://tests/... can't be loaded by spawned child
+       Godot processes. Keeping the harness at the project root puts it in
+       the SDK's default compile glob automatically, no explicit Include needed. -->
   <ItemGroup>
     <PackageReference Include="ImGui.NET" Version="1.91.0.1" />
   </ItemGroup>

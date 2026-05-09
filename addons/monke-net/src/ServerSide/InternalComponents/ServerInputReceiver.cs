@@ -44,6 +44,7 @@ public partial class ServerInputReceiver : InternalServerComponent
     {
         bool received;
         IPackableElement result;
+        string source;
 
         if (_pendingInputs.TryGetValue(tick, out var tickInputs)
             && tickInputs.TryGetValue(serverEntity, out result))
@@ -53,6 +54,7 @@ public partial class ServerInputReceiver : InternalServerComponent
             if (!_defaultInputCache.ContainsKey(serverEntity))
                 _defaultInputCache[serverEntity] = (IPackableElement)System.Activator.CreateInstance(result.GetType());
             received = true;
+            source = "received";
         }
         else
         {
@@ -68,12 +70,15 @@ public partial class ServerInputReceiver : InternalServerComponent
                 && _lastInputStored.TryGetValue(serverEntity, out IPackableElement repeat))
             {
                 result = repeat;
+                source = $"repeat(stale={staleTicks})";
             }
             else
             {
                 _defaultInputCache.TryGetValue(serverEntity, out result);
+                source = "default";
             }
         }
+        MonkeLogger.Debug($"[NET-INPUT-CONSUME] tick={tick} eid={serverEntity.EntityId} authority={serverEntity.Authority} source={source} input={result?.ToString() ?? "null"}");
 
         int authority = serverEntity.Authority;
         _missedInputTotal.TryAdd(authority, 0);
@@ -114,6 +119,7 @@ public partial class ServerInputReceiver : InternalServerComponent
 
     private void RegisterCommand(NetworkBehaviour serverEntity, PackedClientInputMessage inputCommand)
     {
+        MonkeLogger.Debug($"[NET-INPUT-RX] eid={serverEntity.EntityId} authority={serverEntity.Authority} latestTick={inputCommand.Tick} batch={inputCommand.Inputs.Length}");
         int offset = inputCommand.Inputs.Length - 1;
         foreach (IPackableElement input in inputCommand.Inputs)
         {
@@ -128,6 +134,7 @@ public partial class ServerInputReceiver : InternalServerComponent
 
             if (value.TryAdd(serverEntity, input))
             {
+                MonkeLogger.Debug($"[NET-INPUT-RX]   tick={tick} input={input}");
                 if (!_pendingTicksPerEntity.TryGetValue(serverEntity, out var ticks))
                 {
                     ticks = new SortedSet<int>();

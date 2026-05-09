@@ -31,6 +31,14 @@ public partial class PredictionRigidbody3D : Node
 
     public RigidBody3D Body => _body;
 
+    /// <summary>
+    /// Optional visual smoother wired in the inspector. Exposed so prediction entities
+    /// can route soft-correction offsets through the visual root instead of mutating
+    /// the body's transform — see <see cref="PredictionVisualSmoothing3D.AddDriftCorrection"/>.
+    /// Returns null when no smoother is wired (sphere meshes, props that don't need it).
+    /// </summary>
+    public PredictionVisualSmoothing3D Smoothing => _smoothing;
+
     private enum PendingKind
     {
         Force,
@@ -98,9 +106,16 @@ public partial class PredictionRigidbody3D : Node
     public void Simulate()
     {
         if (_body == null) return;
+        if (_pending.Count > 0)
+        {
+            MonkeLogger.Debug($"[PHYS-RB-SIMULATE] body={_body.Name} pending={_pending.Count} prePos=({_body.GlobalPosition.X:F3},{_body.GlobalPosition.Y:F3},{_body.GlobalPosition.Z:F3}) preVel=({_body.LinearVelocity.X:F3},{_body.LinearVelocity.Y:F3},{_body.LinearVelocity.Z:F3})");
+        }
         for (int i = 0; i < _pending.Count; i++)
         {
             var p = _pending[i];
+            string atSuffix = (p.Kind == PendingKind.ForceAtPosition || p.Kind == PendingKind.ImpulseAtPosition)
+                ? $" at=({p.Position.X:F3},{p.Position.Y:F3},{p.Position.Z:F3})" : "";
+            MonkeLogger.Debug($"[PHYS-RB-SIMULATE]   {p.Kind} v=({p.Vector.X:F3},{p.Vector.Y:F3},{p.Vector.Z:F3}){atSuffix}");
             switch (p.Kind)
             {
                 case PendingKind.Force: _body.ApplyCentralForce(p.Vector); break;
@@ -153,10 +168,26 @@ public partial class PredictionRigidbody3D : Node
             preVisualRot = _smoothing.Visual.Quaternion;
         }
 
-        _body.GlobalPosition = authoritative.Position;
-        _body.Quaternion = authoritative.Rotation;
+        Vector3 prePos = _body.GlobalPosition;
+        Vector3 preVel = _body.LinearVelocity;
+        Vector3 posDelta = authoritative.Position - prePos;
+        Vector3 velDelta = authoritative.LinearVelocity - preVel;
+        MonkeLogger.Debug($"[PHYS-RB-RECONCILE] body={_body.Name} prePos=({prePos.X:F3},{prePos.Y:F3},{prePos.Z:F3}) -> authPos=({authoritative.Position.X:F3},{authoritative.Position.Y:F3},{authoritative.Position.Z:F3}) |posDelta|={posDelta.Length():F4} preVel=({preVel.X:F3},{preVel.Y:F3},{preVel.Z:F3}) -> authVel=({authoritative.LinearVelocity.X:F3},{authoritative.LinearVelocity.Y:F3},{authoritative.LinearVelocity.Z:F3}) |velDelta|={velDelta.Length():F4} smoothing={smoothingEnabled} pendingDropped={_pending.Count}");
+
+        // Atomic Transform set propagates Position + Rotation to the physics
+        // server in a single update; setting them separately can leave the body
+        // briefly inconsistent and (more importantly) leaves Basis with whatever
+        // scale/shear drift accumulated from prior frames. Reconstructing Basis
+        // from the authoritative quaternion guarantees a clean orthonormal basis.
+        _body.GlobalTransform = new Transform3D(new Basis(authoritative.Rotation), authoritative.Position);
         _body.LinearVelocity = authoritative.LinearVelocity;
         _body.AngularVelocity = authoritative.AngularVelocity;
+        // Clear residual continuous forces / torques. RigidBody3D keeps
+        // ConstantForce/ConstantTorque applied every tick until cleared; if game
+        // code ever called AddConstantForce (not AddImpulse) those would otherwise
+        // outlive the rollback and corrupt the resimulated trajectory.
+        _body.ConstantForce = Vector3.Zero;
+        _body.ConstantTorque = Vector3.Zero;
         _pending.Clear();
         _body.ForceUpdateTransform();
 

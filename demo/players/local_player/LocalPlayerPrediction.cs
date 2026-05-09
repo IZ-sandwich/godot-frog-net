@@ -13,6 +13,10 @@ public partial class LocalPlayerPrediction : ClientPredictedEntity
     // the player via PushRigidBodies' reaction impulses. 3 cm caused every push to trigger
     // a reconcile chain.
     [Export] private float _maxDeviationAllowedSquared = 0.04f;
+    // Linear-velocity divergence threshold (squared, m²/s²). Catches the case where the
+    // player's position is still within tolerance but momentum has drifted (e.g. midair
+    // after a slope-blocked jump on one side only).
+    [Export] private float _maxVelocityDeviationSquared = 0.25f;
     // Per-snapshot fraction of accumulated drift to absorb when below the hard reconcile
     // threshold. 0 disables. Position-only — see LocalVehiclePrediction for why velocity
     // and rotation lerps are deliberately omitted.
@@ -35,15 +39,20 @@ public partial class LocalPlayerPrediction : ClientPredictedEntity
     public override void HandleReconciliation(IEntityStateData receivedState)
     {
         EntityStateMessage state = (EntityStateMessage)receivedState;
+        MonkeLogger.Debug($"[ENTITY-RECONCILE] LocalPlayer eid={EntityId} auth={state} prePos=({_characterBody.Position.X:F3},{_characterBody.Position.Y:F3},{_characterBody.Position.Z:F3}) preVel=({_characterBody.Velocity.X:F3},{_characterBody.Velocity.Y:F3},{_characterBody.Velocity.Z:F3})");
         _characterBody.Position = state.Position;
         _characterBody.Velocity = state.Velocity;
     }
 
     // Check if we have misspredicted
-    public override bool HasMisspredicted(int tick, IEntityStateData receivedState, Vector3 savedPosition)
+    public override bool HasMisspredicted(int tick, IEntityStateData receivedState, RigidbodyState savedState)
     {
         EntityStateMessage state = (EntityStateMessage)receivedState;
-        return (state.Position - savedPosition).LengthSquared() > _maxDeviationAllowedSquared;
+        if ((state.Position - savedState.Position).LengthSquared() > _maxDeviationAllowedSquared)
+            return true;
+        if ((state.Velocity - savedState.LinearVelocity).LengthSquared() > _maxVelocityDeviationSquared)
+            return true;
+        return false;
     }
 
     // When the client is re-simulating inputs, what should we do with it? usually the same we do on process tick
@@ -58,10 +67,21 @@ public partial class LocalPlayerPrediction : ClientPredictedEntity
         return _characterBody.Position;
     }
 
+    // CharacterBody3D snapshot: only position + linear velocity are meaningful. Rotation
+    // and angular velocity stay zero/identity — the player's visible yaw is driven by
+    // input.CameraYaw on the dummy side, not derived from the body.
+    public override RigidbodyState GetSnapshotState() => new RigidbodyState
+    {
+        Position = _characterBody.GlobalPosition,
+        Rotation = Quaternion.Identity,
+        LinearVelocity = _characterBody.Velocity,
+        AngularVelocity = Vector3.Zero,
+    };
+
     public override Vector3 ExtractAuthoritativePosition(IEntityStateData state) =>
         ((EntityStateMessage)state).Position;
 
-    public override void ApplySoftCorrection(IEntityStateData receivedState, Vector3 savedPositionAtTick)
+    public override void ApplySoftCorrection(IEntityStateData receivedState, RigidbodyState savedStateAtTick)
     {
         if (_softCorrectionBlend <= 0f) return;
         // While anchored to a vehicle this is effectively a no-op: TryAnchorToOwnedVehicle
@@ -69,8 +89,10 @@ public partial class LocalPlayerPrediction : ClientPredictedEntity
         // is the correct behaviour — when riding, the player's "real" position is the
         // vehicle's, and soft-correcting it would just fight the anchor.
         var state = (EntityStateMessage)receivedState;
-        Vector3 posError = savedPositionAtTick - state.Position;
-        _characterBody.GlobalPosition -= posError * _softCorrectionBlend;
+        Vector3 posError = savedStateAtTick.Position - state.Position;
+        Vector3 shift = -posError * _softCorrectionBlend;
+        MonkeLogger.Debug($"[PRED-SOFT] LocalPlayer eid={EntityId} posError=({posError.X:F4},{posError.Y:F4},{posError.Z:F4}) blend={_softCorrectionBlend} bodyShift=({shift.X:F4},{shift.Y:F4},{shift.Z:F4})");
+        _characterBody.GlobalPosition += shift;
     }
 
     // While the local client owns a vehicle, skip MoveAndSlide on the player so WASD

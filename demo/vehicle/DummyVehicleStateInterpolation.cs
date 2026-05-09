@@ -28,9 +28,7 @@ public partial class DummyVehicleStateInterpolation : ClientInterpolatedEntity
         var futureState = (EntityStateMessage)future;
 
         Vector3 targetPos = pastState.Position.Lerp(futureState.Position, interpolationFactor);
-        var pastQ = Quaternion.FromEuler(pastState.Rotation);
-        var futureQ = Quaternion.FromEuler(futureState.Rotation);
-        Quaternion targetRot = pastQ.Slerp(futureQ, interpolationFactor).Normalized();
+        Quaternion targetRot = pastState.Rotation.Slerp(futureState.Rotation, interpolationFactor).Normalized();
 
         Vector3 delta = targetPos - _body.GlobalPosition;
 

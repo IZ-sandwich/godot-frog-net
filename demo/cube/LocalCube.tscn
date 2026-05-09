@@ -1,0 +1,39 @@
+[gd_scene format=3 uid="uid://hnno4lwknkkq"]
+
+[ext_resource type="Script" uid="uid://b8b0gwk6gllyg" path="res://demo/ball/LocalBallPrediction.cs" id="2_lcubepred"]
+[ext_resource type="Script" uid="uid://o8fwa7kmma11" path="res://addons/monke-net/src/Shared/PredictionRigidbody3D.cs" id="3_predrb"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_greencube"]
+albedo_color = Color(0.25, 0.85, 0.35, 1)
+
+[sub_resource type="BoxMesh" id="BoxMesh_cube"]
+material = SubResource("StandardMaterial3D_greencube")
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_cube"]
+
+[sub_resource type="PhysicsMaterial" id="PhysicsMaterial_cube"]
+friction = 0.6
+bounce = 0.2
+
+[node name="LocalCube" type="RigidBody3D" unique_id=1700010001]
+collision_layer = 2
+collision_mask = 3
+physics_material_override = SubResource("PhysicsMaterial_cube")
+linear_damp = 0.4
+angular_damp = 0.8
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="." unique_id=1700010002]
+mesh = SubResource("BoxMesh_cube")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=1700010003]
+shape = SubResource("BoxShape3D_cube")
+
+[node name="PredictionRigidbody" type="Node" parent="." unique_id=1700010004 node_paths=PackedStringArray("_body")]
+script = ExtResource("3_predrb")
+_body = NodePath("..")
+metadata/_custom_type_script = "uid://o8fwa7kmma11"
+
+[node name="ClientPredictedEntity" type="Node" parent="." unique_id=1700010005 node_paths=PackedStringArray("_predictionRb")]
+script = ExtResource("2_lcubepred")
+_predictionRb = NodePath("../PredictionRigidbody")
+metadata/_custom_type_script = "uid://2rptuj0wp7kx"

@@ -58,6 +58,13 @@ public partial class ServerManager : Node
         }
         if (_serverClock != null)
             _serverClock.NetworkProcessTick -= OnNetworkProcess;
+
+        // Server-spawned entities live under EntitySpawner (an autoload), so they
+        // survive ServerManager going away unless we explicitly free them. Clear
+        // here so a server tear-down (test runner dispose, server restart in the
+        // same process) doesn't leak rigidbodies into the next session — they'd
+        // otherwise sit in EntitySpawner.Entities polluting subsequent reads.
+        MonkeNetManager.Instance?.EntitySpawner?.ClearServerEntities();
     }
 
     public override void _Ready()
@@ -97,6 +104,7 @@ public partial class ServerManager : Node
     {
         if (_serverClock == null) return; // Not yet initialized via Initialize()
         _currentTick = _serverClock.ProcessTick();
+        MonkeLogger.Debug($"[SERVER-TICK] tick={_currentTick} dt={PhysicsUtils.DeltaTime:F4}");
 
         EmitSignal(SignalName.ServerTick, _currentTick);
         EntitiesCallProcessTick(_currentTick);
@@ -105,6 +113,7 @@ public partial class ServerManager : Node
 
         if (MonkeNetManager.Instance != null)
         {
+            MonkeLogger.Debug($"[SERVER-TICK] tick={_currentTick} SpaceStep");
             PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
             PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
         }
@@ -216,6 +225,8 @@ public partial class ServerManager : Node
                 | ImGuiWindowFlags.NoResize
                 | ImGuiWindowFlags.AlwaysAutoResize))
         {
+            if (ImGui.Button("Mark log"))
+                MonkeLogger.Mark(_currentTick, "server");
             ImGui.Text($"Framerate {Engine.GetFramesPerSecond()}fps");
             ImGui.Text($"Physics Tick {Engine.PhysicsTicksPerSecond}hz");
             _serverClock.DisplayDebugInformation();

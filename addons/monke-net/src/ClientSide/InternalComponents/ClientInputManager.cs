@@ -61,6 +61,8 @@ public partial class ClientInputManager : InternalClientComponent
             userCmd.Inputs[i] = _producedInputs[start + i].Input;
         }
 
+        MonkeLogger.Debug($"[NET-INPUT-TX] latestTick={currentTick} batch={count} latest={(count > 0 ? userCmd.Inputs[count - 1].ToString() : "")}");
+
         SendCommandToServer(userCmd, INetworkManager.PacketModeEnum.Unreliable, (int)ChannelEnum.ClientInput);
     }
 
@@ -69,8 +71,10 @@ public partial class ClientInputManager : InternalClientComponent
     {
         if (command is GameSnapshotMessage snapshot && snapshot.Tick > _lastReceivedTick)
         {
+            int beforeCount = _producedInputs.Count;
             _lastReceivedTick = snapshot.Tick;
             _producedInputs.RemoveAll(input => input.Tick <= snapshot.Tick);
+            MonkeLogger.Debug($"[NET-INPUT-ACK] ackedTick={snapshot.Tick} dropped={beforeCount - _producedInputs.Count} pending={_producedInputs.Count}");
         }
     }
 

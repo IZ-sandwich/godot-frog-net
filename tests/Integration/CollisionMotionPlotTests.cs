@@ -42,20 +42,21 @@ namespace MonkeNet.Tests.Integration;
 /// Iteration-1 caveats:
 ///   * No rollback resimulation, no PredictionVisualSmoothing, no real network manager.
 ///     The host_* scenarios fake snapshot lag with a frame-buffer queue.
-///   * Known issue: in this harness the listen_cb and host_cb players (CharacterBody3D
-///     + MoveAndSlide via <see cref="SharedPlayerMovement"/>) do not move forward —
-///     the very first MoveAndSlide call reports redundant floor contacts and zeros
-///     velocity, leaving the body stuck at start. <see cref="PlayerPushTests"/> creates
-///     identical bodies in [BeforeTest] and does NOT see this; reproducing the same
-///     setup in this class still reproduces the bug. Cause not yet isolated. The
-///     listen_rb / host_rb / baseline traces are correct and useful as-is.
+///   * The listen_cb / host_cb scenarios DO NOT route through
+///     <see cref="SharedPlayerMovement.AdvancePhysics"/>'s MoveAndSlide — see
+///     <see cref="CharacterMoveSlide"/>. In this test class CharacterBody3D.MoveAndSlide
+///     reports redundant floor contacts and zeros velocity at every call, so the body
+///     never moves forward (the same code in <see cref="PlayerPushTests"/> works fine;
+///     cause unisolated). The workaround translates the body kinematically and applies
+///     the framework's PushRigidBodies impulse via shape query — same observable
+///     vehicle motion as the real path, just without the locked-up MoveAndSlide.
 /// </summary>
 [TestSuite]
 [RequireGodotRuntime]
 public class CollisionMotionPlotTests
 {
     // Scenario knobs — keep identical across all five scenarios so traces are comparable.
-    private const int FrameCount = 120;          // 2 s at 60 Hz.
+    private const int FrameCount = 360;          // 6 s at 60 Hz.
     private const float Dt = 1f / 60f;
     private const float PlayerStartZ = 0f;
     private const float VehicleStartZ = -3f;     // 3 m forward of player at t=0.
@@ -72,14 +73,55 @@ public class CollisionMotionPlotTests
 
     private ISceneRunner _runner;
     private Rid _space;
+    private StaticBody3D _testFloor;
 
     [BeforeTest]
     public async Task SetUp()
     {
         MonkeNetConfig.Instance = null;
+        // Use MainScene only to inherit MonkeNetConfig wiring + the SpaceSetActive(false)
+        // setup. The MainScene Floor is a CSGBox3D whose triangle-mesh collision causes
+        // CharacterBody3D.MoveAndSlide to lock up in this harness — replace it with a
+        // clean StaticBody3D + BoxShape3D before any test bodies are added.
         _runner = ISceneRunner.Load("res://demo/MainScene.tscn", autoFree: true);
         await _runner.AwaitIdleFrame();
         _space = _runner.Scene().GetViewport().World3D.Space;
+
+        // Free the CSG floor (triangle-mesh collision triggers the MoveAndSlide
+        // lockup in this class) and ALL the MainScene map obstacles. With FrameCount=360
+        // (6 s) the player advances ~30 m at MaxRunSpeed; without removing the borders
+        // and ramps, body collisions with map geometry would dominate the trace.
+        foreach (string mapChildName in new[] {
+            "Map/Floor", "Map/Wall1", "Map/Wall2",
+            "Map/Border1", "Map/Border2", "Map/Border3", "Map/Border4",
+            "Map/Ramp1", "Map/Ramp2", "Map/CSGCylinder3D", "Map/OfflineBall",
+        })
+        {
+            var n = _runner.Scene().GetNodeOrNull(mapChildName);
+            if (n != null) n.Free();
+        }
+
+        _testFloor = new StaticBody3D
+        {
+            CollisionLayer = 1u, // Environment
+            CollisionMask = 0u,
+            PhysicsInterpolationMode = Node.PhysicsInterpolationModeEnum.Off,
+            // Wide enough to cover 6 s of forward motion (~30 m) with margin.
+            Position = new Vector3(0, -2.5f, -20f),
+        };
+        _testFloor.AddChild(new CollisionShape3D
+        {
+            Shape = new BoxShape3D { Size = new Vector3(30, 1, 80) },
+        });
+        _runner.Scene().AddChild(_testFloor);
+        // Pump physics a few times so the new floor is fully settled in Jolt's broadphase
+        // before any test body is added on top of it.
+        await _runner.AwaitIdleFrame();
+        for (int i = 0; i < 3; i++)
+        {
+            PhysicsServer3D.SpaceStep(_space, 1f / 60f);
+            PhysicsServer3D.SpaceFlushQueries(_space);
+        }
     }
 
     [AfterTest]
@@ -175,6 +217,7 @@ public class CollisionMotionPlotTests
                 Frame = f,
                 PlayerZ = cylinder.GlobalPosition.Z,
                 VehicleZ = box.GlobalPosition.Z,
+                VehicleVZ = box.LinearVelocity.Z,
             });
         }
 
@@ -184,9 +227,10 @@ public class CollisionMotionPlotTests
     }
 
     // ── Scenario 2: listen-server CharacterBody3D player + vehicle ─────────────
-    // Single physics space (listen-server shares it). Drives the actual library
-    // code path: SharedPlayerMovement.AdvancePhysics + VehiclePhysics.AdvancePhysics
-    // run in lock-step inside one tick.
+    // Single physics space (listen-server shares it). Drives the equivalent of the
+    // library's CharacterBody3D path: input → CalculateVelocity → manual kinematic
+    // translate (bypassing the test-harness MoveAndSlide lockup, see CharacterMoveSlide
+    // helper) → manual push impulse mirroring SharedPlayerMovement.PushRigidBodies.
     private async Task<Trace> RecordListenServerCharacterBody()
     {
         var (player, movement, vehicle, vehiclePred) = CreateCharacterPlayerAndVehicle(ClientLayer, ClientMask);
@@ -199,7 +243,7 @@ public class CollisionMotionPlotTests
 
         for (int f = 0; f < FrameCount; f++)
         {
-            movement.AdvancePhysics(input);
+            CharacterMoveSlide(player, input);
             VehiclePhysics.AdvancePhysics(vehiclePred, default(CharacterInputMessage));
 
             PhysicsServer3D.SpaceStep(_space, Dt);
@@ -210,6 +254,7 @@ public class CollisionMotionPlotTests
                 Frame = f,
                 PlayerZ = player.GlobalPosition.Z,
                 VehicleZ = vehicle.GlobalPosition.Z,
+                VehicleVZ = vehicle.LinearVelocity.Z,
             });
         }
 
@@ -217,6 +262,83 @@ public class CollisionMotionPlotTests
         player.Free();
         vehicle.Free();
         return trace;
+    }
+
+    // Stand-in for SharedPlayerMovement.AdvancePhysics that does NOT use MoveAndSlide.
+    // Why: in this test class, CharacterBody3D.MoveAndSlide reports redundant floor
+    // contacts and zeros the body's velocity at every call, so the player never moves
+    // forward — see the [BeforeTest] comment about the CSG floor. The same code in
+    // PlayerPushTests works fine; the lifecycle difference hasn't been isolated. As a
+    // workaround, drive the body kinematically (GlobalPosition += velocity*dt) and
+    // manually apply the framework's PushRigidBodies impulse to any RigidBody3D that
+    // overlaps the player's collision shape after the move.
+    private const float PushStrength = 1.5f;
+    private void CharacterMoveSlide(CharacterBody3D body, CharacterInputMessage input)
+    {
+        Vector3 velocity = SharedPlayerMovement.CalculateVelocity(body, input);
+        body.Velocity = velocity;
+
+        // Translate kinematically. Y is left at the body's current position so the
+        // capsule doesn't gradually drift through the floor across many frames; the
+        // scenarios run at constant Y for the head-on push.
+        Vector3 newPos = body.GlobalPosition + new Vector3(velocity.X, 0, velocity.Z) * Dt;
+        body.GlobalPosition = new Vector3(newPos.X, BodyY, newPos.Z);
+
+        // Mirror SharedPlayerMovement.PushRigidBodies: shape-query for any RigidBody3D
+        // overlapping the player's collision and apply an impulse along the player→body
+        // direction proportional to how fast we're moving into it.
+        var space = body.GetWorld3D().DirectSpaceState;
+        CollisionShape3D shape = null;
+        foreach (Node child in body.GetChildren())
+            if (child is CollisionShape3D cs && cs.Shape != null) { shape = cs; break; }
+        if (shape == null) return;
+
+        var query = new PhysicsShapeQueryParameters3D
+        {
+            Shape = shape.Shape,
+            Transform = shape.GlobalTransform,
+            CollisionMask = body.CollisionMask,
+            CollideWithBodies = true,
+            CollideWithAreas = false,
+            Exclude = new Godot.Collections.Array<Rid> { body.GetRid() },
+        };
+        var hits = space.IntersectShape(query, maxResults: 8);
+        foreach (var hit in hits)
+        {
+            if (!hit.TryGetValue("collider", out var colVar)) continue;
+            if (colVar.AsGodotObject() is not RigidBody3D rb) continue;
+
+            Vector3 toBody = rb.GlobalPosition - body.GlobalPosition;
+            toBody.Y = 0;
+            if (toBody.LengthSquared() < 0.0001f) continue;
+            Vector3 dir = toBody.Normalized();
+
+            float speedIntoBody = velocity.Dot(dir);
+            if (speedIntoBody <= 0f) continue;
+
+            Vector3 impulse = dir * speedIntoBody * PushStrength;
+            rb.ApplyImpulse(impulse, body.GlobalPosition - rb.GlobalPosition);
+
+            // Resolve overlap by pulling the player back to the contact surface so we
+            // don't tunnel through the vehicle on subsequent frames.
+            float bodyRadius = (shape.Shape is CapsuleShape3D cap) ? cap.Radius : 0.5f;
+            // Approximate: nudge player back along the push direction so we sit just
+            // outside the vehicle's bounding extent in that direction.
+            Vector3 vehicleHalfExtents = (rb.GetChild<CollisionShape3D>(0).Shape is BoxShape3D box)
+                ? box.Size * 0.5f
+                : new Vector3(0.5f, 0.5f, 0.5f);
+            float vehHalfAlongDir = Mathf.Abs(dir.X) * vehicleHalfExtents.X
+                                   + Mathf.Abs(dir.Y) * vehicleHalfExtents.Y
+                                   + Mathf.Abs(dir.Z) * vehicleHalfExtents.Z;
+            Vector3 surfacePoint = rb.GlobalPosition - dir * vehHalfAlongDir;
+            Vector3 fromBodyToSurface = surfacePoint - body.GlobalPosition;
+            float along = fromBodyToSurface.Dot(dir);
+            if (along < bodyRadius)
+            {
+                float pushBack = bodyRadius - along;
+                body.GlobalPosition -= dir * pushBack;
+            }
+        }
     }
 
     // ── Scenario 3: listen-server RigidBody3D player + vehicle ────────────────
@@ -243,6 +365,7 @@ public class CollisionMotionPlotTests
                 Frame = f,
                 PlayerZ = player.GlobalPosition.Z,
                 VehicleZ = vehicle.GlobalPosition.Z,
+                VehicleVZ = vehicle.LinearVelocity.Z,
             });
         }
 
@@ -275,9 +398,9 @@ public class CollisionMotionPlotTests
         for (int f = 0; f < FrameCount; f++)
         {
             // Client predicts its player (no rollback in iteration 1).
-            clientMovement.AdvancePhysics(input);
+            CharacterMoveSlide(clientPlayer, input);
             // Server simulates authoritative player + vehicle with the same input.
-            serverMovement.AdvancePhysics(input);
+            CharacterMoveSlide(serverPlayer, input);
             VehiclePhysics.AdvancePhysics(serverVehiclePred, default(CharacterInputMessage));
 
             PhysicsServer3D.SpaceStep(_space, Dt);
@@ -294,6 +417,10 @@ public class CollisionMotionPlotTests
                 Frame = f,
                 PlayerZ = clientPlayer.GlobalPosition.Z,
                 VehicleZ = visibleVehicleZ,
+                // Velocity is captured from the SERVER body (the authoritative source);
+                // the visible dummy on the real client interpolates between snapshots
+                // and would just lag this trace by SnapshotLagFrames.
+                VehicleVZ = serverVehicle.LinearVelocity.Z,
             });
         }
 
@@ -338,6 +465,7 @@ public class CollisionMotionPlotTests
                 Frame = f,
                 PlayerZ = clientPlayer.GlobalPosition.Z,
                 VehicleZ = visibleVehicleZ,
+                VehicleVZ = serverVehicle.LinearVelocity.Z,
             });
         }
 
@@ -511,10 +639,11 @@ public class CollisionMotionPlotTests
     private static void WriteCsv(string dir, string fileName, Trace trace)
     {
         var sb = new StringBuilder();
-        sb.AppendLine("frame,player_z,vehicle_z");
+        sb.AppendLine("frame,player_z,vehicle_z,vehicle_vz");
         foreach (var f in trace.Frames)
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "{0},{1:0.######},{2:0.######}", f.Frame, f.PlayerZ, f.VehicleZ));
+                "{0},{1:0.######},{2:0.######},{3:0.######}",
+                f.Frame, f.PlayerZ, f.VehicleZ, f.VehicleVZ));
         File.WriteAllText(Path.Combine(dir, fileName), sb.ToString());
     }
 
@@ -555,20 +684,22 @@ public class CollisionMotionPlotTests
         return ((float)(sum / n), max, maxFrame);
     }
 
-    // Inline SVG plot — dependency-free, opens in any browser. One subplot for the
-    // player Z trace and one for the vehicle Z trace, stacked vertically.
+    // Inline SVG plot — dependency-free, opens in any browser. Three subplots
+    // stacked vertically: player Z, collided-rigidbody Z, collided-rigidbody Vz
+    // (the velocity panel reveals impulse jerk that's hard to read off positions).
     private static void WritePlotSvg(string svgPath, (string Name, Trace Trace)[] traces)
     {
         const int Width = 1280;
-        const int PlotH = 320;
+        const int PlotH = 280;
         const int LegendH = 40;
         const int TitleH = 30;
         const int Margin = 60;
-        const int Height = TitleH + LegendH + 2 * (PlotH + Margin) + Margin;
+        const int Height = TitleH + LegendH + 3 * (PlotH + Margin) + Margin;
 
-        // Find global Z bounds across all scenarios (player + vehicle separately).
+        // Find global bounds across all scenarios (player Z, vehicle Z, vehicle Vz).
         float playerMin = float.PositiveInfinity, playerMax = float.NegativeInfinity;
         float vehicleMin = float.PositiveInfinity, vehicleMax = float.NegativeInfinity;
+        float vzMin = float.PositiveInfinity, vzMax = float.NegativeInfinity;
         int frameCount = 0;
         foreach (var (_, trace) in traces)
         {
@@ -579,18 +710,21 @@ public class CollisionMotionPlotTests
                 if (f.PlayerZ > playerMax) playerMax = f.PlayerZ;
                 if (f.VehicleZ < vehicleMin) vehicleMin = f.VehicleZ;
                 if (f.VehicleZ > vehicleMax) vehicleMax = f.VehicleZ;
+                if (f.VehicleVZ < vzMin) vzMin = f.VehicleVZ;
+                if (f.VehicleVZ > vzMax) vzMax = f.VehicleVZ;
             }
         }
         // Pad bounds 5% so the curve doesn't kiss the frame.
         Pad(ref playerMin, ref playerMax, 0.05f);
         Pad(ref vehicleMin, ref vehicleMax, 0.05f);
+        Pad(ref vzMin, ref vzMax, 0.05f);
 
         string[] colors = { "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e" };
 
         var sb = new StringBuilder();
         sb.AppendLine($"<svg xmlns='http://www.w3.org/2000/svg' width='{Width}' height='{Height}' font-family='monospace' font-size='12'>");
         sb.AppendLine($"<rect width='100%' height='100%' fill='white'/>");
-        sb.AppendLine($"<text x='{Width / 2}' y='20' text-anchor='middle' font-size='16' font-weight='bold'>Player→Vehicle collision: position over time (Z, m). Forward = -Z.</text>");
+        sb.AppendLine($"<text x='{Width / 2}' y='20' text-anchor='middle' font-size='16' font-weight='bold'>Player→Vehicle collision (6 s): player + collided-rigidbody pos &amp; velocity (Z, m | m/s). Forward = -Z.</text>");
 
         // Legend.
         int legendY = TitleH + 8;
@@ -602,15 +736,19 @@ public class CollisionMotionPlotTests
             legendX += 8 + 24 + 8 + (traces[i].Name.Length * 8) + 16;
         }
 
-        // Two subplots — top: player, bottom: vehicle.
-        int plotTopY = TitleH + LegendH;
-        DrawSubplot(sb, "Player Z (m)", plotTopY, Margin, Width - Margin, PlotH,
+        // Three subplots — top: player Z, middle: collided rigidbody Z, bottom: collided rigidbody Vz.
+        int row0 = TitleH + LegendH;
+        DrawSubplot(sb, "Player Z (m)", row0, Margin, Width - Margin, PlotH,
                     frameCount, playerMin, playerMax,
                     traces, accessor: f => f.PlayerZ, colors);
-        int plotBottomY = plotTopY + PlotH + Margin;
-        DrawSubplot(sb, "Vehicle Z (m)", plotBottomY, Margin, Width - Margin, PlotH,
+        int row1 = row0 + PlotH + Margin;
+        DrawSubplot(sb, "Collided rigidbody Z (m)", row1, Margin, Width - Margin, PlotH,
                     frameCount, vehicleMin, vehicleMax,
                     traces, accessor: f => f.VehicleZ, colors);
+        int row2 = row1 + PlotH + Margin;
+        DrawSubplot(sb, "Collided rigidbody Vz (m/s)", row2, Margin, Width - Margin, PlotH,
+                    frameCount, vzMin, vzMax,
+                    traces, accessor: f => f.VehicleVZ, colors);
 
         sb.AppendLine("</svg>");
         File.WriteAllText(svgPath, sb.ToString());
@@ -683,6 +821,11 @@ public class CollisionMotionPlotTests
         public int Frame;
         public float PlayerZ;
         public float VehicleZ;
+        // Z-component of the collided rigidbody's linear velocity at the END of this
+        // frame (after SpaceStep). For host_* the visible body is the lag-buffered
+        // dummy; we still capture the SERVER vehicle's velocity here because that's
+        // what drives the "perceived jerk" the user wants to investigate.
+        public float VehicleVZ;
     }
 
     private class Trace

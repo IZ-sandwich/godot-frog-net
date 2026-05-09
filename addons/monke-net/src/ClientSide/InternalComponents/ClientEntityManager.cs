@@ -147,6 +147,7 @@ public partial class ClientEntityManager : InternalClientComponent
 
         if (command is EntityEventMessage entityEvent)
         {
+            MonkeLogger.Debug($"[NET-ENTITY-RX] event={entityEvent.Event} eid={entityEvent.EntityId} type={entityEvent.EntityType} authority={entityEvent.Authority} pos=({entityEvent.Position.X:F3},{entityEvent.Position.Y:F3},{entityEvent.Position.Z:F3}) yaw={entityEvent.Yaw:F3}");
             switch (entityEvent.Event)
             {
                 case EntityEventEnum.Created:

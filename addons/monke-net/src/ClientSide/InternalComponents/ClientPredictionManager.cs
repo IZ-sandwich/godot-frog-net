@@ -118,8 +118,15 @@ public partial class ClientPredictionManager : InternalClientComponent
         {
             if (snapshot.Tick > _lastTickReceived)
             {
+                MonkeLogger.Debug($"[NET-SNAP-RX] tick={snapshot.Tick} entities={snapshot.States.Length} (last={_lastTickReceived})");
+                for (int i = 0; i < snapshot.States.Length; i++)
+                    MonkeLogger.Debug($"[NET-SNAP-RX]   state[{i}]={snapshot.States[i]}");
                 _lastTickReceived = snapshot.Tick;
                 ProcessServerState(snapshot);
+            }
+            else
+            {
+                MonkeLogger.Debug($"[NET-SNAP-RX] dropped out-of-order tick={snapshot.Tick} (last={_lastTickReceived})");
             }
         }
     }
@@ -162,7 +169,9 @@ public partial class ClientPredictionManager : InternalClientComponent
             var clientPredictedEntity = entity.GetComponent<ClientPredictedEntity>();
             if (clientPredictedEntity != null)
             {
-                predictedState.Entities.Add(clientPredictedEntity, clientPredictedEntity.GetPosition());
+                var snap = clientPredictedEntity.GetSnapshotState();
+                predictedState.Entities.Add(clientPredictedEntity, snap);
+                MonkeLogger.Debug($"[PRED-REG] tick={tick} eid={clientPredictedEntity.EntityId} input={input} pos=({snap.Position.X:F3},{snap.Position.Y:F3},{snap.Position.Z:F3}) vel=({snap.LinearVelocity.X:F3},{snap.LinearVelocity.Y:F3},{snap.LinearVelocity.Z:F3}) angvel=({snap.AngularVelocity.X:F3},{snap.AngularVelocity.Y:F3},{snap.AngularVelocity.Z:F3})");
             }
         });
     }
@@ -178,7 +187,13 @@ public partial class ClientPredictionManager : InternalClientComponent
 
         if (predictedStateData == default(PredictedState) || predictedStateData.Tick != receivedSnapshot.Tick)
         {
+            // No locally-owned predicted entities means there's nothing to reconcile this
+            // tick — RegisterPrediction never recorded a state for it (no input, or no
+            // ClientPredictedEntity in the scene). This is the normal pre-spawn / spectator
+            // path, not a fault. Don't count it or log it.
+            if (!HasAnyPredictedEntity()) return;
             _missedLocalState++;
+            MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} MISSED-LOCAL-STATE (no matching predicted entry; total missed={_missedLocalState})");
             return;
         }
 
@@ -189,10 +204,15 @@ public partial class ClientPredictionManager : InternalClientComponent
             var predictedState = predictedStateData.Entities[predictableEntity];
             var authoritativeState = FindStateForEntityId(predictableEntity.EntityId, receivedSnapshot.States);
 
+            Vector3 authPos = predictableEntity.ExtractAuthoritativePosition(authoritativeState);
+            Vector3 posDiff = authPos - predictedState.Position;
+            MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} predPos=({predictedState.Position.X:F3},{predictedState.Position.Y:F3},{predictedState.Position.Z:F3}) authPos=({authPos.X:F3},{authPos.Y:F3},{authPos.Z:F3}) |posDiff|={posDiff.Length():F4}m predVel=({predictedState.LinearVelocity.X:F3},{predictedState.LinearVelocity.Y:F3},{predictedState.LinearVelocity.Z:F3})");
+
             if (predictableEntity.HasMisspredicted(receivedSnapshot.Tick, authoritativeState, predictedState))
             {
                 _misspredictionsCount++;
-                LogMispredictionThrottled(predictableEntity, predictedState, authoritativeState, receivedSnapshot.Tick, networkDegraded);
+                MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} MISPREDICTED -> rollback");
+                LogMispredictionThrottled(predictableEntity, predictedState.Position, authoritativeState, receivedSnapshot.Tick, networkDegraded);
                 RollbackAndResimulate(receivedSnapshot.States, predictedStateData);
                 return;
             }
@@ -201,12 +221,29 @@ public partial class ClientPredictionManager : InternalClientComponent
             // a no-op (default impl), but entities like the local vehicle override this to
             // pull body state toward authoritative each snapshot, preventing the small
             // collision-response drifts from accumulating until they exceed the threshold.
+            MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} OK -> soft-correct");
             predictableEntity.ApplySoftCorrection(authoritativeState, predictedState);
         }
     }
 
     private void RollbackAndResimulate(IEntityStateData[] authoritativeStates, PredictedState predictedStateData)
     {
+        // Listen-server short-circuit: client and server share the same World3D.Space, so
+        // the body the client "predicts" IS the server-authoritative body. Stepping the
+        // shared space N times here would advance every other peer's networked rigidbody
+        // too — OfflineRigidbody3D only protects nodes explicitly tagged offline. By
+        // construction (deferred RegisterPrediction via ServerManager.PostPhysicsTick) the
+        // misprediction check should never fire here, but if it does — timing edge case,
+        // float wobble in the velocity threshold check — the safer behaviour is to skip
+        // the destructive resim. Diagnostic counters in ProcessServerState already logged it.
+        if (MonkeNetManager.Instance != null && MonkeNetManager.Instance.IsServer)
+        {
+            MonkeLogger.Debug($"[PRED-ROLLBACK] tick={predictedStateData.Tick} SKIPPED (listen-server, shared physics space)");
+            return;
+        }
+
+        MonkeLogger.Debug($"[PRED-ROLLBACK] tick={predictedStateData.Tick} entities={predictedStateData.Entities.Count} resimTicks={_predictedStates.Count}");
+
         // Snapshot non-networked rigidbodies so the resim's repeated SpaceStep calls
         // don't drift them. Restored after the loop.
         OfflineRigidbody3D.SnapshotAll();
@@ -215,6 +252,7 @@ public partial class ClientPredictionManager : InternalClientComponent
         foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
         {
             var authoritativeState = FindStateForEntityId(predictableEntity.EntityId, authoritativeStates);
+            MonkeLogger.Debug($"[PRED-RECONCILE] tick={predictedStateData.Tick} eid={predictableEntity.EntityId} -> auth={authoritativeState}");
             predictableEntity.HandleReconciliation(authoritativeState);
         }
 
@@ -222,6 +260,7 @@ public partial class ClientPredictionManager : InternalClientComponent
         for (int i = 0; i < _predictedStates.Count; i++)
         {
             var remainingInput = _predictedStates[i];
+            MonkeLogger.Debug($"[PRED-RESIM] resimTick={remainingInput.Tick} entities={remainingInput.Entities.Count} input={remainingInput.Input}");
             foreach (ClientPredictedEntity predictableEntity in remainingInput.Entities.Keys)
             {
                 predictableEntity.ResimulateTick(remainingInput.Input);
@@ -232,11 +271,25 @@ public partial class ClientPredictionManager : InternalClientComponent
 
             foreach (ClientPredictedEntity predictableEntity in remainingInput.Entities.Keys)
             {
-                remainingInput.Entities[predictableEntity] = predictableEntity.GetPosition();
+                var post = predictableEntity.GetSnapshotState();
+                remainingInput.Entities[predictableEntity] = post;
+                MonkeLogger.Debug($"[PRED-RESIM]   eid={predictableEntity.EntityId} postPos=({post.Position.X:F3},{post.Position.Y:F3},{post.Position.Z:F3}) postVel=({post.LinearVelocity.X:F3},{post.LinearVelocity.Y:F3},{post.LinearVelocity.Z:F3})");
             }
         }
 
         OfflineRigidbody3D.RestoreAll();
+        MonkeLogger.Debug($"[PRED-ROLLBACK] complete (offline bodies restored)");
+    }
+
+    private static bool HasAnyPredictedEntity()
+    {
+        if (EntitySpawner.Instance == null) return false;
+        foreach (var entity in EntitySpawner.Instance.ClientEntities)
+        {
+            if (entity.GetComponent<ClientPredictedEntity>() != null)
+                return true;
+        }
+        return false;
     }
 
     private static IEntityStateData FindStateForEntityId(int entityId, IEntityStateData[] authStates)
@@ -313,6 +366,6 @@ public partial class ClientPredictionManager : InternalClientComponent
     {
         public int Tick;                                            // Tick at which the input was taken
         public IPackableElement Input;                              // Input message sent to the server
-        public Dictionary<ClientPredictedEntity, Vector3> Entities;
+        public Dictionary<ClientPredictedEntity, RigidbodyState> Entities;
     }
 }

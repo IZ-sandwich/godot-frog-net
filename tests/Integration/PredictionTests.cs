@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Threading.Tasks;
 using GameDemo;
 using GdUnit4;
+using Godot;
 using MonkeNet.Client;
 using MonkeNet.NetworkMessages;
 using MonkeNet.Serializer;
@@ -29,6 +30,8 @@ public class PredictionTests
     private ISceneRunner _clientRunner;
     private ClientManager _client;
     private ClientPredictionManager _predictionManager;
+    private FakeClientPredictedEntity _fakeEntity;
+    private Node3D _fakeEntityRoot;
 
     [BeforeTest]
     public async Task SetUp()
@@ -55,7 +58,25 @@ public class PredictionTests
     [AfterTest]
     public void TearDown()
     {
+        if (_fakeEntityRoot != null && Godot.GodotObject.IsInstanceValid(_fakeEntityRoot))
+            _fakeEntityRoot.QueueFree();
+        _fakeEntityRoot = null;
+        _fakeEntity = null;
+        EntitySpawner.Instance?.ClientEntities.Clear();
         _clientRunner?.Dispose();
+    }
+
+    // Registers a FakeClientPredictedEntity in EntitySpawner.Instance.ClientEntities so
+    // ProcessServerState's HasAnyPredictedEntity() guard passes — without a registered
+    // predicted entity, missed-local-state increments are skipped as the pre-spawn path.
+    private void RegisterFakePredictedEntity(int entityId = 99)
+    {
+        var spawner = EntitySpawner.Instance;
+        _fakeEntityRoot = new Node3D();
+        _fakeEntity = new FakeClientPredictedEntity { EntityId = entityId };
+        _fakeEntityRoot.AddChild(_fakeEntity);
+        spawner.AddChild(_fakeEntityRoot);
+        spawner.ClientEntities.Add(_fakeEntity);
     }
 
     // I-01 ─────────────────────────────────────────────────────────────────────
@@ -109,6 +130,12 @@ public class PredictionTests
     [TestCase]
     public async Task Prediction_MissedLocalState_Increments_WhenNoPredictionForTick()
     {
+        // A predicted entity must exist for ProcessServerState to count missed states —
+        // the no-entity case is the pre-spawn/spectator path and is intentionally skipped.
+        RegisterFakePredictedEntity();
+        await _clientRunner.AwaitIdleFrame();
+        ClearPredictedStates();
+
         // Empty _predictedStates list — no prediction for tick 99
         var snap = new GameSnapshotMessage
         {
@@ -116,7 +143,6 @@ public class PredictionTests
             States = System.Array.Empty<IEntityStateData>()
         };
         _clientNet.SimulateIncomingPacket(1, MessageSerializer.Serialize(snap));
-        await _clientRunner.AwaitIdleFrame();
 
         int missed = GetMissedLocalState();
         AssertThat(missed).IsGreaterEqual(1);
@@ -174,6 +200,9 @@ public class PredictionTests
     [TestCase]
     public void Prediction_RollbackBeyondCapTreatedAsMissedState()
     {
+        // A predicted entity must exist for ProcessServerState to count missed states —
+        // the no-entity case is the pre-spawn/spectator path and is intentionally skipped.
+        RegisterFakePredictedEntity();
         ClearPredictedStates();
         _predictionManager.MaxRollbackTicks = 5;
         int initialMissed = GetMissedLocalState();
@@ -265,7 +294,7 @@ public class PredictionTests
         stateType.GetField("Input")?.SetValue(state, null);
 
         // Create empty dictionary for Entities field
-        var entitiesType = typeof(Dictionary<ClientPredictedEntity, Godot.Vector3>);
+        var entitiesType = typeof(Dictionary<ClientPredictedEntity, MonkeNet.Shared.RigidbodyState>);
         stateType.GetField("Entities")?.SetValue(state, System.Activator.CreateInstance(entitiesType));
 
         (list as System.Collections.IList)?.Add(state);

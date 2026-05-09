@@ -34,10 +34,18 @@ public partial class ClientPropPrediction : ClientPredictedEntity
 
     public override Vector3 GetPosition() => _rigidBody.Position;
 
-    public override bool HasMisspredicted(int tick, IEntityStateData receivedState, Vector3 savedPosition)
+    public override RigidbodyState GetSnapshotState() => new RigidbodyState
+    {
+        Position = _rigidBody.GlobalPosition,
+        Rotation = _rigidBody.Quaternion,
+        LinearVelocity = _rigidBody.LinearVelocity,
+        AngularVelocity = _rigidBody.AngularVelocity,
+    };
+
+    public override bool HasMisspredicted(int tick, IEntityStateData receivedState, RigidbodyState savedState)
     {
         var state = (PhysicsStateMessage)receivedState;
-        return (state.Position - savedPosition).LengthSquared() > _mispredictionThresholdSquared;
+        return (state.Position - savedState.Position).LengthSquared() > _mispredictionThresholdSquared;
     }
 
     public override void HandleReconciliation(IEntityStateData receivedState)

@@ -12,6 +12,10 @@ namespace GameDemo;
 public partial class MainScene : Node3D
 {
     private static readonly string FLAG_DEDICATED_SERVER = "as_server";
+    // CLI user arg (passed after `--`) that switches MainScene to multi-process
+    // test-harness mode. Detected via OS.GetCmdlineUserArgs() rather than
+    // OS.HasFeature so it works on stock Godot binaries without a custom build.
+    private static readonly string FLAG_TEST_HARNESS = "--test-harness";
 
     // Max distance at which a client may claim a vehicle. Both the server approver and
     // the client-side prompt enforce this; the server is the authoritative check.
@@ -43,6 +47,7 @@ public partial class MainScene : Node3D
     private Button _spawnBallButton;
     private Button _spawnVehicleButton;
     private Button _spawnRigidPlayerButton;
+    private Button _spawnCubeButton;
     private Button _claimVehicleButton;
     private Button _disconnectButton;
     private Button _simulateTimeoutButton;
@@ -74,6 +79,7 @@ public partial class MainScene : Node3D
         _spawnBallButton = GetNode<Button>("Menu/SpawnBallButton");
         _spawnVehicleButton = GetNode<Button>("Menu/SpawnVehicleButton");
         _spawnRigidPlayerButton = GetNode<Button>("Menu/SpawnRigidPlayerButton");
+        _spawnCubeButton = GetNode<Button>("Menu/SpawnCubeButton");
         _claimVehicleButton = GetNode<Button>("Menu/ClaimVehicleButton");
         _disconnectButton = GetNode<Button>("Menu/DisconnectButton");
         _simulateTimeoutButton = GetNode<Button>("Menu/SimulateTimeoutButton");
@@ -94,6 +100,7 @@ public partial class MainScene : Node3D
         _spawnBallButton.Hide();
         _spawnVehicleButton.Hide();
         _spawnRigidPlayerButton.Hide();
+        _spawnCubeButton.Hide();
         _claimVehicleButton.Hide();
         _highPingLabel = GetNode<Label>("NetworkStatusPanel/HighPingLabel");
         _packetLossLabel = GetNode<Label>("NetworkStatusPanel/PacketLossLabel");
@@ -103,6 +110,21 @@ public partial class MainScene : Node3D
         {
             MonkeNetManager.Instance.CreateServer(9999);
             HookServerVehicleHandling();
+        }
+
+        // Multi-process test harness mode. When the child Godot process is
+        // launched with --test-harness as a user arg, MainScene plays the role
+        // of a programmable test harness instead of the demo: it hides the
+        // menu and spins up a TCP orchestration listener that the test process
+        // can drive. This sidesteps a Godot resource-loading quirk where a
+        // custom harness scene under tests/ or test-harness/ fails to load
+        // when launched from inside the gdUnit4 test runner — MainScene is
+        // the project's main scene and is therefore always loadable.
+        if (System.Array.IndexOf(OS.GetCmdlineUserArgs(), FLAG_TEST_HARNESS) >= 0)
+        {
+            GetNode<Control>("Menu").Hide();
+            var harness = new MonkeNet.Tests.MultiProcess.MultiClientHarness();
+            AddChild(harness);
         }
     }
 
@@ -136,8 +158,11 @@ public partial class MainScene : Node3D
             return false;
         }
 
+        // Both player variants are eligible to drive: EntityType 0 = regular CharacterBody3D
+        // player, 3 = rigid-body player. Filtering only by 0 used to silently reject every
+        // claim from a rigid-player client because no matching entity existed.
         var player = EntitySpawner.Instance.Entities
-            .FirstOrDefault(e => e.EntityType == 0 && e.Authority == requesterId);
+            .FirstOrDefault(e => (e.EntityType == 0 || e.EntityType == 3) && e.Authority == requesterId);
         if (player == null)
         {
             MonkeLogger.Warn($"VehicleClaim rejected (client {requesterId}, entity {entityId}): no player entity for client");
@@ -210,7 +235,6 @@ public partial class MainScene : Node3D
     {
         if (ClientManager.Instance == null) return;
         ClientManager.Instance.MakeEntityRequest(1);
-        _spawnBallButton.Hide();
     }
 
     private void OnSpawnRigidPlayerButtonPressed()
@@ -218,6 +242,12 @@ public partial class MainScene : Node3D
         if (ClientManager.Instance == null) return;
         ClientManager.Instance.MakeEntityRequest(3);
         _spawnRigidPlayerButton.Hide();
+    }
+
+    private void OnSpawnCubeButtonPressed()
+    {
+        if (ClientManager.Instance == null) return;
+        ClientManager.Instance.MakeEntityRequest(4);
     }
 
     // Spawn a vehicle owned by the server (not by the requesting client). The framework's
@@ -358,6 +388,7 @@ public partial class MainScene : Node3D
         _spawnBallButton.Show();
         _spawnVehicleButton.Show();
         _spawnRigidPlayerButton.Show();
+        _spawnCubeButton.Show();
         _claimVehicleButton.Show();
     }
 
@@ -370,6 +401,7 @@ public partial class MainScene : Node3D
         _spawnBallButton.Hide();
         _spawnVehicleButton.Hide();
         _spawnRigidPlayerButton.Hide();
+        _spawnCubeButton.Hide();
         _claimVehicleButton.Hide();
         MonkeLogger.Info("Connection lost. Returning to main menu.");
         _connectingLabel.Text = "Connection lost.";
@@ -385,6 +417,7 @@ public partial class MainScene : Node3D
         _spawnBallButton.Hide();
         _spawnVehicleButton.Hide();
         _spawnRigidPlayerButton.Hide();
+        _spawnCubeButton.Hide();
         _claimVehicleButton.Hide();
         _connectingLabel.Text = "Failed to connect.";
         GetTree().CreateTimer(2.0f).Timeout += () =>

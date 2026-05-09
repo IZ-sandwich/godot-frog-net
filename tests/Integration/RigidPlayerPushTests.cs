@@ -349,4 +349,102 @@ public class RigidPlayerPushTests
                 $"advance={vehicleAdvance:F2} m (expected > 1 m).")
             .IsGreater(1f);
     }
+
+    // RP-PUSH-06 ────────────────────────────────────────────────────────────
+    // Player runs head-on into an immovable static wall (no cube — direct contact
+    // chain ends at infinite mass). The user-visible bug is: the rigid player
+    // visibly creeps forward into the cube/wall stack and snaps back to its
+    // original spot every few frames. The single-process root cause is that
+    // RigidPlayerPhysics overwrites velocity to -MaxRunSpeed every tick via
+    // SetLinearVelocity; when the player is in contact with an immovable surface,
+    // Jolt's contact constraint has to reabsorb that fresh -5 m/s every step, but
+    // the integrator has already advanced the body ~8 cm into the wall before
+    // the constraint runs — so during the transient the player penetrates the
+    // wall noticeably before being shoved back.
+    //
+    // The fix: drive horizontal velocity through Jolt's solver (impulse with a
+    // max-acceleration cap) instead of replacing the body's post-contact velocity
+    // wholesale. The contact constraint then absorbs each small impulse before
+    // the integrator can push the body past the contact surface, keeping
+    // overshoot to sub-centimeter.
+    [TestCase]
+    public void RigidPlayerPush_HeadOnIntoStaticWall_DoesNotPenetrate()
+    {
+        SetBodyPosition(_vehicle, new Vector3(50, 50, 50));
+        SetBodyPosition(_ball, new Vector3(50, 50, 50));
+        SetBodyPosition(_player, new Vector3(0, -1f, 0));
+
+        // Static wall front face at z = -2.5 (center -3, half-size 0.5). Player
+        // capsule front face is 0.5 ahead of body, so first contact at
+        // player.Z = -2.0. Anything more forward = wall penetration.
+        var wall = new StaticBody3D
+        {
+            CollisionLayer = 1,
+            PhysicsInterpolationMode = Node.PhysicsInterpolationModeEnum.Off,
+            Position = new Vector3(0, -1f, -3f),
+        };
+        wall.AddChild(new CollisionShape3D
+        {
+            Shape = new BoxShape3D { Size = new Vector3(20, 4, 1) },
+        });
+        _runner.Scene().AddChild(wall);
+
+        PhysicsServer3D.SpaceFlushQueries(_space);
+
+        var input = new CharacterInputMessage { MoveX = 0, MoveY = -1, CameraYaw = 0 };
+
+        // Phase 1: drive up to the wall and settle. After ~30 ticks the body has lost
+        // its free-flight inertia to the wall constraint and Jolt has zeroed its
+        // velocity at rest.
+        for (int i = 0; i < 30; i++)
+        {
+            RigidPlayerPhysics.AdvancePhysics(_predictionRb, input);
+            PhysicsServer3D.SpaceStep(_space, 1f / 60f);
+            PhysicsServer3D.SpaceFlushQueries(_space);
+        }
+
+        // Sanity: body really is at rest against the wall now. If this fails the test
+        // setup is wrong, not the physics under test.
+        AssertThat(Mathf.Abs(_player.LinearVelocity.Z))
+            .OverrideFailureMessage(
+                $"Test setup: player did not reach rest against the wall. " +
+                $"vel.Z={_player.LinearVelocity.Z:F3}, pos.Z={_player.GlobalPosition.Z:F3}.")
+            .IsLess(0.5f);
+
+        // Now press forward one more tick. AdvancePhysics queues its drive op and
+        // Simulate flushes it to the body. The body velocity AFTER this call (and
+        // before the next SpaceStep) is what the integrator will use to advance the
+        // body next step, and it's what the rollback system would record as the
+        // body's post-tick velocity for cross-process comparison.
+        //
+        // The bug: SetLinearVelocity overwrites this to -MaxRunSpeed regardless of
+        // contact, so each tick the integrator advances the body by speed × dt deep
+        // into the wall before the next-tick constraint solver pulls it back. The
+        // intra-step excursion is what the user sees as forward creep + snap-back,
+        // and the per-tick velocity discontinuity (0 → -5 → 0 → -5...) feeds
+        // cross-Jolt nondeterminism into the saved tick states, causing the
+        // velocity-divergence threshold in LocalRigidPlayerPrediction to trip and
+        // hard-reconcile the body — every few snapshots in netplay.
+        //
+        // The fix caps the per-tick velocity change at MaxHorizontalAccel × dt
+        // (~0.83 m/s at 60 Hz). With the body at rest, that's the worst-case post-
+        // Simulate velocity we should ever see — well below the previous design's
+        // -5 m/s.
+        float preSimulateVz = _player.LinearVelocity.Z;
+        RigidPlayerPhysics.AdvancePhysics(_predictionRb, input);
+        float postSimulateVz = _player.LinearVelocity.Z;
+        float velocityInjected = Mathf.Abs(postSimulateVz - preSimulateVz);
+
+        AssertThat(velocityInjected)
+            .OverrideFailureMessage(
+                $"After one tick of forward input against an immovable wall, the body's " +
+                $"horizontal velocity jumped by {velocityInjected:F3} m/s " +
+                $"(pre={preSimulateVz:F3}, post={postSimulateVz:F3}). The contact constraint " +
+                $"had already zeroed the body's velocity, so the input drive should add at " +
+                $"most ~MaxHorizontalAccel × dt ≈ 0.83 m/s. A jump straight to MaxRunSpeed " +
+                $"means SetLinearVelocity is overriding contact response — the integrator " +
+                $"will then shove the body 8 cm/tick into the wall before the next constraint " +
+                $"pass, creating the forward-creep / snap-back pattern. Expected < 1.5 m/s.")
+            .IsLess(1.5f);
+    }
 }

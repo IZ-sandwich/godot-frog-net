@@ -1,4 +1,4 @@
-﻿using Godot;
+using Godot;
 using MonkeNet.Serializer;
 using MonkeNet.Shared;
 
@@ -8,10 +8,24 @@ namespace MonkeNet.Client;
 public partial class ClientPredictedEntity : ClientNetworkBehaviour
 {
     public virtual void OnProcessTick(int tick, IPackableElement input) { }
-    public virtual bool HasMisspredicted(int tick, IEntityStateData receivedState, Vector3 savedState) { return false; }
+    public virtual bool HasMisspredicted(int tick, IEntityStateData receivedState, RigidbodyState savedState) { return false; }
     public virtual void HandleReconciliation(IEntityStateData receivedState) { }
     public virtual void ResimulateTick(IPackableElement input) { }
+
+    /// <summary>
+    /// Position of the entity at the moment of registration. Used by the prediction
+    /// manager only as a quick accessor for diagnostic logging.
+    /// </summary>
     public virtual Vector3 GetPosition() { return Vector3.Zero; }
+
+    /// <summary>
+    /// Snapshot of the entity's full simulation state at the current tick. Stored by
+    /// the prediction manager for each registered tick and passed back to
+    /// <see cref="HasMisspredicted"/> and <see cref="ApplySoftCorrection"/> when a
+    /// server snapshot for that tick arrives. Override on each predicted entity that
+    /// wants velocity-aware misprediction detection — default is zeroed state.
+    /// </summary>
+    public virtual RigidbodyState GetSnapshotState() { return default; }
 
     /// <summary>
     /// Extracts the authoritative position from an <see cref="IEntityStateData"/>.
@@ -31,5 +45,5 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     /// reconcile threshold and snap. Mirrors Fish-Net's LocalReconcileCorrectionType=Smooth.
     /// Default no-op — opt in per entity by overriding.
     /// </summary>
-    public virtual void ApplySoftCorrection(IEntityStateData receivedState, Vector3 savedPositionAtTick) { }
+    public virtual void ApplySoftCorrection(IEntityStateData receivedState, RigidbodyState savedStateAtTick) { }
 }

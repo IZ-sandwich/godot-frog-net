@@ -323,6 +323,45 @@ public class PredictionRigidbodyTests
             .IsLess(0.5f);
     }
 
+    // PR-09 ─────────────────────────────────────────────────────────────────
+    // Regression: ApplySoftCorrection runs every snapshot and routes through
+    // AddDriftCorrection, which used to do `_posOffset += shift; _remaining = DurationSec;`.
+    // Resetting _remaining before any decay had a chance to land let _posOffset
+    // accumulate unbounded under repeated calls, so the visual drifted arbitrarily
+    // far from the body. The fix collapses the currently-rendered offset
+    // (_posOffset * t) into the stored value before stacking the new shift; with
+    // delta < DurationSec between calls the rendered offset converges to a bounded
+    // equilibrium. This test pumps a constant per-frame shift and asserts the
+    // visible offset stays near `shift / (1 - decayRetention)`, not unbounded.
+    [TestCase]
+    public async Task PredictionRigidbody_Smoothing_DriftCorrectionDoesNotAccumulateUnbounded()
+    {
+        var (visualRoot, smoothing) = AttachSmoothing(_body, durationSec: 0.1f);
+        _predictionRb.Initialize(_body, smoothing);
+
+        _body.GlobalPosition = Vector3.Zero;
+        visualRoot.GlobalPosition = Vector3.Zero;
+        await _runner.AwaitIdleFrame();
+
+        // Pump 200 frames of a constant +X shift. With the bug, _posOffset grows by
+        // shift every frame (linearly). With the fix, the visible offset converges.
+        Vector3 perFrameShift = new(0.01f, 0, 0);
+        for (int i = 0; i < 200; i++)
+        {
+            smoothing.AddDriftCorrection(perFrameShift);
+            await _runner.AwaitIdleFrame();
+        }
+
+        // Buggy behaviour: offset ≈ 200 * 0.01 = 2.0m. Bounded behaviour at 60Hz with
+        // DurationSec=0.1s: per-frame retention ≈ (0.1 - 1/60) / 0.1 ≈ 0.833, so
+        // equilibrium ≈ 0.01 / (1 - 0.833) ≈ 0.06m. Use a generous bound to absorb
+        // frame-rate jitter from AwaitIdleFrame.
+        Vector3 finalOffset = visualRoot.GlobalPosition - _body.GlobalPosition;
+        AssertThat(finalOffset.Length())
+            .OverrideFailureMessage($"visual drifted unbounded: offset={finalOffset} (length={finalOffset.Length():F4}m)")
+            .IsLess(0.5f);
+    }
+
     private (Node3D visualRoot, PredictionVisualSmoothing3D smoothing) AttachSmoothing(
         RigidBody3D body, float durationSec)
     {

@@ -46,7 +46,14 @@ public partial class ClientSnapshotInterpolator : InternalClientComponent
         {
             // Add snapshot tu buffer if we don't have any or if it is a future one
             if (_snapshotBuffer.Count <= 0 || snapshot.Tick > _snapshotBuffer[^1].Tick)
+            {
                 _snapshotBuffer.Add(snapshot);
+                MonkeLogger.Debug($"[INTERP-RX] tick={snapshot.Tick} entities={snapshot.States.Length} bufferSize={_snapshotBuffer.Count}");
+            }
+            else
+            {
+                MonkeLogger.Debug($"[INTERP-RX] dropped out-of-order tick={snapshot.Tick} (buffer head={_snapshotBuffer[^1].Tick})");
+            }
         }
     }
 

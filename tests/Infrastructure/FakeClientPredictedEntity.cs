@@ -15,12 +15,13 @@ public partial class FakeClientPredictedEntity : ClientPredictedEntity
     /// <summary>Configures what <see cref="HasMisspredicted"/> returns.</summary>
     public bool HasMisspredictedReturnValue { get; set; } = false;
 
-    public List<(int Tick, IEntityStateData ReceivedState, Vector3 SavedState)> HasMisspredictedCalls { get; } = new();
+    public List<(int Tick, IEntityStateData ReceivedState, RigidbodyState SavedState)> HasMisspredictedCalls { get; } = new();
     public List<IEntityStateData> HandleReconciliationCalls { get; } = new();
     public List<IPackableElement> ResimulateTickCalls { get; } = new();
     public int GetPositionCallCount { get; private set; }
+    public int GetSnapshotStateCallCount { get; private set; }
 
-    public override bool HasMisspredicted(int tick, IEntityStateData receivedState, Vector3 savedState)
+    public override bool HasMisspredicted(int tick, IEntityStateData receivedState, RigidbodyState savedState)
     {
         HasMisspredictedCalls.Add((tick, receivedState, savedState));
         return HasMisspredictedReturnValue;
@@ -40,5 +41,11 @@ public partial class FakeClientPredictedEntity : ClientPredictedEntity
     {
         GetPositionCallCount++;
         return Vector3.Zero;
+    }
+
+    public override RigidbodyState GetSnapshotState()
+    {
+        GetSnapshotStateCallCount++;
+        return default;
     }
 }

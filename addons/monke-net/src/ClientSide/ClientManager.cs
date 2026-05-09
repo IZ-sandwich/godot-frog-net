@@ -80,6 +80,14 @@ public partial class ClientManager : Node
         }
         if (_clock != null)
             _clock.LatencyCalculated -= OnLatencyCalculated;
+
+        // Client-side entities (LocalAuthorityScene / DummyScene instances) live
+        // under EntitySpawner (an autoload), so they survive ClientManager going
+        // away unless we explicitly free them. Clear here so reconnect or scene-
+        // reload doesn't carry over stale entities into the next session.
+        // OnServerDisconnected already does this for the disconnect path; this
+        // covers tree-exit paths (test dispose, scene reload) that bypass it.
+        MonkeNetManager.Instance?.EntitySpawner?.ClearClientEntities();
     }
 
     public override void _Ready()
@@ -107,6 +115,7 @@ public partial class ClientManager : Node
         // Advance Clock
         _clock.ProcessTick();
         int currentTick = _clock.GetCurrentTick();
+        MonkeLogger.Debug($"[CLIENT-TICK] tick={currentTick} dt={PhysicsUtils.DeltaTime:F4}");
 
         // Read and send produced input to the server
         var input = _inputManager.GenerateAndTransmitInputs(currentTick);
@@ -123,6 +132,7 @@ public partial class ClientManager : Node
         {
             // Pure-client mode: this manager owns the SpaceStep. Run it now so forces
             // queued in Predict integrate, then RegisterPrediction reads post-step state.
+            MonkeLogger.Debug($"[CLIENT-TICK] tick={currentTick} SpaceStep (pure-client)");
             PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
             PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
             _predictionManager.RegisterPrediction(currentTick, input);
@@ -291,6 +301,8 @@ public partial class ClientManager : Node
                 | ImGuiWindowFlags.NoResize
                 | ImGuiWindowFlags.AlwaysAutoResize))
         {
+            if (ImGui.Button("Mark log"))
+                MonkeLogger.Mark(_clock?.GetCurrentTick() ?? 0, "client");
             ImGui.Text($"Network ID {_networkManager?.GetNetworkId() ?? 0}");
             string tok = MonkeLogger.CurrentToken?.Length >= 4 ? MonkeLogger.CurrentToken[^4..] : "----";
             ImGui.Text($"Session Token  ...{tok}");

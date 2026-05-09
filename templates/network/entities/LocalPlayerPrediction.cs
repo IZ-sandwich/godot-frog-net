@@ -26,10 +26,10 @@ public partial class LocalPlayerPrediction : ClientPredictedEntity
         // _playerMovement.AdvancePhysics((PlayerInputMessage)input);
     }
 
-    public override bool HasMisspredicted(int tick, IEntityStateData receivedState, Vector3 savedPosition)
+    public override bool HasMisspredicted(int tick, IEntityStateData receivedState, RigidbodyState savedState)
     {
         var state = (PlayerStateMessage)receivedState;
-        return (state.Position - savedPosition).LengthSquared() > _mispredictionThresholdSquared;
+        return (state.Position - savedState.Position).LengthSquared() > _mispredictionThresholdSquared;
     }
 
     public override void HandleReconciliation(IEntityStateData receivedState)
@@ -47,4 +47,12 @@ public partial class LocalPlayerPrediction : ClientPredictedEntity
     }
 
     public override Vector3 GetPosition() => _characterBody.Position;
+
+    public override RigidbodyState GetSnapshotState() => new RigidbodyState
+    {
+        Position = _characterBody.GlobalPosition,
+        Rotation = Quaternion.Identity,
+        LinearVelocity = _characterBody.Velocity,
+        AngularVelocity = Vector3.Zero,
+    };
 }

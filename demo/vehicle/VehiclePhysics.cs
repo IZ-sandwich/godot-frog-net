@@ -35,6 +35,8 @@ public static class VehiclePhysics
         float throttle = -input.MoveY;                   // W maps to MoveY = -1, treat as forward.
         float steering = -input.MoveX;                   // A maps to MoveX = -1, treat as left turn.
 
+        MonkeLogger.Debug($"[PHYS-VEHICLE] body={body.Name} input=({input}) throttle={throttle:F3} steering={steering:F3} forward=({forward.X:F3},{forward.Y:F3},{forward.Z:F3}) prePos=({body.GlobalPosition.X:F3},{body.GlobalPosition.Y:F3},{body.GlobalPosition.Z:F3}) preVel=({body.LinearVelocity.X:F3},{body.LinearVelocity.Y:F3},{body.LinearVelocity.Z:F3}) preAngVel=({body.AngularVelocity.X:F3},{body.AngularVelocity.Y:F3},{body.AngularVelocity.Z:F3})");
+
         if (Mathf.Abs(throttle) > 0.01f)
             predictionRb.AddForce(forward * throttle * ForwardThrust);
 

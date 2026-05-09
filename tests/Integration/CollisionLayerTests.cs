@@ -126,7 +126,7 @@ public class CollisionLayerTests
         {
             EntityId = 1,
             Position = Vector3.Zero,
-            Rotation = Vector3.Zero,
+            Rotation = Quaternion.Identity,
             Velocity = Vector3.Zero,
             AngularVelocity = Vector3.Zero,
         };
@@ -134,7 +134,7 @@ public class CollisionLayerTests
         {
             EntityId = 1,
             Position = new Vector3(0.1f, 0, 0),       // small delta — soft-correct path
-            Rotation = Vector3.Zero,
+            Rotation = Quaternion.Identity,
             Velocity = new Vector3(3, 0, 0),
             AngularVelocity = new Vector3(0, 5, 0),
         };

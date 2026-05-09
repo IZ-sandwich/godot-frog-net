@@ -21,7 +21,7 @@ public partial class ServerBallStateSyncronizer : ServerStateSyncronizer
             EntityId = this.EntityId,
             Yaw = 0,
             Position = state.Position,
-            Rotation = state.Rotation.GetEuler(),
+            Rotation = state.Rotation,
             Velocity = state.LinearVelocity,
             AngularVelocity = state.AngularVelocity,
         };

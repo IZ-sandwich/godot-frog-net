@@ -131,7 +131,7 @@ public class RollbackTests
                     Position = new Vector3(1f, 2f, 3f),
                     Velocity = Vector3.Zero,
                     AngularVelocity = Vector3.Zero,
-                    Rotation = Vector3.Zero,
+                    Rotation = Quaternion.Identity,
                     Yaw = 0f,
                 }
             }

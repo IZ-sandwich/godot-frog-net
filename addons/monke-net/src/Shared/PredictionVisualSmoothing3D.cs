@@ -122,6 +122,51 @@ public partial class PredictionVisualSmoothing3D : Node3D
         }
     }
 
+    /// <summary>
+    /// Visual-only soft correction. Adds <paramref name="worldOffset"/> to the offset
+    /// between the visual mesh and the body, then decays it back to zero over
+    /// <see cref="DurationSec"/>. Use from per-snapshot soft-correction logic that wants
+    /// to nudge the rendered pose toward authoritative without disturbing the simulated
+    /// body — mutating <c>body.GlobalPosition</c> directly invalidates Jolt's persistent
+    /// contact cache and causes more drift than it fixes.
+    /// Calling repeatedly accumulates the offset and refreshes the decay window.
+    /// No-op if Body or Visual is unwired or DurationSec is non-positive.
+    /// </summary>
+    public void AddDriftCorrection(Vector3 worldOffset)
+    {
+        if (Body == null || Visual == null || DurationSec <= 0f) return;
+
+        // If a reconciliation is still pending its post-resim recapture, fold the new
+        // offset into the pending pre-visual position so the eventual recompute against
+        // the post-resim body pose absorbs it correctly.
+        if (_pendingReconcile)
+        {
+            _pendingPreVisualPos += worldOffset;
+            return;
+        }
+
+        // Collapse the currently-rendered offset (_posOffset * t) into the stored value
+        // before stacking a new shift on top. Without this, callers that fire every
+        // snapshot (e.g. ApplySoftCorrection) keep resetting _remaining to DurationSec
+        // before any decay completes, so _posOffset accumulates unbounded and the visual
+        // drifts arbitrarily far from the body. Collapsing keeps the rendered visual
+        // continuous: post-call render = pre-call render + worldOffset.
+        float t = _remaining > 0f && DurationSec > 0f ? _remaining / DurationSec : 0f;
+        _posOffset = _posOffset * t + worldOffset;
+        _rotOffset = Quaternion.Identity.Slerp(_rotOffset, t);
+        _remaining = DurationSec;
+
+        // Hard cap: a runaway accumulation past TeleportDistance would render the visual
+        // arbitrarily far from the body. Snap the offset back to zero in that case —
+        // matches the same threshold OnReconciled uses.
+        if (TeleportDistance > 0f && _posOffset.Length() > TeleportDistance)
+        {
+            _posOffset = Vector3.Zero;
+            _rotOffset = Quaternion.Identity;
+            _remaining = 0f;
+        }
+    }
+
     /// <summary>True while the visual is still catching up to the body.</summary>
     public bool IsSmoothing => _remaining > 0f;
 

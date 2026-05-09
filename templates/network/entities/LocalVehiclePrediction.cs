@@ -25,10 +25,10 @@ public partial class LocalVehiclePrediction : ClientPredictedEntity
         // _vehiclePhysics.AdvancePhysics((VehicleInputMessage)input);
     }
 
-    public override bool HasMisspredicted(int tick, IEntityStateData receivedState, Vector3 savedPosition)
+    public override bool HasMisspredicted(int tick, IEntityStateData receivedState, RigidbodyState savedState)
     {
         var state = (PhysicsStateMessage)receivedState;
-        return (state.Position - savedPosition).LengthSquared() > _mispredictionThresholdSquared;
+        return (state.Position - savedState.Position).LengthSquared() > _mispredictionThresholdSquared;
     }
 
     public override void HandleReconciliation(IEntityStateData receivedState)
@@ -47,4 +47,12 @@ public partial class LocalVehiclePrediction : ClientPredictedEntity
     }
 
     public override Vector3 GetPosition() => _vehicleBody.GlobalPosition;
+
+    public override RigidbodyState GetSnapshotState() => new RigidbodyState
+    {
+        Position = _vehicleBody.GlobalPosition,
+        Rotation = _vehicleBody.Quaternion,
+        LinearVelocity = _vehicleBody.Velocity,
+        AngularVelocity = Vector3.Zero,
+    };
 }

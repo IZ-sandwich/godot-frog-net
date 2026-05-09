@@ -41,7 +41,7 @@ public partial class FirstPersonCameraController : Node3D
         var cm = ClientManager.Instance;
         if (cm?.IsNetworkReady == true)
         {
-            Input.MouseMode = Input.MouseModeEnum.Captured;
+            CaptureMouseUnlessTest();
         }
         else if (cm != null)
         {
@@ -50,6 +50,15 @@ public partial class FirstPersonCameraController : Node3D
             _subscribedManager = cm;
             cm.Connect(ClientManager.SignalName.NetworkReady, _networkReadyCallable);
         }
+    }
+
+    // The gdUnit4 test runner spawns a real Godot window, so an unconditional
+    // Captured grab steals the user's pointer for the whole test run. run-tests.ps1
+    // sets MONKENET_TEST=1 to opt out; production / F5-from-editor leaves it unset.
+    private static void CaptureMouseUnlessTest()
+    {
+        if (!string.IsNullOrEmpty(OS.GetEnvironment("MONKENET_TEST"))) return;
+        Input.MouseMode = Input.MouseModeEnum.Captured;
     }
 
     public override void _ExitTree()
@@ -77,7 +86,7 @@ public partial class FirstPersonCameraController : Node3D
 
     private void OnNetworkReady()
     {
-        Input.MouseMode = Input.MouseModeEnum.Captured;
+        CaptureMouseUnlessTest();
         if (_networkReadySubscribed && _subscribedManager != null)
         {
             _subscribedManager.Disconnect(ClientManager.SignalName.NetworkReady, _networkReadyCallable);
@@ -107,8 +116,10 @@ public partial class FirstPersonCameraController : Node3D
         {
             if (keyEvent.Keycode == Key.C && keyEvent.Pressed && ClientManager.Instance?.IsNetworkReady == true)
             {
-                Input.MouseMode = Input.MouseMode == Input.MouseModeEnum.Visible ?
-                    Input.MouseModeEnum.Captured : Input.MouseModeEnum.Visible;
+                if (Input.MouseMode == Input.MouseModeEnum.Visible)
+                    CaptureMouseUnlessTest();
+                else
+                    Input.MouseMode = Input.MouseModeEnum.Visible;
             }
         }
 

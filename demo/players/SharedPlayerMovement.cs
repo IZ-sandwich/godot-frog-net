@@ -40,13 +40,25 @@ public partial class SharedPlayerMovement : Node
 
     public void AdvancePhysics(CharacterInputMessage input)
     {
+        Vector3 prePos = _characterBody.GlobalPosition;
         Vector3 newVelocity = CalculateVelocity(_characterBody, input);
         _characterBody.Velocity = newVelocity;
         PhysicsUtils.MoveAndSlide(_characterBody);
+        Vector3 postPos = _characterBody.GlobalPosition;
+        int slides = _characterBody.GetSlideCollisionCount();
+        MonkeLogger.Debug($"[PHYS-PLAYER] body={_characterBody.Name} input=({input}) attemptedVel=({newVelocity.X:F3},{newVelocity.Y:F3},{newVelocity.Z:F3}) postSlideVel=({_characterBody.Velocity.X:F3},{_characterBody.Velocity.Y:F3},{_characterBody.Velocity.Z:F3}) prePos=({prePos.X:F3},{prePos.Y:F3},{prePos.Z:F3}) postPos=({postPos.X:F3},{postPos.Y:F3},{postPos.Z:F3}) slides={slides} onFloor={_characterBody.IsOnFloor()}");
+        for (int i = 0; i < slides; i++)
+        {
+            var c = _characterBody.GetSlideCollision(i);
+            string colliderName = c.GetCollider() is Node n ? n.Name : "<null>";
+            Vector3 normal = c.GetNormal();
+            Vector3 cpos = c.GetPosition();
+            MonkeLogger.Debug($"[PHYS-PLAYER]   slide[{i}] collider={colliderName} normal=({normal.X:F3},{normal.Y:F3},{normal.Z:F3}) at=({cpos.X:F3},{cpos.Y:F3},{cpos.Z:F3})");
+        }
         // Pass the pre-MoveAndSlide velocity. MoveAndSlide zeroes the component into any
         // surface it slides against, so reading _characterBody.Velocity after the call
         // would always report ~0 component into a head-on collision and we'd never push.
-        // PushRigidBodies(newVelocity);
+        PushRigidBodies(newVelocity);
         PushOfflineProps(newVelocity);
     }
 
@@ -69,6 +81,7 @@ public partial class SharedPlayerMovement : Node
 
             Vector3 impulse = pushDir * speedIntoBody * _rigidBodyPushStrength;
             Vector3 contactOffset = collision.GetPosition() - rb.GlobalPosition;
+            MonkeLogger.Debug($"[PHYS-PUSH] kind=rigid pusher={_characterBody.Name} pushed={rb.Name} impulse=({impulse.X:F3},{impulse.Y:F3},{impulse.Z:F3}) at=({contactOffset.X:F3},{contactOffset.Y:F3},{contactOffset.Z:F3}) speedInto={speedIntoBody:F3}");
 
             // Apply directly on the body, not through PredictionRigidbody3D's queue: ball
             // entities (LocalBall/ServerBall) don't call Simulate() in their tick handlers
@@ -131,6 +144,7 @@ public partial class SharedPlayerMovement : Node
 
             Vector3 impulse = dir * speedIntoBody * _rigidBodyPushStrength;
             Vector3 contactOffset = _characterBody.GlobalPosition - rb.GlobalPosition;
+            MonkeLogger.Debug($"[PHYS-PUSH] kind=offlineProp pusher={_characterBody.Name} pushed={rb.Name} impulse=({impulse.X:F3},{impulse.Y:F3},{impulse.Z:F3}) at=({contactOffset.X:F3},{contactOffset.Y:F3},{contactOffset.Z:F3}) speedInto={speedIntoBody:F3}");
             rb.ApplyImpulse(impulse, contactOffset);
         }
     }

@@ -16,8 +16,6 @@ public partial class DummyRigidPlayerStateInterpolation : ClientInterpolatedEnti
 
         // Slerp on quaternions to avoid the ±π wrap that Vector3.Lerp on Euler angles
         // produces. Same rationale as DummyVehicleStateInterpolation.
-        var pastQ = Quaternion.FromEuler(pastState.Rotation);
-        var futureQ = Quaternion.FromEuler(futureState.Rotation);
-        _parent.Quaternion = pastQ.Slerp(futureQ, interpolationFactor);
+        _parent.Quaternion = pastState.Rotation.Slerp(futureState.Rotation, interpolationFactor);
     }
 }

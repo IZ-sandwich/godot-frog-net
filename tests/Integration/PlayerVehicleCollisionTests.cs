@@ -45,6 +45,16 @@ public class PlayerVehicleCollisionTests
     public async Task SetUp()
     {
         MonkeNetConfig.Instance = null;
+        // Other suites that exercise networking (PerformanceRegressionTests etc.) spawn
+        // entities through ServerManager.SpawnEntity, which adds them as children of the
+        // EntitySpawner node on the MonkeNet autoload. The autoload survives scene
+        // changes, so its accumulated children survive too — leaving stale CharacterBody3D
+        // / RigidBody3D nodes (typically on layer 32768, ServerPlayers) in the tree.
+        // PVC-01 layers its server pair on that same bit and would collide with the
+        // strays. Idempotently clear server- and client-side spawn lists before each
+        // test; safe to call when no autoload is present.
+        try { MonkeNet.Shared.EntitySpawner.Instance?.ClearServerEntities(); } catch { }
+        try { MonkeNet.Shared.EntitySpawner.Instance?.ClearClientEntities(); } catch { }
         _runner = ISceneRunner.Load("res://demo/MainScene.tscn", autoFree: true);
         await _runner.AwaitIdleFrame();
     }

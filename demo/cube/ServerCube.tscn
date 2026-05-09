@@ -1,0 +1,45 @@
+[gd_scene format=3 uid="uid://c7jvpob6fjg7d"]
+
+[ext_resource type="Script" uid="uid://88nwa67lqidu" path="res://demo/ball/ServerBallStateSyncronizer.cs" id="2_scubesync"]
+[ext_resource type="Script" uid="uid://o8fwa7kmma11" path="res://addons/monke-net/src/Shared/PredictionRigidbody3D.cs" id="3_predrb"]
+[ext_resource type="Script" uid="uid://df8rhrcg15uax" path="res://addons/monke-net/src/Shared/OfflineRigidbody3D.cs" id="4_offrb"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_greencube"]
+albedo_color = Color(0.25, 0.85, 0.35, 1)
+
+[sub_resource type="BoxMesh" id="BoxMesh_cube"]
+material = SubResource("StandardMaterial3D_greencube")
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_cube"]
+
+[sub_resource type="PhysicsMaterial" id="PhysicsMaterial_cube"]
+friction = 0.6
+bounce = 0.2
+
+[node name="ServerCube" type="RigidBody3D" unique_id=1700020001]
+collision_layer = 32768
+collision_mask = 32769
+physics_material_override = SubResource("PhysicsMaterial_cube")
+linear_damp = 0.4
+angular_damp = 0.8
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="." unique_id=1700020002]
+mesh = SubResource("BoxMesh_cube")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=1700020003]
+shape = SubResource("BoxShape3D_cube")
+
+[node name="PredictionRigidbody" type="Node" parent="." unique_id=1700020004 node_paths=PackedStringArray("_body")]
+script = ExtResource("3_predrb")
+_body = NodePath("..")
+metadata/_custom_type_script = "uid://o8fwa7kmma11"
+
+[node name="ServerStateSyncronizer" type="Node" parent="." unique_id=1700020005 node_paths=PackedStringArray("_predictionRb")]
+script = ExtResource("2_scubesync")
+_predictionRb = NodePath("../PredictionRigidbody")
+metadata/_custom_type_script = "uid://clh4o8hlbokjg"
+
+[node name="OfflineRigidbody" type="Node" parent="." unique_id=1700020006 node_paths=PackedStringArray("Body")]
+script = ExtResource("4_offrb")
+Body = NodePath("..")
+metadata/_custom_type_script = "uid://df8rhrcg15uax"

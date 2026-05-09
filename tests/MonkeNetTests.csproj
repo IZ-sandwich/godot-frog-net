@@ -23,4 +23,13 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.*" />
     <PackageReference Include="gdUnit4.test.adapter" Version="3.*" />
   </ItemGroup>
+
+  <!-- monke-net.dll must be rebuilt before any test run that spawns child
+       Godot processes (the multi-process tests). `dotnet test` builds only
+       MonkeNetTests.dll by default, so child processes would otherwise load
+       a stale monke-net.dll missing MultiClientHarness. This target builds
+       the main project before the test assembly. -->
+  <Target Name="BuildMonkeNetForChildProcesses" BeforeTargets="Build">
+    <MSBuild Projects="..\monke-net.csproj" Targets="Build" />
+  </Target>
 </Project>

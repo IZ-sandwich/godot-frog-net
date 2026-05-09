@@ -11,7 +11,10 @@ public struct EntityStateMessage : IEntityStateData
     public Vector3 Position { get; set; } // Entity Position
     public Vector3 Velocity { get; set; } // Entity velocity
     public Vector3 AngularVelocity { get; set; } // Entity velocity
-    public Vector3 Rotation { get; set; }
+    // Full-precision quaternion on the wire. Sending Euler angles round-trips through
+    // FromEuler/GetEuler which is lossy near gimbal lock and accumulates error over
+    // many snapshots — especially noticeable on tumbling rigidbodies (ball, vehicle).
+    public Quaternion Rotation { get; set; }
     public float Yaw { get; set; } // Looking angle
 
     public void ReadBytes(MessageReader reader)
@@ -20,7 +23,7 @@ public struct EntityStateMessage : IEntityStateData
         Position = reader.ReadVector3();
         Velocity = reader.ReadVector3();
         AngularVelocity = reader.ReadVector3();
-        Rotation = reader.ReadVector3();
+        Rotation = reader.ReadQuaternion();
         Yaw = reader.ReadSingle();
     }
 
@@ -35,6 +38,12 @@ public struct EntityStateMessage : IEntityStateData
     }
 
     public readonly IPackableElement GetCopy() => this;
+
+    public override readonly string ToString() =>
+        $"eid={EntityId} pos=({Position.X:F3},{Position.Y:F3},{Position.Z:F3}) "
+        + $"vel=({Velocity.X:F3},{Velocity.Y:F3},{Velocity.Z:F3}) "
+        + $"rot=({Rotation.X:F3},{Rotation.Y:F3},{Rotation.Z:F3},{Rotation.W:F3}) "
+        + $"angvel=({AngularVelocity.X:F3},{AngularVelocity.Y:F3},{AngularVelocity.Z:F3}) yaw={Yaw:F3}";
 }
 
 // Client → server: "I'm done driving this vehicle, return authority to the server."
@@ -87,4 +96,7 @@ public struct CharacterInputMessage : IPackableElement
     }
 
     public readonly IPackableElement GetCopy() => this;
+
+    public override readonly string ToString() =>
+        $"keys=0x{Keys:X2} move=({MoveX:F3},{MoveY:F3}) yaw={CameraYaw:F3}";
 }

@@ -32,9 +32,7 @@ public partial class DummyBallStateInterpolation : ClientInterpolatedEntity
         // Slerp can drift slightly off-normalized — when interpolationFactor extrapolates
         // past 1 (interpolator running ahead of the snapshot buffer), Godot's IsNormalized
         // check throws on the next slerp call. Renormalize defensively.
-        var pastQ = Quaternion.FromEuler(pastState.Rotation);
-        var futureQ = Quaternion.FromEuler(futureState.Rotation);
-        Quaternion targetRot = pastQ.Slerp(futureQ, interpolationFactor).Normalized();
+        Quaternion targetRot = pastState.Rotation.Slerp(futureState.Rotation, interpolationFactor).Normalized();
 
         Vector3 delta = targetPos - _body.GlobalPosition;
 

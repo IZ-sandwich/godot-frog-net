@@ -82,7 +82,13 @@ public class LagCompTargetingTests
         await _serverRunner.AwaitIdleFrame();
         var entityRoot = EntitySpawner.Instance.GetEntityRoot(EntitySpawner.Instance.Entities[0])!;
 
+        // Player scene's collision capsule is offset (0, 1, 0) from the body
+        // root, so the capsule occupies y ∈ [body.y, body.y + 2]. Place the
+        // body at y=0 for clarity but aim the ray at y=1 (capsule center) so
+        // the ray solidly passes through the shape rather than grazing its
+        // bottom cap (where Jolt's edge-case handling may miss).
         Vector3 pastPos = new(5, 0, 0);
+        Vector3 rayY = new(0, 1, 0);
         entityRoot.GlobalPosition = pastPos;
         await _serverRunner.AwaitIdleFrame();
         await _serverRunner.AwaitIdleFrame();
@@ -98,7 +104,7 @@ public class LagCompTargetingTests
 
         // Raycast aimed at pastPos along -Z. With rewind, body is at pastPos
         // for the duration of the query; ray must hit.
-        Vector3 origin = pastPos + new Vector3(0, 0, 5);
+        Vector3 origin = pastPos + new Vector3(0, 0, 5) + rayY;
         Vector3 dir = Vector3.Forward;  // (0, 0, -1) — toward target along -Z
         bool hit = _lagComp.RaycastAtTick(rewindTick, origin, dir, length: 10f, out var hitInfo);
 
@@ -114,8 +120,10 @@ public class LagCompTargetingTests
             .OverrideFailureMessage($"raycast at past tick {rewindTick} did not hit; target was at {pastPos} during the rewound window")
             .IsTrue();
 
-        float distToPast = (hitInfo.Point - pastPos).Length();
-        float distToCurrent = (hitInfo.Point - new Vector3(100, 0, 0)).Length();
+        // Compare hit point to the past pose (offset by rayY so it's near the
+        // capsule center, where the ray hit) and the current pose.
+        float distToPast = (hitInfo.Point - (pastPos + rayY)).Length();
+        float distToCurrent = (hitInfo.Point - new Vector3(100, 1, 0)).Length();
         AssertThat(distToPast)
             .OverrideFailureMessage($"hit point {hitInfo.Point} is closer to current pose (100,0,0) than past pose ({pastPos})")
             .IsLess(distToCurrent);

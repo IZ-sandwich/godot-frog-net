@@ -31,6 +31,11 @@ public partial class ServerNetworkClock : InternalServerComponent
         return _currentTick;
     }
 
+    /// <summary>Current server-authoritative tick. Surfaced so test harnesses
+    /// can compare it against the client's <see cref="ClientNetworkClock.GetCurrentTick"/>
+    /// to measure clock-sync convergence.</summary>
+    public int CurrentTick => _currentTick;
+
     public int GetNetworkTickRate()
     {
         return _netTickrate;

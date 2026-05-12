@@ -142,6 +142,66 @@ public class ClockTests
         }
     }
 
+    // B-06 ─────────────────────────────────────────────────────────────────────
+    // Fast-correction path: a sync sample whose offset estimate exceeds
+    // ClientNetworkClock._immediateCorrectionMinAbsTicks should pump _lastOffset
+    // immediately (not wait for the averaged-window buffer to fill), so the
+    // next ProcessTick advances _currentTick by the offset. This is the
+    // Photon-Fusion-2-style "first-packet correction" that brings the clock
+    // to within a few ticks of the server within ~0.5 s of connecting.
+    [TestCase]
+    public void Clock_AppliesImmediateCorrection_OnLargeOffsetSample()
+    {
+        SetSampleSize(11); // make the windowed path inert for this test
+
+        // Inject a sync echo as if the server already replied with a far-future
+        // ServerTime. Bypasses the server-side echo path, which on the fake
+        // bridge would otherwise reflect the server's _currentTick (0).
+        // Read _lastOffset BEFORE awaiting an idle frame so the engine's
+        // _PhysicsProcess can't consume it before we observe it.
+        InjectClockSyncEchoToClient(serverTime: 80, clientTime: (int)Godot.Time.GetTicksMsec());
+
+        int lastOffset = GetLastOffset();
+
+        // _lastOffset should equal the immediate offset estimate ≈ 80
+        // (allowing for the (latency_ticks) component and any raw ticks the
+        // client has done during scene setup).
+        AssertThat(lastOffset).IsGreaterEqual(70);
+    }
+
+    // B-07 ─────────────────────────────────────────────────────────────────────
+    // After an immediate correction the per-sample offset buffers must be
+    // cleared so the next averaged window doesn't re-add the same pre-
+    // correction offset on top of the immediate one (which would yank the
+    // clock backwards right as the window completes).
+    [TestCase]
+    public async Task Clock_ImmediateCorrection_ClearsBuffersToAvoidWindowDoubleCount()
+    {
+        SetSampleSize(3);
+
+        // Big-offset sync → immediate path, clears buffers.
+        InjectClockSyncEchoToClient(serverTime: 80, clientTime: (int)Godot.Time.GetTicksMsec());
+        await _clientRunner.AwaitIdleFrame();
+
+        // After the immediate correction the buffer should be empty, so two
+        // more small-offset samples shouldn't complete the window of 3.
+        bool fired = false;
+        _client.LatencyCalculated += (_, __) => fired = true;
+
+        // Subsequent samples mimic post-correction state: server-time close
+        // to client's current synced tick (raw tick now ~= 80 from the
+        // immediate correction, before any ProcessTick advances).
+        int alignedServerTick = GetCurrentRawTick();
+        InjectClockSyncEchoToClient(alignedServerTick, (int)Godot.Time.GetTicksMsec());
+        InjectClockSyncEchoToClient(alignedServerTick, (int)Godot.Time.GetTicksMsec());
+        await _clientRunner.AwaitIdleFrame();
+        AssertThat(fired).IsFalse(); // buffer still only has 2 post-correction samples
+
+        InjectClockSyncEchoToClient(alignedServerTick, (int)Godot.Time.GetTicksMsec()); // 3rd → window emits
+        await _clientRunner.AwaitIdleFrame();
+        AssertThat(fired).IsTrue();
+    }
+
     // B-05 ─────────────────────────────────────────────────────────────────────
     [TestCase]
     public async Task Clock_GetCurrentTick_ExceedsRawTickByAtLeastFixedMargin()
@@ -183,10 +243,27 @@ public class ClockTests
             ?.GetValue(_clock) ?? 0);
     }
 
+    private int GetLastOffset()
+    {
+        return (int)(typeof(ClientNetworkClock)
+            .GetField("_lastOffset", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?.GetValue(_clock) ?? 0);
+    }
+
     private void SendClockSync()
     {
         // Trigger the clock's timer-driven method to send a sync, then deliver the echo.
         _clock.GetNode<Godot.Timer>("Timer").EmitSignal("timeout");
         // The bridge synchronously delivers the server's echo to the client.
+    }
+
+    // Injects a ClockSyncMessage echo directly into the client's network
+    // endpoint as if the server had already replied with the given ServerTime.
+    // Bypasses the server-echo path (where ServerTime would reflect the
+    // server's actual _currentTick = 0 since we don't pump physics here).
+    private void InjectClockSyncEchoToClient(int serverTime, int clientTime)
+    {
+        var sync = new ClockSyncMessage { ClientTime = clientTime, ServerTime = serverTime };
+        _clientNet.SimulateIncomingPacket(1, MessageSerializer.Serialize(sync));
     }
 }

@@ -64,4 +64,24 @@ public partial class DummyBallStateInterpolation : ClientInterpolatedEntity
         _body.GlobalPosition = _body.GlobalPosition.Lerp(targetPos, _correctionBlend);
         _body.Quaternion = _body.Quaternion.Normalized().Slerp(targetRot, _correctionBlend).Normalized();
     }
+
+    /// <summary>
+    /// Hard-snap the body's full pose + velocity to the authoritative state with no
+    /// lerp or soft-correct blend. Used by <c>ClientPredictionManager.RollbackAndResimulate</c>
+    /// at the start of a rollback so that the locally-predicted player collides with
+    /// this body at its server-truth pose for the rollback tick rather than at
+    /// whatever pose the local interpolator drifted to since.
+    /// </summary>
+    public override void HardSnapToAuthoritativeState(IEntityStateData state)
+    {
+        if (_body == null) return;
+        var s = (EntityStateMessage)state;
+        _body.GlobalPosition = s.Position;
+        _body.Quaternion = s.Rotation.Normalized();
+        _body.LinearVelocity = s.Velocity;
+        _body.AngularVelocity = s.AngularVelocity;
+        _body.ResetPhysicsInterpolation();
+        _lastFuturePosition = s.Position;
+        _haveLastFuture = true;
+    }
 }

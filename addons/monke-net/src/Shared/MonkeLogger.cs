@@ -24,6 +24,10 @@ public partial class MonkeLogger : Node
     private static StreamWriter _file;
     private static readonly object _fileLock = new();
     private static string _filePath;
+    /// <summary>Absolute path of the log file this process is writing to, or null
+    /// if file logging is disabled / failed to open. Surfaced so a test harness
+    /// can copy the live log out at run end without having to rediscover the path.</summary>
+    public static string FilePath => _filePath;
 
     public override void _EnterTree()
     {

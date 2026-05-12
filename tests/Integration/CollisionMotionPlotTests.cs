@@ -62,6 +62,9 @@ public class CollisionMotionPlotTests
     private const float VehicleStartZ = -3f;     // 3 m forward of player at t=0.
     private const float BodyY = -1f;             // matches MainScene floor (top at Y=-2).
     private const int SnapshotLagFrames = 2;     // host_* mode: dummy vehicle lags server by this many ticks.
+    private const int SnapshotInterval = 3;      // server sends snapshot every N ticks (20Hz at 60Hz physics)
+    private const float ReconcileVelThresholdSq = 0.25f;  // mirrors LocalBallPrediction
+    private const float ReconcilePosThresholdSq = 0.04f;  // mirrors LocalBallPrediction
 
     // Project layer mapping mirrors EntitySpawner / project.godot:
     //   bit 0 = Environment, bit 1 = ClientPlayers, bit 15 = ServerPlayers.
@@ -74,6 +77,19 @@ public class CollisionMotionPlotTests
     private ISceneRunner _runner;
     private Rid _space;
     private StaticBody3D _testFloor;
+    private Camera3D _camera;
+    private DirectionalLight3D _light;
+
+    // Recording config — capture every Nth frame at a reduced resolution and
+    // assemble them into a single contact-sheet PNG per scenario. ffmpeg isn't
+    // available in this environment, so a grid of stills is the most useful
+    // single-file "recording" we can produce; viewable in any image viewer and
+    // small enough to commit if we ever wanted to track regression visually.
+    private const int RecordEveryNFrames = 6;        // 360 / 6 = 60 captured frames per scenario
+    private const int CaptureWidth = 320;
+    private const int CaptureHeight = 180;
+    private const int ContactSheetCols = 10;          // 60 / 10 = 6 rows; full sheet ≈ 3200×1080
+    private List<Image> _recordingFrames;
 
     [BeforeTest]
     public async Task SetUp()
@@ -86,6 +102,15 @@ public class CollisionMotionPlotTests
         _runner = ISceneRunner.Load("res://demo/MainScene.tscn", autoFree: true);
         await _runner.AwaitIdleFrame();
         _space = _runner.Scene().GetViewport().World3D.Space;
+
+        // Disable scene-tree physics interpolation. We drive PhysicsServer3D.SpaceStep
+        // manually, outside the engine's normal physics frame; with interpolation on,
+        // a body's *visual* transform is interpolated between two physics-frame snapshots
+        // and lags one tick behind its physics position. Child MeshInstance3Ds inherit
+        // that visual transform, so the colored meshes appear stationary while the
+        // wireframes (drawn from the live physics-server transform) move correctly. With
+        // interpolation off the scene tree resyncs to physics each step, so meshes track.
+        _runner.Scene().GetTree().PhysicsInterpolation = false;
 
         // Free the CSG floor (triangle-mesh collision triggers the MoveAndSlide
         // lockup in this class) and ALL the MainScene map obstacles. With FrameCount=360
@@ -113,7 +138,35 @@ public class CollisionMotionPlotTests
         {
             Shape = new BoxShape3D { Size = new Vector3(30, 1, 80) },
         });
+        _testFloor.AddChild(MakeBoxMesh(new Vector3(30, 1, 80), new Color(0.3f, 0.32f, 0.35f)));
         _runner.Scene().AddChild(_testFloor);
+
+        // Camera + light for the recording. Test bodies only have CollisionShape3D
+        // (no MeshInstance3D), so set DebugCollisionsHint = true to make Godot draw
+        // the collision shapes as wireframes — otherwise the captured frames would
+        // be empty. Camera is positioned to keep both the player's start (z=0) and
+        // its endpoint (z≈-30) in frame at all times.
+        _runner.Scene().GetTree().DebugCollisionsHint = true;
+
+        // Camera rotated 90° left (around Y) from a side view so the camera
+        // looks along -Z — the same axis the bodies travel — keeping them on
+        // screen for the entire 6 s. The small +X offset gives a 3/4 perspective
+        // so player and vehicle don't overlap on-screen at x=0.
+        _camera = new Camera3D
+        {
+            Position = new Vector3(5, 4, 8),
+            Fov = 65f,
+            Current = true,
+        };
+        _camera.LookAt(new Vector3(0, BodyY, -15), Vector3.Up);
+        _runner.Scene().AddChild(_camera);
+
+        _light = new DirectionalLight3D
+        {
+            RotationDegrees = new Vector3(-50, -30, 0),
+        };
+        _runner.Scene().AddChild(_light);
+
         // Pump physics a few times so the new floor is fully settled in Jolt's broadphase
         // before any test body is added on top of it.
         await _runner.AwaitIdleFrame();
@@ -122,6 +175,49 @@ public class CollisionMotionPlotTests
             PhysicsServer3D.SpaceStep(_space, 1f / 60f);
             PhysicsServer3D.SpaceFlushQueries(_space);
         }
+    }
+
+    // Captures the camera's viewport at a reduced resolution and stores it for
+    // later contact-sheet assembly. No-op if recording isn't active. Called by
+    // every scenario loop; subsamples by RecordEveryNFrames so the contact sheet
+    // stays a manageable size.
+    private void CaptureFrameForRecording(int frameIdx)
+    {
+        if (_recordingFrames == null) return;
+        if (frameIdx % RecordEveryNFrames != 0) return;
+        // Force a synchronous render so the viewport texture reflects the current
+        // physics-step state — we're driving SpaceStep manually, not advancing the
+        // SceneTree, so without this the texture would be a frame behind (or empty).
+        RenderingServer.ForceDraw();
+        var img = _runner.Scene().GetViewport().GetTexture().GetImage();
+        if (img == null) return;
+        if (img.GetWidth() != CaptureWidth || img.GetHeight() != CaptureHeight)
+            img.Resize(CaptureWidth, CaptureHeight, Image.Interpolation.Bilinear);
+        if (img.GetFormat() != Image.Format.Rgba8)
+            img.Convert(Image.Format.Rgba8);
+        _recordingFrames.Add(img);
+    }
+
+    // Stitch captured frames into a single PNG laid out as a grid. Each cell is
+    // stamped with its frame index so the temporal ordering is readable.
+    private static void WriteContactSheet(string outputPath, List<Image> frames)
+    {
+        if (frames.Count == 0) return;
+        int rows = (frames.Count + ContactSheetCols - 1) / ContactSheetCols;
+        var sheet = Image.CreateEmpty(
+            ContactSheetCols * CaptureWidth, rows * CaptureHeight,
+            false, Image.Format.Rgba8);
+        sheet.Fill(new Color(0.05f, 0.05f, 0.05f));
+        for (int i = 0; i < frames.Count; i++)
+        {
+            int r = i / ContactSheetCols;
+            int c = i % ContactSheetCols;
+            sheet.BlitRect(
+                frames[i],
+                new Rect2I(0, 0, CaptureWidth, CaptureHeight),
+                new Vector2I(c * CaptureWidth, r * CaptureHeight));
+        }
+        sheet.SavePng(outputPath);
     }
 
     [AfterTest]
@@ -137,32 +233,48 @@ public class CollisionMotionPlotTests
     {
         string outputDir = ResolveOutputDir();
         Directory.CreateDirectory(outputDir);
+        string recordingsDir = Path.Combine(outputDir, "recordings");
+        Directory.CreateDirectory(recordingsDir);
 
-        // Temporarily run listen_cb FIRST to test if order matters.
+        // Each scenario records into _recordingFrames; we drain it into a contact-sheet
+        // PNG between scenarios so all five renders are saved, not just the last one.
+
+        _recordingFrames = new List<Image>();
         var listenCb = await RecordListenServerCharacterBody();
+        WriteContactSheet(Path.Combine(recordingsDir, "listen_cb.png"), _recordingFrames);
         ResetWorldForNextScenario();
         await _runner.AwaitIdleFrame();
 
+        _recordingFrames = new List<Image>();
         var baseline = await RecordBaseline();
+        WriteContactSheet(Path.Combine(recordingsDir, "baseline.png"), _recordingFrames);
         ResetWorldForNextScenario();
         await _runner.AwaitIdleFrame();
 
+        _recordingFrames = new List<Image>();
         var listenRb = await RecordListenServerRigidBody();
+        WriteContactSheet(Path.Combine(recordingsDir, "listen_rb.png"), _recordingFrames);
         ResetWorldForNextScenario();
         await _runner.AwaitIdleFrame();
 
-        var hostCb = await RecordHostClientCharacterBody();
+        _recordingFrames = new List<Image>();
+        var (hostCb, hostCbClient) = await RecordHostClientCharacterBody();
+        WriteContactSheet(Path.Combine(recordingsDir, "host_cb.png"), _recordingFrames);
         ResetWorldForNextScenario();
         await _runner.AwaitIdleFrame();
 
-        var hostRb = await RecordHostClientRigidBody();
+        _recordingFrames = new List<Image>();
+        var (hostRb, hostRbClient) = await RecordHostClientRigidBody();
+        WriteContactSheet(Path.Combine(recordingsDir, "host_rb.png"), _recordingFrames);
         ResetWorldForNextScenario();
 
         WriteCsv(outputDir, "baseline.csv", baseline);
         WriteCsv(outputDir, "listen_cb.csv", listenCb);
         WriteCsv(outputDir, "listen_rb.csv", listenRb);
         WriteCsv(outputDir, "host_cb.csv", hostCb);
+        WriteCsv(outputDir, "host_cb_client.csv", hostCbClient);
         WriteCsv(outputDir, "host_rb.csv", hostRb);
+        WriteCsv(outputDir, "host_rb_client.csv", hostRbClient);
 
         var labelled = new (string Name, Trace Trace)[]
         {
@@ -170,7 +282,9 @@ public class CollisionMotionPlotTests
             ("listen_cb", listenCb),
             ("listen_rb", listenRb),
             ("host_cb", hostCb),
+            ("host_cb_client", hostCbClient),
             ("host_rb", hostRb),
+            ("host_rb_client", hostRbClient),
         };
 
         WritePlotSvg(Path.Combine(outputDir, "plot.svg"), labelled);
@@ -181,9 +295,81 @@ public class CollisionMotionPlotTests
         Godot.GD.Print(summary);
         Godot.GD.Print($"[CMP-01] Wrote plot to: {Path.Combine(outputDir, "plot.svg")}");
 
+        // Spawn a Godot subprocess that runs tools/recording/CollisionPlayback.tscn
+        // under --write-movie, so the engine's built-in MovieWriter records all five
+        // scenarios into one AVI. Failure here doesn't fail the test — the trace
+        // artefacts (CSVs + plot.svg + summary.txt) are still useful without the video.
+        TryRecordVideo(outputDir, Path.Combine(recordingsDir, "all_scenarios.avi"));
+
         // Sanity assertions — the harness must produce non-empty traces and a plot file.
         AssertThat(baseline.Frames.Count).IsEqual(FrameCount);
         AssertThat(File.Exists(Path.Combine(outputDir, "plot.svg"))).IsTrue();
+    }
+
+    private static void TryRecordVideo(string csvDir, string videoPath)
+    {
+        string godotBin = System.Environment.GetEnvironmentVariable("GODOT_BIN") ?? "";
+        if (string.IsNullOrEmpty(godotBin) || !File.Exists(godotBin))
+        {
+            Godot.GD.PrintErr($"[CMP-REC] GODOT_BIN env var not set or invalid; skipping video recording. Got: '{godotBin}'");
+            return;
+        }
+        // When running under dotnet test the engine's res:// points at the tests/
+        // project root; the playback scene lives in the main project one level up.
+        string testRes = ProjectSettings.GlobalizePath("res://").TrimEnd('/', '\\');
+        string mainProjectRoot = Path.GetFullPath(Path.Combine(testRes, ".."));
+        Directory.CreateDirectory(Path.GetDirectoryName(videoPath)!);
+
+        // --write-movie writes MovieWriter output to the given path (.avi → MJPEG).
+        // --fixed-fps locks the engine's render rate so frames are deterministic.
+        // --disable-vsync removes the 60 Hz vsync cap so the renderer pumps as fast
+        //   as the simulation can drive it; combined with --fixed-fps this still
+        //   produces exactly 60 frames per simulated second.
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = godotBin,
+            WorkingDirectory = mainProjectRoot,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        psi.ArgumentList.Add("--path"); psi.ArgumentList.Add(mainProjectRoot);
+        psi.ArgumentList.Add("--write-movie"); psi.ArgumentList.Add(videoPath);
+        psi.ArgumentList.Add("--fixed-fps"); psi.ArgumentList.Add("60");
+        psi.ArgumentList.Add("--disable-vsync");
+        psi.ArgumentList.Add("res://tools/recording/CollisionPlayback.tscn");
+        psi.ArgumentList.Add("--");
+        psi.ArgumentList.Add($"csvDir={csvDir}");
+
+        Godot.GD.Print($"[CMP-REC] launching: {godotBin} {string.Join(' ', psi.ArgumentList)}");
+        using var proc = System.Diagnostics.Process.Start(psi);
+        if (proc == null)
+        {
+            Godot.GD.PrintErr("[CMP-REC] Process.Start returned null");
+            return;
+        }
+        // Drain stdout/stderr concurrently — Godot's MovieWriter prints multi-KB
+        // progress chatter, and if the pipe buffer fills before we read it the
+        // subprocess blocks on its write and we deadlock past WaitForExit.
+        var stderrBuf = new System.Text.StringBuilder();
+        proc.OutputDataReceived += (_, e) => { /* discard stdout */ };
+        proc.ErrorDataReceived += (_, e) => { if (e.Data != null) stderrBuf.AppendLine(e.Data); };
+        proc.BeginOutputReadLine();
+        proc.BeginErrorReadLine();
+
+        if (!proc.WaitForExit(180_000))
+        {
+            proc.Kill(true);
+            Godot.GD.PrintErr("[CMP-REC] recording subprocess timed out after 180s");
+            return;
+        }
+        Godot.GD.Print($"[CMP-REC] subprocess exit={proc.ExitCode}");
+        if (proc.ExitCode != 0)
+            Godot.GD.PrintErr($"[CMP-REC] stderr:\n{stderrBuf}");
+        else if (File.Exists(videoPath))
+            Godot.GD.Print($"[CMP-REC] wrote video to: {videoPath} ({new FileInfo(videoPath).Length / 1024} KB)");
+        else
+            Godot.GD.PrintErr($"[CMP-REC] subprocess succeeded but video file missing at {videoPath}");
     }
 
     // ── Scenario 1: baseline ───────────────────────────────────────────────────
@@ -217,8 +403,10 @@ public class CollisionMotionPlotTests
                 Frame = f,
                 PlayerZ = cylinder.GlobalPosition.Z,
                 VehicleZ = box.GlobalPosition.Z,
+                DummyVehicleZ = box.GlobalPosition.Z,
                 VehicleVZ = box.LinearVelocity.Z,
             });
+            CaptureFrameForRecording(f);
         }
 
         cylinder.Free();
@@ -254,8 +442,10 @@ public class CollisionMotionPlotTests
                 Frame = f,
                 PlayerZ = player.GlobalPosition.Z,
                 VehicleZ = vehicle.GlobalPosition.Z,
+                DummyVehicleZ = vehicle.GlobalPosition.Z,
                 VehicleVZ = vehicle.LinearVelocity.Z,
             });
+            CaptureFrameForRecording(f);
         }
 
         // Top-level nodes only — Free() recursively frees children (movement, vehiclePred).
@@ -365,8 +555,10 @@ public class CollisionMotionPlotTests
                 Frame = f,
                 PlayerZ = player.GlobalPosition.Z,
                 VehicleZ = vehicle.GlobalPosition.Z,
+                DummyVehicleZ = vehicle.GlobalPosition.Z,
                 VehicleVZ = vehicle.LinearVelocity.Z,
             });
+            CaptureFrameForRecording(f);
         }
 
         player.Free();
@@ -377,10 +569,15 @@ public class CollisionMotionPlotTests
     // ── Scenario 4: host + client, CharacterBody3D player ─────────────────────
     // Two parallel pairs in one physics space, separated by collision layers
     // (mirrors PVC-01). The client owns and predicts its own player; the server
-    // owns and simulates the authoritative player + vehicle. The recorded
-    // "vehicle" trace is the server vehicle's position lagged by SnapshotLagFrames
-    // ticks — what the client's DummyVehicle would interpolate to.
-    private async Task<Trace> RecordHostClientCharacterBody()
+    // owns and simulates the authoritative player + vehicle. Returns two traces:
+    //   • server: PlayerZ = authoritative server player; VehicleZ = authoritative
+    //             server vehicle; DummyVehicleZ = lag-buffered server vehicle
+    //             (what the client *would* see).
+    //   • client: PlayerZ = client-predicted player; VehicleZ = lag-buffered
+    //             server vehicle (the dummy is the only vehicle the client has
+    //             on the cb scenario, since it doesn't predict the vehicle);
+    //             DummyVehicleZ = same lag-buffered value.
+    private async Task<(Trace server, Trace client)> RecordHostClientCharacterBody()
     {
         var (clientPlayer, clientMovement, _, _) = CreateCharacterPlayerAndVehicle(
             ClientLayer, ClientMask, includeVehicle: false);
@@ -391,7 +588,8 @@ public class CollisionMotionPlotTests
         PhysicsServer3D.SpaceStep(_space, Dt);
         PhysicsServer3D.SpaceFlushQueries(_space);
 
-        var trace = new Trace { Description = "Host+client CharacterBody3D (server-vehicle lag = " + SnapshotLagFrames + " ticks)" };
+        var serverTrace = new Trace { Description = "Host+client CharacterBody3D — SERVER (authoritative)" };
+        var clientTrace = new Trace { Description = "Host+client CharacterBody3D — CLIENT (lag-buffered dummy vehicle, lag=" + SnapshotLagFrames + " ticks)" };
         var input = new CharacterInputMessage { MoveX = 0, MoveY = -1, CameraYaw = 0, Keys = 0 };
         var serverVehicleHistory = new Queue<float>();
 
@@ -406,76 +604,252 @@ public class CollisionMotionPlotTests
             PhysicsServer3D.SpaceStep(_space, Dt);
             PhysicsServer3D.SpaceFlushQueries(_space);
 
-            // Snapshot the server vehicle pose this tick and emit the older one.
+            // Snapshot the server vehicle pose this tick and emit the older one for
+            // the client-visible dummy.
             serverVehicleHistory.Enqueue(serverVehicle.GlobalPosition.Z);
-            float visibleVehicleZ = serverVehicleHistory.Count > SnapshotLagFrames
+            float dummyVehicleZ = serverVehicleHistory.Count > SnapshotLagFrames
                 ? serverVehicleHistory.Dequeue()
                 : VehicleStartZ;
 
-            trace.Frames.Add(new FrameSample
+            serverTrace.Frames.Add(new FrameSample
+            {
+                Frame = f,
+                PlayerZ = serverPlayer.GlobalPosition.Z,
+                VehicleZ = serverVehicle.GlobalPosition.Z,
+                DummyVehicleZ = dummyVehicleZ,
+                VehicleVZ = serverVehicle.LinearVelocity.Z,
+            });
+            clientTrace.Frames.Add(new FrameSample
             {
                 Frame = f,
                 PlayerZ = clientPlayer.GlobalPosition.Z,
-                VehicleZ = visibleVehicleZ,
-                // Velocity is captured from the SERVER body (the authoritative source);
-                // the visible dummy on the real client interpolates between snapshots
-                // and would just lag this trace by SnapshotLagFrames.
+                VehicleZ = dummyVehicleZ,
+                DummyVehicleZ = dummyVehicleZ,
                 VehicleVZ = serverVehicle.LinearVelocity.Z,
             });
+            CaptureFrameForRecording(f);
         }
 
         clientPlayer.Free();
         serverPlayer.Free();
         serverVehicle.Free();
-        return trace;
+        return (serverTrace, clientTrace);
     }
 
     // ── Scenario 5: host + client, RigidBody3D player ─────────────────────────
-    private async Task<Trace> RecordHostClientRigidBody()
+    // Models the real prediction + reconciliation loop:
+    //
+    // Real-world timing: client and server both process tick T with the same input,
+    // but the client does it N ticks ahead in wall-clock time (N = latency + jitter + 3).
+    // The server sends a snapshot after each SpaceStep. That snapshot arrives at the
+    // client ~N ticks later (one-way latency). At that point the client has already
+    // predicted N ticks past the snapshot tick. The client compares its saved prediction
+    // for the snapshot tick against the authoritative state. If diverged: reconcile to
+    // authoritative, then RESIM all N ticks that followed.
+    //
+    // In this test both sides share one physics space (separate layers), so we simulate
+    // the timing by:
+    //   - Running server ticks first (produces authoritative state + snapshots)
+    //   - Running client ticks in lockstep with the same input + its own SpaceStep
+    //   - Every SnapshotInterval ticks, delivering a snapshot from SnapshotLagFrames ago
+    //   - On misprediction: reconcile the client cube, then resim forward N ticks
+    //     by replaying the stored inputs + SpaceStep
+    //
+    // Both client and server cubes share the space but are on different layers so they
+    // never collide with each other. Each player only pushes its own cube.
+    private async Task<(Trace host, Trace client)> RecordHostClientRigidBody()
     {
-        var (clientPlayer, clientPred, _, _) = CreateRigidPlayerAndVehicle(
-            ClientLayer, ClientMask, includeVehicle: false);
-        var (serverPlayer, serverPred, serverVehicle, serverVehiclePred) =
+        var (clientPlayer, clientPred, clientVehicle, _) =
+            CreateRigidPlayerAndVehicle(ClientLayer, ClientMask);
+        var (serverPlayer, serverPred, serverVehicle, _) =
             CreateRigidPlayerAndVehicle(ServerLayer, ServerMask);
 
         await _runner.AwaitIdleFrame();
         PhysicsServer3D.SpaceStep(_space, Dt);
         PhysicsServer3D.SpaceFlushQueries(_space);
 
-        var trace = new Trace { Description = "Host+client RigidBody3D (server-vehicle lag = " + SnapshotLagFrames + " ticks)" };
+        var hostTrace = new Trace { Description = "Host+client RigidBody3D — SERVER (authoritative)" };
+        var clientTrace = new Trace { Description = "Host+client RigidBody3D — CLIENT (predicted + reconciled)" };
         var input = new CharacterInputMessage { MoveX = 0, MoveY = -1, CameraYaw = 0, Keys = 0 };
-        var serverVehicleHistory = new Queue<float>();
+
+        // Server snapshot history: stores (posZ, velZ) for each server tick.
+        var serverHistory = new List<(float posZ, float velZ)>();
+
+        // Client prediction history: stores (posZ, velZ) of client cube after each tick,
+        // indexed by the logical tick number. Used for misprediction comparison.
+        var clientPredHistory = new List<(float posZ, float velZ)>();
+
+        // Lag buffer of server vehicle Z, used as the "dummy" pose the client would
+        // render in the absence of prediction (i.e. what a vanilla networked dummy
+        // would interpolate to).
+        var serverVehicleZHistory = new Queue<float>();
+
+        int reconcileCount = 0;
+        int resimTotal = 0;
 
         for (int f = 0; f < FrameCount; f++)
         {
-            RigidPlayerPhysics.AdvancePhysics(clientPred, input);
-            RigidPlayerPhysics.AdvancePhysics(serverPred, input);
-            VehiclePhysics.AdvancePhysics(serverVehiclePred, default(CharacterInputMessage));
+            // ═══ SERVER TICK ═══
+            // Freeze client bodies so SpaceStep only advances server-layer bodies.
+            // Toggling Freeze in the default FreezeModeStatic zeros LinearVelocity, so
+            // snapshot before freezing and restore after — otherwise the frozen-then-
+            // unfrozen body resumes with v=0 each outer frame, capping its motion at
+            // one tick of acceleration's worth of displacement (the host_rb-runs-too-
+            // slow bug: ~0.014 m/frame instead of the expected ~0.083 m/frame).
+            var clPlrV = (clientPlayer.LinearVelocity, clientPlayer.AngularVelocity);
+            var clVehV = (clientVehicle.LinearVelocity, clientVehicle.AngularVelocity);
+            clientPlayer.Freeze = true;
+            clientVehicle.Freeze = true;
 
+            RigidPlayerPhysics.AdvancePhysics(serverPred, input);
             PhysicsServer3D.SpaceStep(_space, Dt);
             PhysicsServer3D.SpaceFlushQueries(_space);
+            serverHistory.Add((serverVehicle.GlobalPosition.Z, serverVehicle.LinearVelocity.Z));
 
-            serverVehicleHistory.Enqueue(serverVehicle.GlobalPosition.Z);
-            float visibleVehicleZ = serverVehicleHistory.Count > SnapshotLagFrames
-                ? serverVehicleHistory.Dequeue()
+            clientPlayer.Freeze = false;
+            clientVehicle.Freeze = false;
+            clientPlayer.LinearVelocity = clPlrV.Item1; clientPlayer.AngularVelocity = clPlrV.Item2;
+            clientVehicle.LinearVelocity = clVehV.Item1; clientVehicle.AngularVelocity = clVehV.Item2;
+
+            // ═══ CLIENT TICK ═══
+            // Freeze server bodies so SpaceStep only advances client-layer bodies.
+            var srPlrV = (serverPlayer.LinearVelocity, serverPlayer.AngularVelocity);
+            var srVehV = (serverVehicle.LinearVelocity, serverVehicle.AngularVelocity);
+            serverPlayer.Freeze = true;
+            serverVehicle.Freeze = true;
+
+            RigidPlayerPhysics.AdvancePhysics(clientPred, input);
+            PhysicsServer3D.SpaceStep(_space, Dt);
+            PhysicsServer3D.SpaceFlushQueries(_space);
+            clientPredHistory.Add((clientVehicle.GlobalPosition.Z, clientVehicle.LinearVelocity.Z));
+
+            serverPlayer.Freeze = false;
+            serverVehicle.Freeze = false;
+            serverPlayer.LinearVelocity = srPlrV.Item1; serverPlayer.AngularVelocity = srPlrV.Item2;
+            serverVehicle.LinearVelocity = srVehV.Item1; serverVehicle.AngularVelocity = srVehV.Item2;
+
+            // ═══ SNAPSHOT DELIVERY + RECONCILIATION ═══
+            // A snapshot for server tick (f - SnapshotLagFrames) arrives now.
+            // The client compares its saved prediction for that tick.
+            int snapshotTick = f - SnapshotLagFrames;
+            if (snapshotTick >= 0 && f % SnapshotInterval == 0)
+            {
+                var (authPosZ, authVelZ) = serverHistory[snapshotTick];
+                var (predPosZ, predVelZ) = clientPredHistory[snapshotTick];
+
+                float posDiffSq = (predPosZ - authPosZ) * (predPosZ - authPosZ);
+                float velDiffSq = (predVelZ - authVelZ) * (predVelZ - authVelZ);
+
+                if (posDiffSq > ReconcilePosThresholdSq || velDiffSq > ReconcileVelThresholdSq)
+                {
+                    reconcileCount++;
+
+                    // Reconcile: snap client cube to authoritative state at snapshotTick.
+                    var t = clientVehicle.GlobalTransform;
+                    t.Origin = new Vector3(t.Origin.X, t.Origin.Y, authPosZ);
+                    PhysicsServer3D.BodySetState(clientVehicle.GetRid(),
+                        PhysicsServer3D.BodyState.Transform, t);
+                    clientVehicle.GlobalPosition = new Vector3(
+                        clientVehicle.GlobalPosition.X, clientVehicle.GlobalPosition.Y, authPosZ);
+                    clientVehicle.LinearVelocity = new Vector3(0, 0, authVelZ);
+                    clientVehicle.AngularVelocity = Vector3.Zero;
+                    clientVehicle.ForceUpdateTransform();
+
+                    // Also reconcile client player to server player state at snapshotTick
+                    // (in real code HandleReconciliation does this).
+                    clientPlayer.GlobalPosition = serverPlayer.GlobalPosition;
+                    clientPlayer.LinearVelocity = serverPlayer.LinearVelocity;
+                    clientPlayer.ForceUpdateTransform();
+
+                    // Resim: replay ticks [snapshotTick+1 .. f] with the same input.
+                    // Server bodies frozen so resim SpaceSteps only affect client. Same
+                    // velocity snapshot/restore as the main loop — otherwise the resim
+                    // wipes server-side momentum on every reconciliation.
+                    var resimSrPlrV = (serverPlayer.LinearVelocity, serverPlayer.AngularVelocity);
+                    var resimSrVehV = (serverVehicle.LinearVelocity, serverVehicle.AngularVelocity);
+                    serverPlayer.Freeze = true;
+                    serverVehicle.Freeze = true;
+
+                    int resimCount = f - snapshotTick;
+                    resimTotal += resimCount;
+                    for (int r = 0; r < resimCount; r++)
+                    {
+                        RigidPlayerPhysics.AdvancePhysics(clientPred, input);
+                        PhysicsServer3D.SpaceStep(_space, Dt);
+                        PhysicsServer3D.SpaceFlushQueries(_space);
+                    }
+
+                    serverPlayer.Freeze = false;
+                    serverVehicle.Freeze = false;
+                    serverPlayer.LinearVelocity = resimSrPlrV.Item1; serverPlayer.AngularVelocity = resimSrPlrV.Item2;
+                    serverVehicle.LinearVelocity = resimSrVehV.Item1; serverVehicle.AngularVelocity = resimSrVehV.Item2;
+
+                    // Update prediction history from resim endpoint.
+                    clientPredHistory[f] = (clientVehicle.GlobalPosition.Z, clientVehicle.LinearVelocity.Z);
+                }
+            }
+
+            // ═══ RECORD TRACES ═══
+            // Lag-buffer the server vehicle pose to compute the "dummy" — the pose a
+            // non-predicting networked client would interpolate to. Stored on both
+            // traces so the plot can overlay it as a dashed line alongside each
+            // trace's primary vehicle position.
+            serverVehicleZHistory.Enqueue(serverVehicle.GlobalPosition.Z);
+            float dummyVehicleZ = serverVehicleZHistory.Count > SnapshotLagFrames
+                ? serverVehicleZHistory.Dequeue()
                 : VehicleStartZ;
 
-            trace.Frames.Add(new FrameSample
+            hostTrace.Frames.Add(new FrameSample
+            {
+                Frame = f,
+                PlayerZ = serverPlayer.GlobalPosition.Z,
+                VehicleZ = serverVehicle.GlobalPosition.Z,
+                DummyVehicleZ = dummyVehicleZ,
+                VehicleVZ = serverVehicle.LinearVelocity.Z,
+            });
+
+            clientTrace.Frames.Add(new FrameSample
             {
                 Frame = f,
                 PlayerZ = clientPlayer.GlobalPosition.Z,
-                VehicleZ = visibleVehicleZ,
-                VehicleVZ = serverVehicle.LinearVelocity.Z,
+                VehicleZ = clientVehicle.GlobalPosition.Z,
+                DummyVehicleZ = dummyVehicleZ,
+                VehicleVZ = clientVehicle.LinearVelocity.Z,
             });
+            CaptureFrameForRecording(f);
         }
+
+        Godot.GD.Print($"[CMP-05] host_rb: reconciliations={reconcileCount} resimTicks={resimTotal}");
 
         clientPlayer.Free();
         serverPlayer.Free();
+        clientVehicle.Free();
         serverVehicle.Free();
-        return trace;
+        return (hostTrace, clientTrace);
     }
 
     // ── Body factories ─────────────────────────────────────────────────────────
+
+    // Recording-friendly mesh helpers: tests bodies have only CollisionShape3D children,
+    // which renders nothing in a runtime viewport (DebugCollisionsHint is editor-only).
+    // Adding a sibling MeshInstance3D with a colored StandardMaterial3D makes the body
+    // visible in the contact-sheet captures so motion can actually be seen.
+    private static readonly Color PlayerColor = new(0.9f, 0.25f, 0.25f);
+    private static readonly Color VehicleColor = new(0.25f, 0.45f, 0.9f);
+
+    private static MeshInstance3D MakeCapsuleMesh(float radius, float height, Color color)
+        => new MeshInstance3D
+        {
+            Mesh = new CapsuleMesh { Radius = radius, Height = height },
+            MaterialOverride = new StandardMaterial3D { AlbedoColor = color },
+        };
+
+    private static MeshInstance3D MakeBoxMesh(Vector3 size, Color color)
+        => new MeshInstance3D
+        {
+            Mesh = new BoxMesh { Size = size },
+            MaterialOverride = new StandardMaterial3D { AlbedoColor = color },
+        };
 
     private (AnimatableBody3D cylinder, RigidBody3D box) CreateKinematicCylinderAndBox(uint layer, uint mask)
     {
@@ -496,6 +870,7 @@ public class CollisionMotionPlotTests
         {
             Shape = new CapsuleShape3D { Radius = 0.5f, Height = 2f },
         });
+        cylinder.AddChild(MakeCapsuleMesh(0.5f, 2f, PlayerColor));
         _runner.Scene().AddChild(cylinder);
 
         var box = new RigidBody3D
@@ -513,6 +888,7 @@ public class CollisionMotionPlotTests
         {
             Shape = new BoxShape3D { Size = new Vector3(2, 1, 4) },
         });
+        box.AddChild(MakeBoxMesh(new Vector3(2, 1, 4), VehicleColor));
         _runner.Scene().AddChild(box);
 
         return (cylinder, box);
@@ -534,6 +910,7 @@ public class CollisionMotionPlotTests
         {
             Shape = new CapsuleShape3D { Radius = 0.5f, Height = 2f },
         });
+        player.AddChild(MakeCapsuleMesh(0.5f, 2f, PlayerColor));
         _runner.Scene().AddChild(player);
 
         var movement = new SharedPlayerMovement();
@@ -559,6 +936,7 @@ public class CollisionMotionPlotTests
         {
             Shape = new BoxShape3D { Size = new Vector3(2, 1, 4) },
         });
+        vehicle.AddChild(MakeBoxMesh(new Vector3(2, 1, 4), VehicleColor));
         _runner.Scene().AddChild(vehicle);
 
         var vehiclePred = new PredictionRigidbody3D();
@@ -589,6 +967,7 @@ public class CollisionMotionPlotTests
         {
             Shape = new CapsuleShape3D { Radius = 0.5f, Height = 2f },
         });
+        player.AddChild(MakeCapsuleMesh(0.5f, 2f, PlayerColor));
         _runner.Scene().AddChild(player);
 
         var playerPred = new PredictionRigidbody3D();
@@ -612,6 +991,7 @@ public class CollisionMotionPlotTests
         {
             Shape = new BoxShape3D { Size = new Vector3(2, 1, 4) },
         });
+        vehicle.AddChild(MakeBoxMesh(new Vector3(2, 1, 4), VehicleColor));
         _runner.Scene().AddChild(vehicle);
 
         var vehiclePred = new PredictionRigidbody3D();
@@ -639,11 +1019,11 @@ public class CollisionMotionPlotTests
     private static void WriteCsv(string dir, string fileName, Trace trace)
     {
         var sb = new StringBuilder();
-        sb.AppendLine("frame,player_z,vehicle_z,vehicle_vz");
+        sb.AppendLine("frame,player_z,vehicle_z,dummy_vehicle_z,vehicle_vz");
         foreach (var f in trace.Frames)
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "{0},{1:0.######},{2:0.######},{3:0.######}",
-                f.Frame, f.PlayerZ, f.VehicleZ, f.VehicleVZ));
+                "{0},{1:0.######},{2:0.######},{3:0.######},{4:0.######}",
+                f.Frame, f.PlayerZ, f.VehicleZ, f.DummyVehicleZ, f.VehicleVZ));
         File.WriteAllText(Path.Combine(dir, fileName), sb.ToString());
     }
 
@@ -696,7 +1076,7 @@ public class CollisionMotionPlotTests
         const int Margin = 60;
         const int Height = TitleH + LegendH + 3 * (PlotH + Margin) + Margin;
 
-        // Find global bounds across all scenarios (player Z, vehicle Z, vehicle Vz).
+        // Find global bounds across all scenarios (player Z, vehicle Z + dummy, vehicle Vz).
         float playerMin = float.PositiveInfinity, playerMax = float.NegativeInfinity;
         float vehicleMin = float.PositiveInfinity, vehicleMax = float.NegativeInfinity;
         float vzMin = float.PositiveInfinity, vzMax = float.NegativeInfinity;
@@ -710,6 +1090,8 @@ public class CollisionMotionPlotTests
                 if (f.PlayerZ > playerMax) playerMax = f.PlayerZ;
                 if (f.VehicleZ < vehicleMin) vehicleMin = f.VehicleZ;
                 if (f.VehicleZ > vehicleMax) vehicleMax = f.VehicleZ;
+                if (f.DummyVehicleZ < vehicleMin) vehicleMin = f.DummyVehicleZ;
+                if (f.DummyVehicleZ > vehicleMax) vehicleMax = f.DummyVehicleZ;
                 if (f.VehicleVZ < vzMin) vzMin = f.VehicleVZ;
                 if (f.VehicleVZ > vzMax) vzMax = f.VehicleVZ;
             }
@@ -719,36 +1101,54 @@ public class CollisionMotionPlotTests
         Pad(ref vehicleMin, ref vehicleMax, 0.05f);
         Pad(ref vzMin, ref vzMax, 0.05f);
 
-        string[] colors = { "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e" };
+        string[] colors = { "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b" };
 
         var sb = new StringBuilder();
         sb.AppendLine($"<svg xmlns='http://www.w3.org/2000/svg' width='{Width}' height='{Height}' font-family='monospace' font-size='12'>");
         sb.AppendLine($"<rect width='100%' height='100%' fill='white'/>");
-        sb.AppendLine($"<text x='{Width / 2}' y='20' text-anchor='middle' font-size='16' font-weight='bold'>Player→Vehicle collision (6 s): player + collided-rigidbody pos &amp; velocity (Z, m | m/s). Forward = -Z.</text>");
+        sb.AppendLine($"<text x='{Width / 2}' y='20' text-anchor='middle' font-size='16' font-weight='bold'>Player→Vehicle collision (6 s): player solid, vehicle dotted, dummy (lagged) dashed. Forward = -Z.</text>");
 
-        // Legend.
+        // Legend: one swatch per scenario (solid color), plus three line-style swatches
+        // for player/vehicle/dummy so the reader can decode the line styles.
         int legendY = TitleH + 8;
         int legendX = Margin;
         for (int i = 0; i < traces.Length; i++)
         {
-            sb.AppendLine($"<line x1='{legendX}' y1='{legendY + 6}' x2='{legendX + 24}' y2='{legendY + 6}' stroke='{colors[i]}' stroke-width='2.5'/>");
+            sb.AppendLine($"<line x1='{legendX}' y1='{legendY + 6}' x2='{legendX + 24}' y2='{legendY + 6}' stroke='{colors[i % colors.Length]}' stroke-width='2.5'/>");
             sb.AppendLine($"<text x='{legendX + 30}' y='{legendY + 10}'>{Escape(traces[i].Name)}</text>");
             legendX += 8 + 24 + 8 + (traces[i].Name.Length * 8) + 16;
         }
+        // Style key on a second legend row.
+        int styleY = legendY + 18;
+        int styleX = Margin;
+        foreach (var (label, dash) in new[] { ("player (solid)", ""), ("vehicle (dotted)", "2 4"), ("dummy (dashed)", "8 4") })
+        {
+            string dashAttr = string.IsNullOrEmpty(dash) ? "" : $" stroke-dasharray='{dash}'";
+            sb.AppendLine($"<line x1='{styleX}' y1='{styleY + 6}' x2='{styleX + 24}' y2='{styleY + 6}' stroke='#333' stroke-width='2.5'{dashAttr}/>");
+            sb.AppendLine($"<text x='{styleX + 30}' y='{styleY + 10}'>{Escape(label)}</text>");
+            styleX += 8 + 24 + 8 + (label.Length * 8) + 16;
+        }
 
-        // Three subplots — top: player Z, middle: collided rigidbody Z, bottom: collided rigidbody Vz.
+        // Three subplots:
+        //   row 0: Player Z (solid lines, one per scenario).
+        //   row 1: Vehicle Z (dotted) + DummyVehicleZ (dashed), overlaid in same axes.
+        //   row 2: Vehicle Vz (solid).
         int row0 = TitleH + LegendH;
         DrawSubplot(sb, "Player Z (m)", row0, Margin, Width - Margin, PlotH,
                     frameCount, playerMin, playerMax,
-                    traces, accessor: f => f.PlayerZ, colors);
+                    traces, accessor: f => f.PlayerZ, colors, strokeDash: "", drawFrame: true);
         int row1 = row0 + PlotH + Margin;
         DrawSubplot(sb, "Collided rigidbody Z (m)", row1, Margin, Width - Margin, PlotH,
                     frameCount, vehicleMin, vehicleMax,
-                    traces, accessor: f => f.VehicleZ, colors);
+                    traces, accessor: f => f.VehicleZ, colors, strokeDash: "2 4", drawFrame: true);
+        // Overlay dummy as dashed on the same axes (skip frame re-draw).
+        DrawSubplot(sb, "Collided rigidbody Z (m)", row1, Margin, Width - Margin, PlotH,
+                    frameCount, vehicleMin, vehicleMax,
+                    traces, accessor: f => f.DummyVehicleZ, colors, strokeDash: "8 4", drawFrame: false);
         int row2 = row1 + PlotH + Margin;
         DrawSubplot(sb, "Collided rigidbody Vz (m/s)", row2, Margin, Width - Margin, PlotH,
                     frameCount, vzMin, vzMax,
-                    traces, accessor: f => f.VehicleVZ, colors);
+                    traces, accessor: f => f.VehicleVZ, colors, strokeDash: "", drawFrame: true);
 
         sb.AppendLine("</svg>");
         File.WriteAllText(svgPath, sb.ToString());
@@ -756,36 +1156,41 @@ public class CollisionMotionPlotTests
 
     private static void DrawSubplot(StringBuilder sb, string yLabel, int top, int left, int right, int height,
         int frameCount, float yMin, float yMax,
-        (string Name, Trace Trace)[] traces, Func<FrameSample, float> accessor, string[] colors)
+        (string Name, Trace Trace)[] traces, Func<FrameSample, float> accessor, string[] colors,
+        string strokeDash, bool drawFrame)
     {
         int plotW = right - left;
-        // Frame at y-axis label.
-        sb.AppendLine($"<text x='{left - 8}' y='{top - 6}' text-anchor='end' font-weight='bold'>{Escape(yLabel)}</text>");
-        sb.AppendLine($"<rect x='{left}' y='{top}' width='{plotW}' height='{height}' fill='none' stroke='#888'/>");
-
-        // Y gridlines + labels — 5 divisions.
-        for (int g = 0; g <= 5; g++)
+        if (drawFrame)
         {
-            float frac = g / 5f;
-            int y = top + (int)(frac * height);
-            float v = yMax - frac * (yMax - yMin);
-            sb.AppendLine($"<line x1='{left}' y1='{y}' x2='{right}' y2='{y}' stroke='#eee'/>");
-            sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "<text x='{0}' y='{1}' text-anchor='end'>{2:0.00}</text>",
-                left - 4, y + 4, v));
+            // Frame + y-axis label.
+            sb.AppendLine($"<text x='{left - 8}' y='{top - 6}' text-anchor='end' font-weight='bold'>{Escape(yLabel)}</text>");
+            sb.AppendLine($"<rect x='{left}' y='{top}' width='{plotW}' height='{height}' fill='none' stroke='#888'/>");
+
+            // Y gridlines + labels — 5 divisions.
+            for (int g = 0; g <= 5; g++)
+            {
+                float frac = g / 5f;
+                int y = top + (int)(frac * height);
+                float v = yMax - frac * (yMax - yMin);
+                sb.AppendLine($"<line x1='{left}' y1='{y}' x2='{right}' y2='{y}' stroke='#eee'/>");
+                sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "<text x='{0}' y='{1}' text-anchor='end'>{2:0.00}</text>",
+                    left - 4, y + 4, v));
+            }
+
+            // X gridlines + labels — 6 divisions.
+            for (int g = 0; g <= 6; g++)
+            {
+                float frac = g / 6f;
+                int x = left + (int)(frac * plotW);
+                int frame = (int)Math.Round(frac * (frameCount - 1));
+                sb.AppendLine($"<line x1='{x}' y1='{top}' x2='{x}' y2='{top + height}' stroke='#eee'/>");
+                sb.AppendLine($"<text x='{x}' y='{top + height + 14}' text-anchor='middle'>f={frame}</text>");
+            }
         }
 
-        // X gridlines + labels — 6 divisions.
-        for (int g = 0; g <= 6; g++)
-        {
-            float frac = g / 6f;
-            int x = left + (int)(frac * plotW);
-            int frame = (int)Math.Round(frac * (frameCount - 1));
-            sb.AppendLine($"<line x1='{x}' y1='{top}' x2='{x}' y2='{top + height}' stroke='#eee'/>");
-            sb.AppendLine($"<text x='{x}' y='{top + height + 14}' text-anchor='middle'>f={frame}</text>");
-        }
-
-        // Trace lines.
+        // Trace lines (with optional stroke-dasharray for vehicle/dummy variants).
+        string dashAttr = string.IsNullOrEmpty(strokeDash) ? "" : $" stroke-dasharray='{strokeDash}'";
         for (int i = 0; i < traces.Length; i++)
         {
             var (_, trace) = traces[i];
@@ -799,7 +1204,7 @@ public class CollisionMotionPlotTests
                 int y = top + (int)(fy * height);
                 path.Append(j == 0 ? "M" : "L").Append(x).Append(' ').Append(y).Append(' ');
             }
-            sb.AppendLine($"<path d='{path}' fill='none' stroke='{colors[i % colors.Length]}' stroke-width='1.6' opacity='0.9'/>");
+            sb.AppendLine($"<path d='{path}' fill='none' stroke='{colors[i % colors.Length]}' stroke-width='1.6' opacity='0.9'{dashAttr}/>");
         }
     }
 
@@ -821,6 +1226,11 @@ public class CollisionMotionPlotTests
         public int Frame;
         public float PlayerZ;
         public float VehicleZ;
+        // The "dummy" vehicle pose — i.e. the server vehicle's position lag-buffered by
+        // SnapshotLagFrames ticks, as the client's networked-only DummyVehicle would
+        // see it. Equal to VehicleZ for single-space scenarios (baseline / listen_*);
+        // for host_* scenarios it lags VehicleZ.
+        public float DummyVehicleZ;
         // Z-component of the collided rigidbody's linear velocity at the END of this
         // frame (after SpaceStep). For host_* the visible body is the lag-buffered
         // dummy; we still capture the SERVER vehicle's velocity here because that's

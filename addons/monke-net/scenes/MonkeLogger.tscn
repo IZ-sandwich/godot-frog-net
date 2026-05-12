@@ -4,3 +4,4 @@
 
 [node name="MonkeLogger" type="Node" unique_id=1893745621]
 script = ExtResource("1_lg9fa")
+DebugEnabled = true

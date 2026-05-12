@@ -57,7 +57,17 @@ metadata/_custom_type_script = "uid://1rpyl54svogx"
 script = ExtResource("6_p5x2j")
 EntityType = 4
 ClientAuthorityScene = ExtResource("18_lcube")
-ClientDummyScene = ExtResource("20_dcube")
+; ClientDummyScene = LocalCube so server-owned cubes also run as predicted
+; entities on the client (local Jolt sim, snapshot-reconciled). Combined with
+; the force-sleep logic in LocalBallPrediction.MaybeForceSleep, this gives us:
+;   - When the server cube is awake/moving (player pushing it), client cube
+;     simulates locally in parallel; contact dynamics stay close to server's.
+;   - When the server cube has gone to sleep, client cube is force-slept too,
+;     so the body cannot drift / wake spuriously via cross-process Jolt micro-
+;     impulses. (Previously a sleeping server-side cube would "replay" on the
+;     client every 8 ticks as local Jolt slowly accumulated velocity until the
+;     misprediction threshold tripped.)
+ClientDummyScene = ExtResource("18_lcube")
 ServerScene = ExtResource("19_scube")
 metadata/_custom_type_script = "uid://1rpyl54svogx"
 

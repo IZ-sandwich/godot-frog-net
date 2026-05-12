@@ -150,9 +150,16 @@ public partial class LagCompensation : Node
                 if (root is CollisionObject3D co) co.ForceUpdateTransform();
             }
         }
-        // Flush so the physics server picks up the rewound transforms before the query.
+        // Step the physics space with dt=0 to commit the rewound transforms
+        // into Jolt's broadphase. SpaceFlushQueries alone only commits queued
+        // queries; the broadphase tree update that backs IntersectRay only
+        // refreshes inside SpaceStep. Without this the query reads stale AABBs
+        // and misses the body even though Godot's transform was just set.
         if (MonkeNetManager.Instance != null)
+        {
+            PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, 0f);
             PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
+        }
 
         bool hitResult = Raycast(origin, direction, length, out hit, excludeEntityIds);
 
@@ -168,8 +175,14 @@ public partial class LagCompensation : Node
                 if (root is CollisionObject3D co) co.ForceUpdateTransform();
             }
         }
+        // Same SpaceStep(0)+Flush dance on restore so the physics server's
+        // broadphase reflects the current poses for any non-lag-comp queries
+        // running this same tick.
         if (MonkeNetManager.Instance != null)
+        {
+            PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, 0f);
             PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
+        }
 
         return hitResult;
     }

@@ -18,6 +18,7 @@ bounce = 0.3
 collision_layer = 2
 collision_mask = 3
 physics_material_override = SubResource("PhysicsMaterial_ball")
+gravity_scale = 0.0
 linear_damp = 0.4
 angular_damp = 0.8
 physics_interpolation_mode = 2

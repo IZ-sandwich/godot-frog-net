@@ -56,7 +56,7 @@ public class RigidbodyStabilityTests
     public void RigidbodyStability_StackHoldsAcrossReplay()
     {
         var space = _runner.Scene().GetViewport().World3D.Space;
-        AddStaticFloor(yPosition: -1f);
+        var floor1 = AddStaticFloor(yPosition: -1f);
 
         // Run 1.
         var (bodies1, prs1) = BuildTower(5, gapY: 1.05f, startY: 0.5f);
@@ -69,14 +69,20 @@ public class RigidbodyStabilityTests
         var run1Pos = new Vector3[5];
         for (int i = 0; i < 5; i++) run1Pos[i] = bodies1[i].GlobalPosition;
 
-        // Tear down run 1.
+        // Tear down run 1 — including the floor, so Jolt's contact-pair cache
+        // for the floor↔cube manifolds doesn't leak warm-start state into run 2.
+        // Without this, the second tower's settle trajectory inherits subtle
+        // bias from run 1's resolved contacts and drifts ~1 cm differently.
         for (int i = 0; i < 5; i++)
         {
             bodies1[i].GetParent().RemoveChild(bodies1[i]);
             bodies1[i].Free();
         }
+        floor1.GetParent().RemoveChild(floor1);
+        floor1.Free();
 
-        // Run 2 — fresh tower, identical inputs (no impulses; only gravity + contacts).
+        // Run 2 — fresh floor + fresh tower, identical inputs.
+        AddStaticFloor(yPosition: -1f);
         var (bodies2, prs2) = BuildTower(5, gapY: 1.05f, startY: 0.5f);
         for (int t = 0; t < 600; t++)
         {
@@ -294,6 +300,10 @@ public class RigidbodyStabilityTests
     private Vector3 LaunchAndCollect(Rid space, Vector3 initialVel, Vector3 startPos)
     {
         var (body, predictionRb) = MakeBody(gravityScale: 0f, startY: startPos.Y);
+        // Default RigidBody3D + StaticBody3D has bounce=0, so a ball into a wall
+        // simply stops on impact. Add a bouncy material so reflection actually
+        // produces a non-zero return velocity (the property the test measures).
+        body.PhysicsMaterialOverride = new PhysicsMaterial { Bounce = 0.9f, Friction = 0.1f };
         body.GlobalPosition = startPos;
         body.LinearVelocity = initialVel;
         // Step until ball has reflected and is moving away (or 60 ticks elapsed).
@@ -370,12 +380,13 @@ public class RigidbodyStabilityTests
         return (body, predictionRb);
     }
 
-    private void AddStaticFloor(float yPosition)
+    private StaticBody3D AddStaticFloor(float yPosition)
     {
         var floor = new StaticBody3D { Position = new Vector3(0, yPosition, 0) };
         var shape = new BoxShape3D { Size = new Vector3(20, 0.5f, 20) };
         floor.AddChild(new CollisionShape3D { Shape = shape });
         _runner.Scene().AddChild(floor);
+        return floor;
     }
 
     private void AddStaticWall(float xPosition)

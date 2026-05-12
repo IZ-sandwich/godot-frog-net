@@ -45,7 +45,7 @@ public class MultiProcessOrchestrator : IDisposable
     }
 
     public TestProcess Spawn(string role, int enetPort, string label = null,
-        string serverAddr = "127.0.0.1")
+        string serverAddr = "127.0.0.1", string recordVideoPath = null)
     {
         int orchPort = Interlocked.Increment(ref _nextOrchPort);
         label ??= role;
@@ -62,9 +62,33 @@ public class MultiProcessOrchestrator : IDisposable
         // loading quirk where a stand-alone harness scene fails to load when
         // launched from inside the gdUnit4 test runner — MainScene is the
         // project's main scene and is therefore reliably loadable.
-        var args = new List<string>
+        var args = new List<string>();
+
+        // Video recording: when recordVideoPath is provided, run the engine in
+        // WINDOWED mode (so it actually renders) at a fixed resolution. The
+        // harness inside the child Godot process owns the recording — it reads
+        // the viewport via GetImage() each frame and pipes raw RGBA bytes to a
+        // child ffmpeg process's stdin (see HarnessVideoRecorder in
+        // MultiClientHarness.cs). Capture happens entirely inside Godot, so
+        // the test window can be off-screen / minimised / occluded and the
+        // recording is unaffected — no requirement to keep any window on top.
+        //
+        // --debug-collisions paints the CollisionShape3D gizmos over every
+        // body so collision volumes are visible in the recording. Audio is
+        // muted via the Dummy driver so the test run is silent.
+        if (recordVideoPath != null)
         {
-            "--headless",
+            args.Add("--resolution"); args.Add("1280x720");
+            args.Add("--debug-collisions");
+            args.Add("--audio-driver"); args.Add("Dummy");
+        }
+        else
+        {
+            args.Add("--headless");
+        }
+
+        args.AddRange(new[]
+        {
             "--path", projectPath,
             "res://demo/MainScene.tscn",
             "--",
@@ -73,8 +97,9 @@ public class MultiProcessOrchestrator : IDisposable
             $"--enet-port={enetPort}",
             $"--orch-port={orchPort}",
             $"--label={label}",
-        };
+        });
         if (role == "client") args.Add($"--server-addr={serverAddr}");
+        if (recordVideoPath != null) args.Add($"--record-video={recordVideoPath}");
 
         var psi = new ProcessStartInfo(_godotBin)
         {
@@ -86,7 +111,13 @@ public class MultiProcessOrchestrator : IDisposable
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
-            CreateNoWindow = true,
+            // CreateNoWindow only matters for the console. For headless server
+            // processes we hide the console; for windowed clients being
+            // captured by ffmpeg gdigrab we MUST allow the real GUI window so
+            // the engine actually renders into it. With CreateNoWindow=true
+            // Godot's window opens but stays hidden — gdigrab then captures a
+            // solid-clear-colour rectangle for the entire test run.
+            CreateNoWindow = recordVideoPath == null,
         };
         foreach (var a in args) psi.ArgumentList.Add(a);
 
@@ -108,6 +139,7 @@ public class MultiProcessOrchestrator : IDisposable
         return tp;
     }
 
+
     public void Dispose()
     {
         foreach (var tp in _processes)
@@ -126,6 +158,15 @@ public class TestProcess : IDisposable
 {
     public string Label { get; }
     public int OrchPort { get; }
+    public int Pid => _process.Id;
+    /// <summary>PID reported by the child Godot process itself (via the "ready" cmd).
+    /// May differ from <see cref="Pid"/> if the engine relaunches internally during
+    /// startup (e.g. when --write-movie initialises a rendering context). 0 until
+    /// <see cref="WaitReady"/> has succeeded at least once.</summary>
+    public int RemotePid { get; private set; }
+    /// <summary>Absolute path of the child process's MonkeLogger output file, or
+    /// null if file logging failed to initialise. Reported by the ready cmd.</summary>
+    public string RemoteLogPath { get; private set; }
 
     private readonly Process _process;
     private readonly System.Text.StringBuilder _stdoutBuf;
@@ -217,6 +258,9 @@ public class TestProcess : IDisposable
             var data = doc.RootElement.GetProperty("data");
             bool isReady = data.GetProperty("ready").GetBoolean();
             bool isNetReady = data.GetProperty("networkReady").GetBoolean();
+            if (data.TryGetProperty("pid", out var pidProp)) RemotePid = pidProp.GetInt32();
+            if (data.TryGetProperty("logPath", out var lpProp) && lpProp.ValueKind == JsonValueKind.String)
+                RemoteLogPath = lpProp.GetString();
             if (isReady && (!networkReady || isNetReady)) return;
             Thread.Sleep(150);
         }
@@ -252,6 +296,32 @@ public class TestProcess : IDisposable
         return doc.RootElement.GetProperty("data").GetProperty("ticks").GetInt64();
     }
 
+    /// <summary>Reads the client's current synced network tick. Cheap enough
+    /// for polling at high frequency. Throws if called on a server process.</summary>
+    public int ReadClientTick()
+    {
+        using var doc = Send(new { cmd = "get-client-tick" });
+        return doc.RootElement.GetProperty("data").GetProperty("syncedTick").GetInt32();
+    }
+
+    /// <summary>Tight-polls the client's synced network tick until it reaches
+    /// at least <paramref name="targetTick"/>. Tighter polling than
+    /// <see cref="WaitForTicks"/> (~5 ms vs 50 ms) so the test returns within
+    /// roughly one physics tick of the target, which is the resolution needed
+    /// to anchor input schedules deterministically.</summary>
+    public void WaitForClientTick(int targetTick, int timeoutMs = 30_000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        int last = 0;
+        while (DateTime.UtcNow < deadline)
+        {
+            last = ReadClientTick();
+            if (last >= targetTick) return;
+            Thread.Sleep(5);
+        }
+        throw new TimeoutException($"[{Label}] client tick {targetTick} not reached within {timeoutMs} ms (last={last})");
+    }
+
     /// <summary>The peer's Godot multiplayer network ID. For the server this is 1;
     /// for clients it's the dynamically assigned ID (typically 2, 3, ... in
     /// connection order, but never assume order — use this method).</summary>
@@ -275,9 +345,15 @@ public class TestProcess : IDisposable
         if (_disposed) return;
         _disposed = true;
 
+        // Shutdown gracefully via the orch socket. The harness's shutdown
+        // handler finalises the in-engine video recorder (drains the frame
+        // queue + waits for ffmpeg to write the mp4 moov atom) BEFORE
+        // calling GetTree().Quit(), so by the time the Godot child exits the
+        // video file is complete. We give the orch command 30 s to allow for
+        // up to 15 s of ffmpeg-finalise wait inside the harness.
         try
         {
-            if (_writer != null) Send(new { cmd = "shutdown" }, timeoutMs: 2_000);
+            if (_writer != null) Send(new { cmd = "shutdown" }, timeoutMs: 30_000);
         }
         catch { /* best effort */ }
 
@@ -288,7 +364,11 @@ public class TestProcess : IDisposable
 
         try
         {
-            if (!_process.WaitForExit(3_000)) _process.Kill(entireProcessTree: true);
+            // 30 s ceiling: the harness's shutdown handler runs
+            // HarnessVideoRecorder.StopAndFlush which can spend up to 15 s
+            // waiting for ffmpeg to finalise the mp4 container. Killing
+            // earlier would leave a truncated file behind.
+            if (!_process.WaitForExit(30_000)) _process.Kill(entireProcessTree: true);
         }
         catch { try { _process.Kill(entireProcessTree: true); } catch { } }
     }

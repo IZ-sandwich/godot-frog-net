@@ -1,4 +1,5 @@
 using Godot;
+using ImGuiNET;
 using MonkeNet.Serializer;
 using MonkeNet.Server;
 using MonkeNet.Shared;
@@ -15,6 +16,26 @@ public partial class PlayerStateSyncronizer : ServerStateSyncronizer
     private static readonly Vector3 RideOffset = new(0, 1.5f, 0);
 
     public float Yaw { get; set; }
+
+    // Append a per-server-player line to the Server Information overlay window.
+    // ImGui merges multiple Begin/End pairs that share a name into a single window,
+    // so each ServerPlayer entity contributes one row identifying itself by Authority
+    // and reporting how many physics ticks its CharacterBody3D slid into a RigidBody3D.
+    // ImGuiRoot is only autoloaded in the main project (not headless/tests), so the
+    // guard mirrors ServerManager.DisplayDebugInformation.
+    public override void _Process(double delta)
+    {
+        if (_playerMovement == null) return;
+        if (!GetTree().Root.HasNode("ImGuiRoot")) return;
+        if (ImGui.Begin("Server Information"))
+        {
+            try
+            {
+                ImGui.Text($"Player auth={Authority}  rigidbody contact ticks: {_playerMovement.RigidbodyContactTicks}");
+            }
+            finally { ImGui.End(); }
+        }
+    }
 
     public override void OnProcessTick(int tick, IPackableElement genericInput)
     {

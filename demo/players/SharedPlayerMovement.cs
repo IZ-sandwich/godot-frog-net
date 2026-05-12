@@ -30,6 +30,16 @@ public partial class SharedPlayerMovement : Node
     private CollisionShape3D _cachedCollisionShape;
 
     /// <summary>
+    /// Running count of <see cref="AdvancePhysics"/> calls in which the player slid
+    /// against at least one <see cref="RigidBody3D"/>. Surfaced in the ImGui overlay so
+    /// the user can compare client- vs server-side rigidbody contact frequency. Note:
+    /// the client side increments on resim ticks too, so under sustained misprediction
+    /// the client count will run slightly ahead of the server's; that divergence is the
+    /// signal, not an artefact.
+    /// </summary>
+    public int RigidbodyContactTicks { get; private set; }
+
+    /// <summary>
     /// Wires the movement controller to a CharacterBody3D programmatically. Used by
     /// tests; in scenes the [Export] field is set in the editor.
     /// </summary>
@@ -47,6 +57,7 @@ public partial class SharedPlayerMovement : Node
         Vector3 postPos = _characterBody.GlobalPosition;
         int slides = _characterBody.GetSlideCollisionCount();
         MonkeLogger.Debug($"[PHYS-PLAYER] body={_characterBody.Name} input=({input}) attemptedVel=({newVelocity.X:F3},{newVelocity.Y:F3},{newVelocity.Z:F3}) postSlideVel=({_characterBody.Velocity.X:F3},{_characterBody.Velocity.Y:F3},{_characterBody.Velocity.Z:F3}) prePos=({prePos.X:F3},{prePos.Y:F3},{prePos.Z:F3}) postPos=({postPos.X:F3},{postPos.Y:F3},{postPos.Z:F3}) slides={slides} onFloor={_characterBody.IsOnFloor()}");
+        bool hitRigidbodyThisCall = false;
         for (int i = 0; i < slides; i++)
         {
             var c = _characterBody.GetSlideCollision(i);
@@ -54,7 +65,9 @@ public partial class SharedPlayerMovement : Node
             Vector3 normal = c.GetNormal();
             Vector3 cpos = c.GetPosition();
             MonkeLogger.Debug($"[PHYS-PLAYER]   slide[{i}] collider={colliderName} normal=({normal.X:F3},{normal.Y:F3},{normal.Z:F3}) at=({cpos.X:F3},{cpos.Y:F3},{cpos.Z:F3})");
+            if (c.GetCollider() is RigidBody3D) hitRigidbodyThisCall = true;
         }
+        if (hitRigidbodyThisCall) RigidbodyContactTicks++;
         // Pass the pre-MoveAndSlide velocity. MoveAndSlide zeroes the component into any
         // surface it slides against, so reading _characterBody.Velocity after the call
         // would always report ~0 component into a head-on collision and we'd never push.
@@ -75,6 +88,16 @@ public partial class SharedPlayerMovement : Node
                 continue;
 
             Vector3 pushDir = -collision.GetNormal();
+            // Drive the impulse from the player's INPUT velocity only — not the relative
+            // velocity (attemptedVel - rb.LinearVelocity). On a listen server the same
+            // cube is simulated independently on the client- and server-layer pairs by
+            // Jolt; its live LinearVelocity drifts by tiny floating-point amounts every
+            // tick, and feeding that drift into the impulse turns sub-millimetre cube
+            // divergences into systematically different player impulses on each side.
+            // The compounding mismatch shows up as steady player mispredictions whenever
+            // the player walks into a pile of cubes / a vehicle (see logs
+            // monke-net_2026-05-11_13-39-30_pid23300.log vs pid33672.log: player z velocity
+            // diverging 1.77 → 2.51 while static cubes show zero delta).
             float speedIntoBody = attemptedVelocity.Dot(pushDir);
             if (speedIntoBody <= 0f)
                 continue;

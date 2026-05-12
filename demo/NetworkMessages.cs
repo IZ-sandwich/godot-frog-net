@@ -69,6 +69,30 @@ public struct SpawnVehicleRequestMessage : IPackableMessage
     public readonly void WriteBytes(MessageWriter writer) { }
 }
 
+// Client → server: spawn a cube owned by the *server*. Cubes are physics props with
+// no per-client ownership semantics; every client renders them as a DummyCube
+// (interpolated from server snapshots) so collisions between a predicted local
+// rigid player and a cube don't carry the LocalCube/DummyCube asymmetry that caused
+// many more mispredictions when interacting with another client's cube than with
+// "your own" cube — see the user-report logs from 2026-05-11. With auth=0 every
+// rigid-player collision against a cube hits the same interpolated dummy on every
+// client; reconciliations come from the snapshot stream, not from per-pair Jolt drift.
+public struct SpawnCubeRequestMessage : IPackableMessage
+{
+    public void ReadBytes(MessageReader reader) { }
+    public readonly void WriteBytes(MessageWriter writer) { }
+}
+
+// Client → server: spawn a synchronised ball owned by the *server*. Same rationale
+// as SpawnCubeRequestMessage — a ball is a physics prop, not a per-client object.
+// (The demo also has an OfflineBall for local-only effects; that's unaffected since
+// OfflineBall is not a networked entity.)
+public struct SpawnBallRequestMessage : IPackableMessage
+{
+    public void ReadBytes(MessageReader reader) { }
+    public readonly void WriteBytes(MessageWriter writer) { }
+}
+
 // Character inputs sent to the server by a local player every tick.
 // MoveX/MoveY carry analog values (-1..1) so controller sticks work correctly.
 // Keyboard produces exactly -1/0/1; a controller stick produces values in between.

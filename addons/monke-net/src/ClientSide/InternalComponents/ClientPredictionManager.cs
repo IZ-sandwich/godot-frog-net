@@ -24,6 +24,12 @@ public partial class ClientPredictionManager : InternalClientComponent
     private readonly List<PredictedState> _predictedStates = [];
     private int _lastTickReceived = 0;
     private int _misspredictionsCount = 0;
+    /// <summary>
+    /// Number of mispredictions detected this session. Surfaced for harness-driven tests
+    /// (see <c>MultiClientHarness.MispredictCount</c>) so a multi-process scenario can
+    /// assert misprediction budgets after driving a known input pattern.
+    /// </summary>
+    public int MispredictionsCount => _misspredictionsCount;
     private int _missedLocalState = 0;
     private int _trimmedTotal = 0;
     private ulong _lastTrimWarningMsec;
@@ -133,7 +139,20 @@ public partial class ClientPredictionManager : InternalClientComponent
 
     public void Predict(int tick, IPackableElement input)
     {
-        if (input == null) return;
+        // Run OnProcessTick on every predicted entity regardless of whether the
+        // local input source produced an input for this tick. Skipping on null
+        // input means the entity's OnProcessTick (which for a player applies
+        // movement impulses, for a cube does nothing) is bypassed, and then the
+        // matching RegisterPrediction call below ALSO skips — so the tick's
+        // post-step state for every predicted body is never recorded. A later
+        // rollback's resim loop then iterates _predictedStates and silently
+        // skips the un-registered ticks, dropping that many ticks' worth of
+        // physics from the resim. The player free-falls correctly on the server
+        // and on the regular client tick path, but the resim path falls short
+        // by N*gravity-dt² metres on the Y axis (N = un-registered ticks since
+        // rollback), accumulating into a 0.2 m+ position drift over a few
+        // dozen idle ticks — observed as a fresh misprediction at the moment
+        // the running drift crosses the hard threshold.
         EntitySpawner.Instance.ClientEntities.ForEach(entity =>
         {
             var clientPredictedEntity = entity.GetComponent<ClientPredictedEntity>();
@@ -143,7 +162,11 @@ public partial class ClientPredictionManager : InternalClientComponent
 
     public void RegisterPrediction(int tick, IPackableElement input)
     {
-        if (input == null) return;
+        // Always record a PredictedState entry — see Predict() for why a null
+        // input must NOT short-circuit this path. The Entities dict captures
+        // post-step body state regardless of whether a real input was applied;
+        // the resim loop needs an entry per tick so SpaceStep is replayed the
+        // correct number of times.
         var predictedState = new PredictedState
         {
             Tick = tick,
@@ -256,6 +279,19 @@ public partial class ClientPredictionManager : InternalClientComponent
             predictableEntity.HandleReconciliation(authoritativeState);
         }
 
+        // Hard-snap every server-owned interpolated entity (DummyCube, DummyBall, ...)
+        // to its authoritative state at the rollback tick. Without this the per-tick
+        // SpaceStep loop below would re-collide the just-reconciled predicted player
+        // against bodies sitting wherever Jolt happened to have left them at the
+        // current local tick — which is several ticks ahead of the rollback tick. The
+        // resim then produces a player trajectory that doesn't match what the server
+        // computed at the rollback tick, so the next snapshot trips the misprediction
+        // threshold again, repeating every tick the contact persists. Resetting the
+        // surrounding world to its authoritative state at the rollback tick breaks
+        // that cycle; the SpaceStep calls in the loop below evolve both player AND
+        // cube from a known-correct shared starting point.
+        SnapInterpolatedEntitiesToStates(authoritativeStates);
+
         // Advance simulation forward for all remaining inputs
         for (int i = 0; i < _predictedStates.Count; i++)
         {
@@ -279,6 +315,22 @@ public partial class ClientPredictionManager : InternalClientComponent
 
         OfflineRigidbody3D.RestoreAll();
         MonkeLogger.Debug($"[PRED-ROLLBACK] complete (offline bodies restored)");
+    }
+
+    // Hard-snaps every server-owned interpolated entity referenced in the states
+    // array to its authoritative pose + velocity. See call site in
+    // RollbackAndResimulate for the rationale (giving the resim loop a
+    // known-correct starting point for cube/ball collision state).
+    private static void SnapInterpolatedEntitiesToStates(IEntityStateData[] states)
+    {
+        if (EntitySpawner.Instance == null) return;
+        foreach (IEntityStateData state in states)
+        {
+            var entity = EntitySpawner.Instance.TryGetEntityById(state.EntityId);
+            if (entity == null) continue;
+            var interp = entity.GetComponent<ClientInterpolatedEntity>();
+            interp?.HardSnapToAuthoritativeState(state);
+        }
     }
 
     private static bool HasAnyPredictedEntity()

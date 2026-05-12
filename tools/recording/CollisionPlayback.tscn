@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://cy0c02vplyhga"]
+
+[ext_resource type="Script" uid="uid://cqs5o8y6ljdph" path="res://tools/recording/CollisionPlayback.cs" id="1_play"]
+
+[node name="CollisionPlayback" type="Node3D"]
+script = ExtResource("1_play")

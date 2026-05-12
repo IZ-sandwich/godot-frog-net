@@ -228,7 +228,7 @@ public partial class ServerEntityManager : InternalServerComponent
     /// <param name="entityType"></param>
     /// <param name="targetId"></param>
     /// <param name="authority"></param>
-    public T SpawnEntity<T>(byte entityType, int authority, string metadata = "") where T : Node3D
+    public T SpawnEntity<T>(byte entityType, int authority, Vector3? position = null, string metadata = "") where T : Node3D
     {
         var entityEvent = new EntityEventMessage
         {
@@ -242,6 +242,13 @@ public partial class ServerEntityManager : InternalServerComponent
         // TODO: this should be inside metadata
         // Execute event locally and retrieve position and rotation data
         T instancedEntity = _entitySpawner.SpawnEntity(entityEvent, isServerSpawn: true) as T;
+        // Caller-supplied position overrides whatever OnEntitySpawned set (some
+        // entities have a hardcoded default like (0,10,0) for the ball/cube
+        // drop-in). Apply BEFORE capturing entityEvent.Position so the broadcast
+        // carries the final position — otherwise every client's DummyEntity
+        // spawns at the default for one frame before the first snapshot
+        // teleports it to the real location, which is a visible jump.
+        if (position.HasValue) instancedEntity.GlobalPosition = position.Value;
         entityEvent.Position = instancedEntity.Position;
         entityEvent.Yaw = instancedEntity.Rotation.Y;
 

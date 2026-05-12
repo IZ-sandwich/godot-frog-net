@@ -2,5 +2,8 @@
 <RunSettings>
   <GdUnit4>
     <TestSessionTimeout>30</TestSessionTimeout>
+    <!-- Godot's Mono compilation step on first run after adding/touching .cs files
+         can take ~30s; the default 20s causes a "Godot compilation TIMEOUT" abort. -->
+    <CompileProcessTimeout>60000</CompileProcessTimeout>
   </GdUnit4>
 </RunSettings>

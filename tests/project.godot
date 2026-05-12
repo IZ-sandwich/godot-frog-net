@@ -11,6 +11,10 @@ config/name="MonkeNetTests"
 
 [autoload]
 
+; MonkeLogger autoload mirrors the main project's so file-logging works in the
+; subprocesses the multi-process harness spawns under --path=tests. Without this
+; entry MonkeLogger.OpenLogFile never runs and no monke-net_*.log is produced.
+MonkeLogger="*uid://b7m3xwoaqrktv"
 MonkeNet="*uid://bchfwceouveq2"
 
 [dotnet]

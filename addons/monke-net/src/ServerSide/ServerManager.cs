@@ -167,9 +167,9 @@ public partial class ServerManager : Node
 
     public ServerEntityManager EntityManager => _entityManager;
 
-    public T SpawnEntity<T>(byte entityType, int authority, string metadata = "") where T : Node3D
+    public T SpawnEntity<T>(byte entityType, int authority, Vector3? position = null, string metadata = "") where T : Node3D
     {
-        return _entityManager.SpawnEntity<T>(entityType, authority, metadata);
+        return _entityManager.SpawnEntity<T>(entityType, authority, position, metadata);
     }
 
     public void DestroyEntity(int entityId, int targetId)

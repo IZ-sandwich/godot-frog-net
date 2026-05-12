@@ -7,6 +7,14 @@
 
 [sub_resource type="CapsuleShape3D" id="CapsuleShape3D_rplyr"]
 
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_rplyr_red"]
+albedo_color = Color(0.85, 0.18, 0.18, 1)
+
+[sub_resource type="CapsuleMesh" id="CapsuleMesh_rplyr"]
+material = SubResource("StandardMaterial3D_rplyr_red")
+radius = 0.5
+height = 2.0
+
 [node name="LocalRigidPlayer" type="RigidBody3D" unique_id=1602080700]
 collision_layer = 2
 collision_mask = 3
@@ -16,6 +24,17 @@ lock_rotation = true
 [node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=1602080701]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0)
 shape = SubResource("CapsuleShape3D_rplyr")
+
+; Visible body mesh sized + positioned to match CollisionShape3D so the player
+; is visible in the test recordings (otherwise the rigid-player scene was a
+; collision-only invisible body). Layer is set so the player's own first-person
+; camera (cull mask default) can hide it via its own cull mask config if a
+; consumer cares about not seeing their own body — for the test's observer
+; camera (cull_mask=all) it's always rendered.
+[node name="VisualMesh" type="MeshInstance3D" parent="." unique_id=1602080707]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0)
+layers = 2
+mesh = SubResource("CapsuleMesh_rplyr")
 
 [node name="PredictionRigidbody" type="Node" parent="." unique_id=1602080702 node_paths=PackedStringArray("_body")]
 script = ExtResource("2_predrb")
@@ -32,6 +51,10 @@ transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.8, 0)
 metadata/_edit_lock_ = true
 
 [node name="Camera" type="Camera3D" parent="RotationHelperY" unique_id=1602080705]
+; cull_mask omits layer 2 (1048575 - 2 = 1048573) so the player's own VisualMesh
+; (placed on layer 2) doesn't block this first-person view. The harness's
+; observer camera uses the default cull_mask and so still renders the body.
+cull_mask = 1048573
 current = true
 fov = 90.0
 script = ExtResource("3_camera")

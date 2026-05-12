@@ -210,6 +210,25 @@ public partial class MainScene : Node3D
             ServerManager.Instance.SpawnEntity<Node3D>(entityType: 2, authority: 0);
             return;
         }
+
+        if (command is SpawnCubeRequestMessage)
+        {
+            // Cubes are server-authoritative props (see SpawnCubeRequestMessage comment).
+            // EntityType 4 = cube; auth=0 makes every client see a DummyCube. Without this
+            // the requester would predict its own LocalCube while every other client saw a
+            // DummyCube, and rigid-player → cube collisions on those other clients drifted
+            // because the predicted-local and interpolated-dummy contact configurations
+            // differ from what the server simulates.
+            ServerManager.Instance.SpawnEntity<Node3D>(entityType: 4, authority: 0);
+            return;
+        }
+
+        if (command is SpawnBallRequestMessage)
+        {
+            // Same rationale as SpawnCubeRequestMessage.
+            ServerManager.Instance.SpawnEntity<Node3D>(entityType: 1, authority: 0);
+            return;
+        }
     }
 
     private void OnServerClientDisconnected(int clientId)
@@ -234,7 +253,13 @@ public partial class MainScene : Node3D
     private void OnSpawnBallButtonPressed()
     {
         if (ClientManager.Instance == null) return;
-        ClientManager.Instance.MakeEntityRequest(1);
+        // Server-authoritative: see SpawnBallRequestMessage. MakeEntityRequest would
+        // assign auth=requester and create a LocalBall on this client + DummyBall on
+        // every other, which produces the rigid-player → cube/ball misprediction
+        // asymmetry
+        ClientManager.Instance.SendCommandToServer(
+            new SpawnBallRequestMessage(),
+            INetworkManager.PacketModeEnum.Reliable, (int)ChannelEnum.GameReliable);
     }
 
     private void OnSpawnRigidPlayerButtonPressed()
@@ -247,7 +272,10 @@ public partial class MainScene : Node3D
     private void OnSpawnCubeButtonPressed()
     {
         if (ClientManager.Instance == null) return;
-        ClientManager.Instance.MakeEntityRequest(4);
+        // Server-authoritative: see SpawnCubeRequestMessage.
+        ClientManager.Instance.SendCommandToServer(
+            new SpawnCubeRequestMessage(),
+            INetworkManager.PacketModeEnum.Reliable, (int)ChannelEnum.GameReliable);
     }
 
     // Spawn a vehicle owned by the server (not by the requesting client). The framework's

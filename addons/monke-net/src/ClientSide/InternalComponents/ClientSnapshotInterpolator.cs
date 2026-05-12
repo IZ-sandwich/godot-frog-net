@@ -90,6 +90,15 @@ public partial class ClientSnapshotInterpolator : InternalClientComponent
         double currentRenderPoint = renderTick - pastSnapshot.Tick;     // Where in this "line" we are located based on current clock
 
         _interpolationFactor = currentRenderPoint / diffBetweenStates;  // Where in the line we are represented as a coefficient
+
+        // Clamp to [0, 1] so a stale future snapshot (jitter spike: render
+        // clock advances but no new snapshot arrived in the buffer) doesn't
+        // cause the lerp to extrapolate beyond the latest known state. Without
+        // this clamp, dummies overshoot during burst-loss / jitter and then
+        // visibly snap back when the next snapshot arrives — producing
+        // multi-meter frame deltas instead of a smooth pause-then-resume.
+        if (_interpolationFactor > 1.0) _interpolationFactor = 1.0;
+        else if (_interpolationFactor < 0.0) _interpolationFactor = 0.0;
         var futureStateCount = nextSnapshot.States.Length;
 
         for (int i = 0; i < futureStateCount; i++)
@@ -106,6 +115,35 @@ public partial class ClientSnapshotInterpolator : InternalClientComponent
                 ClientInterpolatedEntity clientInterpolator = networkBehaviour.GetComponent<ClientInterpolatedEntity>(); //FIXME: instead of searching for the component, I should already have a reference for it somewhere
                 clientInterpolator?.HandleStateInterpolation(pastState, futureState, (float)_interpolationFactor);
             }
+        }
+    }
+
+    /// <summary>
+    /// Snap every interpolated entity's physics body to its state in the LATEST
+    /// received snapshot. Called from <see cref="ClientManager._PhysicsProcess"/>
+    /// just before <see cref="ClientPredictionManager.Predict"/> runs so that the
+    /// locally-predicted player collides with these bodies at their server-truth
+    /// pose during the physics tick — not at whatever pose the last render-frame
+    /// interpolator pass happened to land them on.
+    ///
+    /// Without this call the body's transform between render frames is whatever
+    /// the previous <c>HandleStateInterpolation</c> wrote to it, plus any Jolt
+    /// integration the engine did in the meantime; either source can drift it
+    /// out of sync with the server. Refreshing right before SpaceStep gives the
+    /// player's contact resolution the same cube pose the server's player saw
+    /// when it computed the snapshot we're about to compare against.
+    /// </summary>
+    public void SnapInterpolatedBodiesToLatestSnapshot()
+    {
+        if (_snapshotBuffer.Count == 0) return;
+        var latest = _snapshotBuffer[^1];
+        for (int i = 0; i < latest.States.Length; i++)
+        {
+            IEntityStateData state = latest.States[i];
+            NetworkBehaviour networkBehaviour = EntitySpawner.Instance.TryGetEntityById(state.EntityId);
+            if (networkBehaviour == null) continue;
+            var interp = networkBehaviour.GetComponent<ClientInterpolatedEntity>();
+            interp?.HardSnapToAuthoritativeState(state);
         }
     }
 

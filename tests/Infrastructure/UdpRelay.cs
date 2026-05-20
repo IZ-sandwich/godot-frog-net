@@ -50,6 +50,22 @@ public sealed class UdpRelay : IDisposable
     private float _lossRate;
     private readonly Random _rng = new();
 
+    // Cumulative packet counters, maintained via Interlocked so the test thread
+    // can snapshot them at any moment without locking. Inbound = client→server,
+    // outbound = server→client. "Total" is every packet the relay saw on that
+    // direction; "Dropped" is the subset rolled by ShouldDrop and not delivered.
+    private long _totalInbound, _droppedInbound;
+    private long _totalOutbound, _droppedOutbound;
+
+    /// <summary>Total client→server packets the relay has received (delivered + dropped).</summary>
+    public long TotalInbound => Interlocked.Read(ref _totalInbound);
+    /// <summary>Total client→server packets dropped by simulated loss.</summary>
+    public long DroppedInbound => Interlocked.Read(ref _droppedInbound);
+    /// <summary>Total server→client packets the relay has received (delivered + dropped).</summary>
+    public long TotalOutbound => Interlocked.Read(ref _totalOutbound);
+    /// <summary>Total server→client packets dropped by simulated loss.</summary>
+    public long DroppedOutbound => Interlocked.Read(ref _droppedOutbound);
+
     // Per-client-endpoint forwarder. Each unique client UDP source endpoint
     // gets its own outbound socket to the server so we can route the server's
     // replies back to the right client. Same model a NAT box uses.
@@ -140,7 +156,8 @@ public sealed class UdpRelay : IDisposable
 
     private void OnPacketFromClient(IPEndPoint src, byte[] data)
     {
-        if (ShouldDrop()) return;
+        Interlocked.Increment(ref _totalInbound);
+        if (ShouldDrop()) { Interlocked.Increment(ref _droppedInbound); return; }
         long deliveryTicks = ComputeDeliveryTicks();
         var packet = new PendingPacket
         {
@@ -250,7 +267,8 @@ public sealed class UdpRelay : IDisposable
             {
                 IPEndPoint src = null!;
                 byte[] data = link.OutSocket.Receive(ref src);
-                if (ShouldDrop()) continue;
+                Interlocked.Increment(ref _totalOutbound);
+                if (ShouldDrop()) { Interlocked.Increment(ref _droppedOutbound); continue; }
                 long deliveryTicks = ComputeDeliveryTicks();
                 var pkt = new PendingPacket
                 {

@@ -53,6 +53,15 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
     // when the body unfreezes, so jumping off a moving vehicle preserves momentum.
     private int _lastRiddenVehicleEntityId;
 
+    // Latest AdvancePhysics result for this entity, kept between OnProcessTick (pre-step)
+    // and OnPostPhysicsTick (post-step). LogPostPhysics consumes preVel + the impulse
+    // AdvancePhysics queued to compute the residual velocity attributable to Jolt's
+    // contact-resolution step. Cleared back to default when AdvancePhysics is skipped
+    // (rider-anchored / no-input ticks) so a stale impulse isn't subtracted from an
+    // anchor-step body that didn't run input physics.
+    private RigidPlayerPhysics.AdvanceResult _lastAdvanceResult;
+    private bool _hasLastAdvanceResult;
+
     public override void OnEntitySpawned()
     {
         base.OnEntitySpawned();
@@ -95,9 +104,32 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
     // mesh by 1 tick, perceived as oscillation. This post-step pass re-reads
     // vehicle.GlobalPosition AFTER its just-integrated pose is on the scene
     // tree, so the rider's curr-tick anchor pose lines up with the vehicle's.
+    //
+    // Dismount-with-velocity-inheritance also fires here (not in OnProcessTick)
+    // so the vehicle's post-step LinearVelocity is what's inherited — the same
+    // value the server's UpdateRideFreezeState(post-step) reads and packs into
+    // the snapshot stream. Without this matched timing, the client and server
+    // inherit different vehicle velocities (off by one tick of integration)
+    // and the player's post-dismount free-fall trajectory diverges by ~0.5 m/s
+    // on Y, tripping RIDER-MISPREDICT-TRIP a couple of seconds later.
     public override void OnPostPhysicsTick(int tick, IPackableElement input)
     {
         TryAnchorToOwnedVehicle();
+        UpdateRideFreezeState(isPostStep: true);
+
+        // Post-step diagnostic — runs only on live ticks (resim path doesn't invoke
+        // OnPostPhysicsTick). If the immediately-preceding OnProcessTick ran
+        // RigidPlayerPhysics.AdvancePhysics, _lastAdvanceResult holds the preVel and
+        // queued impulse; LogPostPhysics computes the residual velocity Jolt applied
+        // during the step and dumps the post-step contact list. Skipped when the
+        // body was anchored or no input arrived (those ticks don't run AdvancePhysics
+        // and have no "expected post" to subtract from).
+        var body = _predictionRb?.Body;
+        if (_hasLastAdvanceResult && body != null && !body.Freeze)
+        {
+            RigidPlayerPhysics.LogPostPhysics(body, _lastAdvanceResult.PreVel, _lastAdvanceResult.QueuedImpulse, phase: "live");
+        }
+        _hasLastAdvanceResult = false;
     }
 
     public override void OnProcessTick(int tick, IPackableElement input)
@@ -127,17 +159,25 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
             }
 
             ApplyVisualYaw(cmd.CameraYaw);
-            UpdateRideFreezeState();
-            if (TryAnchorToOwnedVehicle()) return;
-            RigidPlayerPhysics.AdvancePhysics(_predictionRb, cmd);
+            // Mount-only here. Dismount-with-velocity-inheritance fires from
+            // OnPostPhysicsTick so it reads the vehicle's just-integrated velocity.
+            UpdateRideFreezeState(isPostStep: false);
+            if (TryAnchorToOwnedVehicle())
+            {
+                _hasLastAdvanceResult = false; // anchored — no input physics this tick
+                return;
+            }
+            _lastAdvanceResult = RigidPlayerPhysics.AdvancePhysics(_predictionRb, cmd, phase: "live");
+            _hasLastAdvanceResult = true;
             return;
         }
 
         // No input yet for this entity (first few ticks before any snapshot has
         // delivered an input for it). Still try to anchor — riding state is driven
         // by Authority, not input — but skip the physics advance.
-        UpdateRideFreezeState();
+        UpdateRideFreezeState(isPostStep: false);
         TryAnchorToOwnedVehicle();
+        _hasLastAdvanceResult = false;
     }
 
     // Temporary per-render-frame trace of the rider body. Paired with
@@ -205,10 +245,54 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
 
     public override Vector3 GetPosition() => _predictionRb.Body.GlobalPosition;
 
-    public override RigidbodyState GetSnapshotState() => _predictionRb.SnapshotState();
+    public override RigidbodyState GetSnapshotState()
+    {
+        var state = _predictionRb.SnapshotState();
+        // Mirror ServerRigidPlayerStateSyncronizer.PackEntityState: while the body is
+        // anchored to a vehicle (Freeze=Kinematic), Jolt derives a LinearVelocity from
+        // the per-tick transform delta the anchor writes. That derived value is garbage
+        // for prediction purposes — the body's visible motion is the anchor formula, not
+        // the integrator. Recording it into _predictedStates would feed bogus velocities
+        // into the resim path AND into the per-snapshot HasMisspredicted comparison if
+        // the freeze guard there ever changed. Returning zero matches what the server
+        // ships in its snapshot and what the predict-loop should reason about.
+        var body = _predictionRb.Body;
+        bool anchored = body != null && body.Freeze
+                        && body.FreezeMode == RigidBody3D.FreezeModeEnum.Kinematic;
+        if (anchored)
+        {
+            state.LinearVelocity = Vector3.Zero;
+            state.AngularVelocity = Vector3.Zero;
+        }
+        return state;
+    }
 
     public override Vector3 ExtractAuthoritativePosition(IEntityStateData state) =>
         ((EntityStateMessage)state).Position;
+
+    public override Vector3 ExtractAuthoritativeVelocity(IEntityStateData state) =>
+        ((EntityStateMessage)state).Velocity;
+
+    public override Quaternion ExtractAuthoritativeRotation(IEntityStateData state) =>
+        ((EntityStateMessage)state).Rotation;
+
+    public override string DescribeMispredictTrigger(IEntityStateData authoritativeState, RigidbodyState savedState)
+    {
+        // Match this entity's HasMisspredicted thresholds — particularly the
+        // tighter _maxVelocityDeviationSquared (0.25 ≈ 0.5 m/s) that's looser
+        // than the prop / vehicle default (1.0 ≈ 1.0 m/s). Without this
+        // override the base classifier would compare against the looser
+        // default and report "below-thresholds" any time the player's
+        // tighter velocity check actually fired — a silent classification
+        // bug that surfaced in the tower_run analysis at tick 594.
+        Vector3 authPos = ExtractAuthoritativePosition(authoritativeState);
+        Vector3 authVel = ExtractAuthoritativeVelocity(authoritativeState);
+        Quaternion authRot = ExtractAuthoritativeRotation(authoritativeState);
+        bool posOver = (authPos - savedState.Position).LengthSquared() > _maxDeviationAllowedSquared;
+        bool velOver = (authVel - savedState.LinearVelocity).LengthSquared() > _maxVelocityDeviationSquared;
+        bool rotOver = authRot.AngleTo(savedState.Rotation) > Mathf.DegToRad(5f);
+        return MispredictTriggerString.Format(posOver, velOver, rotOver);
+    }
 
     public override bool HasMisspredicted(int tick, IEntityStateData receivedState, RigidbodyState savedState)
     {
@@ -312,12 +396,15 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
         // Rollback resim receives per-entity input from ClientPredictionManager —
         // local input for the locally-driven player, cached server-supplied input
         // for remote players. Apply physics for both so rollback resim of remote
-        // entities tracks the server's resim.
+        // entities tracks the server's resim. The phase tag on the produced
+        // [PHYS-RIGIDPLAYER] log line distinguishes these calls from live-tick ones
+        // so a misprediction-triggered burst of resims doesn't visually merge with
+        // the live tick that recorded the predicted state in the first place.
         if (input is CharacterInputMessage cmd)
         {
             ApplyVisualYaw(cmd.CameraYaw);
             if (TryAnchorToOwnedVehicle()) return;
-            RigidPlayerPhysics.AdvancePhysics(_predictionRb, cmd);
+            RigidPlayerPhysics.AdvancePhysics(_predictionRb, cmd, phase: "resim");
             return;
         }
         TryAnchorToOwnedVehicle();
@@ -365,18 +452,33 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
     // TryAnchorToOwnedVehicle) doesn't accidentally toggle freeze state based on
     // current Authority while replaying historical ticks. Freeze is owned by
     // the live tick; resim only writes pose.
-    private void UpdateRideFreezeState()
+    //
+    // isPostStep gates which transition fires this call:
+    //   - false (from OnProcessTick): handle MOUNT only. Freezing the body before
+    //     this tick's SpaceStep keeps it pinned at the anchor pose for the integration.
+    //   - true (from OnPostPhysicsTick): handle DISMOUNT only. Reading the vehicle's
+    //     LinearVelocity here gets its post-step value for this tick — matching what
+    //     ServerRigidPlayerStateSyncronizer.UpdateRideFreezeState(post-step) reads
+    //     server-side. Both inherit the same vehicle velocity, so the player's
+    //     post-dismount trajectory agrees on both processes and the chronic
+    //     ~0.5 m/s Y-axis gap that previously tripped RIDER-MISPREDICT-TRIP a few
+    //     seconds later goes away.
+    private void UpdateRideFreezeState(bool isPostStep)
     {
         var body = _predictionRb?.Body;
         if (body == null) return;
         var ridden = FindRiddenVehicle();
         bool ridingNow = ridden != null;
-        if (ridingNow && !body.Freeze)
+
+        if (!isPostStep && ridingNow && !body.Freeze)
         {
             body.FreezeMode = RigidBody3D.FreezeModeEnum.Kinematic;
             body.Freeze = true;
+            _lastRiddenVehicleEntityId = ridden.EntityId;
+            return;
         }
-        else if (!ridingNow && body.Freeze)
+
+        if (isPostStep && !ridingNow && body.Freeze)
         {
             // Inherit the vehicle's linear velocity on dismount so jumping off a
             // moving vehicle preserves momentum. Look up the vehicle we were last
@@ -398,8 +500,8 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
             body.Freeze = false;
             body.LinearVelocity = inheritedVel;
             body.AngularVelocity = Vector3.Zero;
+            _lastRiddenVehicleEntityId = 0;
         }
-        _lastRiddenVehicleEntityId = ridingNow ? ridden.EntityId : 0;
     }
 
     private LocalVehiclePrediction FindRiddenVehicle()

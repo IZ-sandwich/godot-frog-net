@@ -83,7 +83,10 @@ public class MultiProcessSidePushVehicleTests : MultiProcessTestBase
     {
         if (Orch == null) return;
 
-        var (server, client) = SpawnPair("side_push_vehicle", recordVideo: true);
+        // Spawn server + active client + passive observer. The observer
+        // simply records video and writes its own log so a non-driver
+        // perspective is captured alongside the driver's.
+        var (server, client, observer) = SpawnTriad("side_push_vehicle", recordVideo: true);
 
         server.WaitForTicks(SnapshotArmTicks);
 
@@ -115,6 +118,7 @@ public class MultiProcessSidePushVehicleTests : MultiProcessTestBase
 
         client.WaitForClientTick(anchorTick);
         int baselineMispredicts = ReadMispredictCount(client);
+        int observerBaselineMispredicts = ReadMispredictCount(observer);
 
         var clientSamples = new List<Sample>();
         var serverSamples = new List<Sample>();
@@ -137,6 +141,7 @@ public class MultiProcessSidePushVehicleTests : MultiProcessTestBase
 
         int finalMispredicts = ReadMispredictCount(client);
         int mispredictsThisRun = finalMispredicts - baselineMispredicts;
+        int observerMispredictsThisRun = ReadMispredictCount(observer) - observerBaselineMispredicts;
 
         // First sample tick where the client's misprediction count went up —
         // the reconcile-observed point.
@@ -151,6 +156,7 @@ public class MultiProcessSidePushVehicleTests : MultiProcessTestBase
         var paths = ArtifactsFor("side_push_vehicle");
         WriteCombinedPlot(paths, clientSamples, serverSamples, playerEid, vehicleEid, baselineMispredicts);
         CopyProcessLogs(paths);
+        CopyObserverLog(paths, "side_push_vehicle");
 
         AssertThat(clientSamples.Count)
             .OverrideFailureMessage("expected non-empty sample stream")
@@ -221,8 +227,27 @@ public class MultiProcessSidePushVehicleTests : MultiProcessTestBase
                 .IsLessEqual(MaxVisualJumpPerTickM);
         }
 
+        // Side-push mispredict budget — the test deliberately injects per-tick
+        // server-only velocity drift, so 1–2 reconciles are expected as the
+        // accumulated drift exceeds HasMisspredicted's threshold. The observer
+        // sees the same drifted server pose via snapshots and should reconcile
+        // at most as many times as the driver does; a higher observer count
+        // points to a snapshot-vs-input replication asymmetry.
+        const int SidePushMispredictBudget = 5;
+        AssertThat(mispredictsThisRun)
+            .OverrideFailureMessage(
+                $"driver mispredicted {mispredictsThisRun} times over {RunTicks} ticks (budget {SidePushMispredictBudget}). " +
+                $"Trace at TestResults/SidePushVehiclePlots/side_push_vehicle.{{csv,svg,mp4}}")
+            .IsLessEqual(SidePushMispredictBudget);
+        AssertThat(observerMispredictsThisRun)
+            .OverrideFailureMessage(
+                $"observer mispredicted {observerMispredictsThisRun} times over {RunTicks} ticks (budget {SidePushMispredictBudget}). " +
+                $"Observer should reconcile at most as many times as the driver in this drift-injection scenario. " +
+                $"Trace at TestResults/SidePushVehiclePlots/side_push_vehicle.{{csv,svg,mp4}}")
+            .IsLessEqual(SidePushMispredictBudget);
+
         Godot.GD.Print($"[MP-SIDE-PUSH] run complete: {clientSamples.Count} samples (client+server), " +
-            $"{mispredictsThisRun} mispredictions over {RunTicks} ticks. " +
+            $"driver={mispredictsThisRun} observer={observerMispredictsThisRun} mispredictions over {RunTicks} ticks. " +
             $"Artefacts: TestResults/SidePushVehiclePlots/side_push_vehicle.{{csv,svg,mp4}}");
     }
 

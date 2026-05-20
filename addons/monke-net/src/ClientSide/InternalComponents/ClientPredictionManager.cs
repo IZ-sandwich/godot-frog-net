@@ -22,14 +22,26 @@ public partial class ClientPredictionManager : InternalClientComponent
     [Export] public int MaxRollbackTicks { get; set; } = 120;
 
     private readonly List<PredictedState> _predictedStates = [];
-    // Per-entity last input as observed by the server. Populated from
-    // GameSnapshotMessage.Inputs on every snapshot. Used by Predict() to drive
-    // forward-prediction of entities this client doesn't own — without it, an
-    // observer can only coast the entity at its last-known velocity, drifting
-    // from the server's input-driven trajectory every tick and forcing a
-    // reconcile on every snapshot. Lookup falls back to null for entities the
-    // server never reports an input for (server-authoritative passive props).
-    private readonly Dictionary<int, IPackableElement> _lastInputByEntityId = [];
+    // Per-entity per-tick input cache populated from GameSnapshotMessage.Inputs
+    // on every snapshot. Each snapshot carries the last N inputs the server
+    // applied per entity, each stamped with its server tick — observers look
+    // up by (entityId, tick) so forward prediction at tick T uses the input
+    // applied at server tick T (when known), and the rollback resim loop
+    // replays each past tick with its actual applied input rather than
+    // approximating with "latest cached input for everything in the window".
+    private readonly Dictionary<int, SortedDictionary<int, IPackableElement>> _inputByEntityIdAndTick = [];
+    // Per-entity most recent server tick we have cached input for. Used by
+    // ResolveRemoteInput when the requested tick isn't in the cache (typical
+    // for forward prediction at ticks beyond the latest snapshot): falls back
+    // to the latest known input rather than null, so observers extrapolate
+    // forward with "continue last input" instead of coasting on velocity.
+    private readonly Dictionary<int, int> _latestCachedTickByEntityId = [];
+    // Entity IDs of remote (non-locally-owned) predicted entities for which we
+    // currently have NO cached server input. Used to edge-log the "predicting
+    // remote entity without input" condition — see ResolveRemoteInput. Tracking
+    // edges (rather than logging every tick) keeps the log readable: one line
+    // when input goes missing, one line when it comes back.
+    private readonly HashSet<int> _remoteEntitiesAwaitingInput = [];
     // Entity IDs whose first authoritative snapshot has already been folded into
     // the prediction state. The first snapshot for a freshly-spawned entity does
     // NOT count as a misprediction even if it triggers a rollback: the client's
@@ -42,12 +54,45 @@ public partial class ClientPredictionManager : InternalClientComponent
     private readonly HashSet<int> _initializedEntityIds = [];
     private int _lastTickReceived = 0;
     private int _misspredictionsCount = 0;
+    private int _mispredictsExternalForce = 0;
+    private int _mispredictsPhysicsNondeterminism = 0;
+    private int _mispredictsDegradedNetwork = 0;
+    private int _lastRollbackDepth = 0;
     /// <summary>
     /// Number of mispredictions detected this session. Surfaced for harness-driven tests
     /// (see <c>MultiClientHarness.MispredictCount</c>) so a multi-process scenario can
     /// assert misprediction budgets after driving a known input pattern.
     /// </summary>
     public int MispredictionsCount => _misspredictionsCount;
+    /// <summary>Per-class mispredict count: server-side impulses or remote-player collisions
+    /// the client didn't replay. The user-visible class — these are the mispredicts that
+    /// actually matter for sync quality.</summary>
+    public int MispredictsExternalForce => _mispredictsExternalForce;
+    /// <summary>Per-class mispredict count: cross-process Jolt FP divergence (contact-manifold
+    /// rounding, bounce-timing skew). Unavoidable noise floor — not a sync failure.</summary>
+    public int MispredictsPhysicsNondeterminism => _mispredictsPhysicsNondeterminism;
+    /// <summary>Per-class mispredict count: snapshots arriving for ticks already trimmed
+    /// from the prediction history buffer. Must be zero under normal operating conditions;
+    /// a non-zero count indicates packet loss or RTT spikes exceeded the rollback window.</summary>
+    public int MispredictsDegradedNetwork => _mispredictsDegradedNetwork;
+    /// <summary>Depth (in ticks) of the most recent rollback: <c>currentTick − reconcileTick</c>.
+    /// Updated each time <see cref="RollbackAndResimulate"/> runs. Used by quantitative tests
+    /// to assemble the rollback-depth distribution (P50/P95/P99) across a scenario.</summary>
+    public int LastRollbackDepth => _lastRollbackDepth;
+    /// <summary>Cumulative count of (tick, entity) pairs where the prediction loop did
+    /// NOT have the EXACT current-tick input cached for a remote entity (that the
+    /// server has previously reported input for). The predictor still continues —
+    /// extrapolating from the most recent preceding cached input — but each such
+    /// extrapolation counts as one missed-input event. The metric thereby measures
+    /// how often the server-reported input stream is too sparse or too stale to
+    /// keep up with the client's prediction tick.</summary>
+    public int MissedInputCount => _missedInputCount;
+    private int _missedInputCount = 0;
+    // Set of entity ids for which the server has reported at least one input.
+    // Used by ResolveRemoteInput to gate the missed-input counter so that
+    // server-owned passive props (which never have input) do not inflate the
+    // M9 metric — see ResolveRemoteInput for the rationale.
+    private readonly HashSet<int> _entitiesEverHadInput = new();
     private int _missedLocalState = 0;
     private int _trimmedTotal = 0;
     private ulong _lastTrimWarningMsec;
@@ -58,9 +103,17 @@ public partial class ClientPredictionManager : InternalClientComponent
     private ulong _mispredictionWindowStartMsec;
     private int _mispredictionLogsThisWindow;
     private const int MispredictionLogsPerSecond = 5;
-    // Diffs above this are attributed to an external force (remote player hit, server impulse,
-    // physics-object collision). Below it the drift is consistent with Jolt non-determinism.
-    private const float ExternalForceThresholdM = 0.5f;
+    // Velocity-residual threshold (m/s) above which the misprediction is attributable
+    // to a genuine external force — a server-side impulse or remote-player collision
+    // the client didn't replay. Pure cross-process Jolt nondeterminism (gravity steps,
+    // contact-manifold rounding) produces position drift with NEAR-IDENTICAL velocity
+    // because both sides applied the same gravity at the same dt; a horizontal velocity
+    // delta of a meter per second only appears when something on the server delivered
+    // an impulse the client's input replay didn't reproduce. Squared form to avoid the
+    // sqrt in the classifier. Replaced the prior position-magnitude classifier
+    // (ExternalForceThresholdM = 0.5 m): a 0.5 m position delta with matching velocity
+    // is just accumulated gravity drift, not a missed external force.
+    private const float ExternalForceVelThresholdSquared = 1.0f; // 1 m/s squared
 
     // Listen-server: when ClientManager defers RegisterPrediction (because the SpaceStep
     // happens in ServerManager later this frame), the input + tick are stashed here and
@@ -134,6 +187,8 @@ public partial class ClientPredictionManager : InternalClientComponent
         // Drop the init flag so an authority-swap or reclaim respawn under the same
         // EntityId is treated as a fresh entity by the spawn-tick alignment guard.
         _initializedEntityIds.Remove(entityId);
+        _remoteEntitiesAwaitingInput.Remove(entityId);
+        _entitiesEverHadInput.Remove(entityId);
     }
 
     protected override void OnCommandReceived(IPackableMessage command)
@@ -159,15 +214,43 @@ public partial class ClientPredictionManager : InternalClientComponent
         }
     }
 
-    // Each snapshot carries the input the server applied to each owner-driven entity
-    // this tick. Cache them so Predict() can re-apply the same input locally when
-    // simulating entities this client doesn't own.
+    // Cap on per-entity client-side input cache. Larger than the server's
+    // per-snapshot history depth so the cache can accumulate across multiple
+    // snapshots before the oldest entries are dropped — gives the rollback
+    // resim a deep-enough window that a typical reconcile finds per-tick input
+    // for every replayed tick even when the resim depth exceeds one
+    // snapshot's history span.
+    private const int InputCacheCapPerEntity = 60;
+
+    // Each snapshot carries the last N (tick, input) pairs the server applied
+    // per entity. Cache them by (entityId, tick) so Predict() and
+    // RollbackAndResimulate can look up the actual per-tick input the server
+    // used, not just the latest cached one.
     private void CacheInputsFromSnapshot(GameSnapshotMessage snapshot)
     {
         if (snapshot.Inputs == null) return;
         foreach (var entry in snapshot.Inputs)
         {
-            _lastInputByEntityId[entry.EntityId] = entry.Input;
+            if (entry.Input == null) continue;
+            if (!_inputByEntityIdAndTick.TryGetValue(entry.EntityId, out var perTick))
+            {
+                perTick = new SortedDictionary<int, IPackableElement>();
+                _inputByEntityIdAndTick[entry.EntityId] = perTick;
+            }
+            perTick[entry.Tick] = entry.Input;
+            while (perTick.Count > InputCacheCapPerEntity)
+                perTick.Remove(perTick.Keys.First());
+
+            if (!_latestCachedTickByEntityId.TryGetValue(entry.EntityId, out int latest)
+                || entry.Tick > latest)
+            {
+                _latestCachedTickByEntityId[entry.EntityId] = entry.Tick;
+            }
+            // Mark this entity as one that has received non-null server input
+            // at some point. ResolveRemoteInput uses this set to scope the M9
+            // missed-input counter to entities that should have input (i.e.,
+            // not passive server-authoritative props).
+            _entitiesEverHadInput.Add(entry.EntityId);
         }
     }
 
@@ -177,8 +260,86 @@ public partial class ClientPredictionManager : InternalClientComponent
     /// owns directly). Used by the entity prediction path when this client is not the
     /// driver — see <see cref="Predict"/>.
     /// </summary>
-    public IPackableElement GetLastInputForEntity(int entityId) =>
-        _lastInputByEntityId.TryGetValue(entityId, out var v) ? v : null;
+    public IPackableElement GetLastInputForEntity(int entityId)
+    {
+        if (!_inputByEntityIdAndTick.TryGetValue(entityId, out var perTick) || perTick.Count == 0)
+            return null;
+        return perTick[perTick.Keys.Last()];
+    }
+
+    /// <summary>
+    /// Resolve the input that should be applied at <paramref name="tick"/> for a
+    /// remote-owned entity. Returns the exact per-tick input from the snapshot
+    /// history when available; otherwise the most recent cached input the
+    /// observer knows about (a "last-input-continues" extrapolation, which is
+    /// the best the observer can do for ticks the server hasn't reported on yet);
+    /// otherwise null.
+    ///
+    /// Per-tick lookup is the main quality knob this method exists for —
+    /// during a rollback resim the loop iterates past ticks one by one, and a
+    /// per-tick cache lets the resim replay each tick with the correct input
+    /// rather than approximating with "latest cached input for everything in
+    /// the rollback window" (the prior behaviour flagged in
+    /// <see cref="RollbackAndResimulate"/>).
+    /// </summary>
+    private IPackableElement ResolveRemoteInput(int entityId, int tick)
+    {
+        IPackableElement resolved = null;
+        bool exactTickHit = false;
+        if (_inputByEntityIdAndTick.TryGetValue(entityId, out var perTick) && perTick.Count > 0)
+        {
+            // Exact tick hit first.
+            if (perTick.TryGetValue(tick, out resolved))
+            {
+                exactTickHit = true;
+            }
+            else
+            {
+                // Closest preceding tick — the input that was applied last at
+                // or before the requested tick. Server's snapshot history is
+                // sparse (last N applied), so a tick we don't have explicit
+                // input for is the same input as the most recent preceding
+                // tick we DO have input for.
+                int chosenTick = int.MinValue;
+                foreach (var kv in perTick)
+                {
+                    if (kv.Key > tick) break;
+                    chosenTick = kv.Key;
+                    resolved = kv.Value;
+                }
+                // If even the oldest cached tick is in the future (e.g. the
+                // observer just connected and the first snapshot covered
+                // future ticks for some reason), fall back to the latest
+                // cached. Better to extrapolate from a known input than to
+                // hand the entity null.
+                if (chosenTick == int.MinValue)
+                    resolved = perTick[perTick.Keys.Last()];
+            }
+        }
+
+        // M9 missed-input metric: counts the gap between "have exact per-tick
+        // server input" and "had to extrapolate / coast". For an entity that
+        // has been seen with input at some point, every tick where we DON'T
+        // have the exact tick's input counts as one missed-input event —
+        // regardless of whether we found a fallback to extrapolate from. The
+        // prediction still uses the extrapolated value (good for behaviour),
+        // but the metric correctly measures how often the server-reported
+        // input stream is too sparse / too late to keep up with the client's
+        // prediction tick.
+        if (!exactTickHit && _entitiesEverHadInput.Contains(entityId))
+            _missedInputCount++;
+
+        if (resolved == null)
+        {
+            if (_remoteEntitiesAwaitingInput.Add(entityId))
+                MonkeLogger.Debug($"[PRED-NO-INPUT] eid={entityId} tick={tick} no cached server input for remote entity — predicting without input (entity will coast on last-known velocity / use defaults)");
+        }
+        else if (_remoteEntitiesAwaitingInput.Remove(entityId))
+        {
+            MonkeLogger.Debug($"[PRED-NO-INPUT] eid={entityId} tick={tick} cached server input now available — resuming input-driven prediction");
+        }
+        return resolved;
+    }
 
     public void Predict(int tick, IPackableElement input)
     {
@@ -209,7 +370,7 @@ public partial class ClientPredictionManager : InternalClientComponent
             // would coast at last-known velocity, drifting every tick).
             IPackableElement perEntityInput = (entity.Authority == myId)
                 ? input
-                : GetLastInputForEntity(entity.EntityId);
+                : ResolveRemoteInput(entity.EntityId, tick);
             clientPredictedEntity.OnProcessTick(tick, perEntityInput);
         });
     }
@@ -232,7 +393,7 @@ public partial class ClientPredictionManager : InternalClientComponent
             if (clientPredictedEntity == null) return;
             IPackableElement perEntityInput = (entity.Authority == myId)
                 ? input
-                : GetLastInputForEntity(entity.EntityId);
+                : ResolveRemoteInput(entity.EntityId, tick);
             clientPredictedEntity.OnPostPhysicsTick(tick, perEntityInput);
         });
     }
@@ -307,10 +468,14 @@ public partial class ClientPredictionManager : InternalClientComponent
         // affected entity (one gravity step per spawn-tick offset for a free-falling
         // body), but that "misprediction" is structural — there's no prior auth state
         // for the client to predict from. Catch the newly-spawned entity up to the
-        // current local tick via a targeted reconcile+resim, but don't disturb other
-        // already-initialized entities (their stable Jolt contact manifolds would
-        // otherwise be invalidated by an unnecessary body teleport — producing the
-        // observed top-of-stack micro-bounce when the player spawns near a tower).
+        // current local tick via a targeted reconcile+resim. The resim's SpaceStep
+        // is holistic and inevitably integrates already-initialized entities by
+        // resimTicks of extra motion; CatchUpNewlySpawnedEntities snapshots their
+        // pre-resim poses and restores them after the loop so subsequent PRED-REG
+        // captures match the server. The restore invalidates persistent contact
+        // manifolds for those bodies and the next physics step rebuilds them
+        // (typically a sub-mm micro-bounce that PredictionVisualSmoothing3D
+        // absorbs).
         HashSet<int> newlyInitializedIds = null;
         foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
         {
@@ -341,8 +506,17 @@ public partial class ClientPredictionManager : InternalClientComponent
             if (predictableEntity.HasMisspredicted(receivedSnapshot.Tick, authoritativeState, predictedState))
             {
                 _misspredictionsCount++;
-                MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} MISPREDICTED -> rollback");
-                LogMispredictionThrottled(predictableEntity, predictedState.Position, authoritativeState, receivedSnapshot.Tick, networkDegraded);
+                Vector3 authVel = predictableEntity.ExtractAuthoritativeVelocity(authoritativeState);
+                Vector3 velDiff = authVel - predictedState.LinearVelocity;
+                string cause = ClassifyMisprediction(velDiff, predictedState.LinearVelocity, networkDegraded);
+                switch (cause)
+                {
+                    case "external-force":          _mispredictsExternalForce++; break;
+                    case "physics-nondeterminism":  _mispredictsPhysicsNondeterminism++; break;
+                    case "degraded-network":        _mispredictsDegradedNetwork++; break;
+                }
+                MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} MISPREDICTED -> rollback (class={cause})");
+                LogMispredictionThrottled(predictableEntity, predictedState, authoritativeState, receivedSnapshot.Tick, networkDegraded);
                 RollbackAndResimulate(receivedSnapshot.States, predictedStateData);
                 return;
             }
@@ -393,15 +567,49 @@ public partial class ClientPredictionManager : InternalClientComponent
             return;
         }
 
-        int otherCount = predictedStateData.Entities.Count - newlyInitializedIds.Count;
-        MonkeLogger.Debug($"[PRED-SPAWN-CATCHUP] tick={predictedStateData.Tick} newEntities={newlyInitializedIds.Count} otherEntities={otherCount} resimTicks={_predictedStates.Count}");
+        // Resolve newly-spawned ClientPredictedEntity objects once, up front. Used by
+        // both the input replay and the post-step capture so a new entity that's not
+        // yet a key in some older _predictedStates[i].Entities (because its
+        // EntityEventMessage arrived after that tick's natural predict ran) still
+        // gets its inputs replayed and its post-step state recorded. Iterating
+        // remainingInput.Entities.Keys missed those ticks — the resim never replayed
+        // their inputs and never wrote a post-step record, so a snapshot arriving
+        // for those ticks would compare against a vacant slot.
+        var newlySpawnedEntities = new List<ClientPredictedEntity>();
+        foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
+        {
+            if (newlyInitializedIds.Contains(predictableEntity.EntityId))
+                newlySpawnedEntities.Add(predictableEntity);
+        }
+
+        int otherCount = predictedStateData.Entities.Count - newlySpawnedEntities.Count;
+        MonkeLogger.Debug($"[PRED-SPAWN-CATCHUP] tick={predictedStateData.Tick} newEntities={newlySpawnedEntities.Count} otherEntities={otherCount} resimTicks={_predictedStates.Count}");
 
         OfflineRigidbody3D.SnapshotAll();
 
+        // Snapshot the live body state of every non-new predicted entity so we can
+        // restore it after the catch-up resim. Jolt's SpaceStep is holistic — it
+        // integrates every body in the space, including ones we don't want to
+        // advance. Without this, each non-new entity emerges from the resim
+        // resimTicks ahead of where natural prediction left it, and the next
+        // PRED-REG captures that overshoot — producing a posDiff/velDiff against
+        // the server's authoritative state for the same tick that trips
+        // HasMisspredicted (tightly for owned entities, eventually for remote).
+        // Restoring the pre-resim pose afterwards undoes the holistic integration.
+        // Cost: bodies in sustained contact (stacked towers, players on a ramp)
+        // have their persistent Jolt contact manifolds invalidated by the restore
+        // and rebuild them on the next step — typically a sub-mm micro-bounce that
+        // PredictionVisualSmoothing3D absorbs and that stays well under the
+        // misprediction thresholds.
+        Dictionary<ClientPredictedEntity, RigidbodyState> preResimPoses = null;
+        foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
+        {
+            if (newlyInitializedIds.Contains(predictableEntity.EntityId)) continue;
+            preResimPoses ??= new Dictionary<ClientPredictedEntity, RigidbodyState>();
+            preResimPoses[predictableEntity] = predictableEntity.GetSnapshotState();
+        }
+
         // Reconcile newly-spawned entities to their auth state at the rollback tick.
-        // Leave every other predicted entity's body completely alone — no snapshot,
-        // no transform write — so their contact manifolds stay intact across the
-        // catch-up.
         foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
         {
             if (!newlyInitializedIds.Contains(predictableEntity.EntityId)) continue;
@@ -410,33 +618,80 @@ public partial class ClientPredictionManager : InternalClientComponent
             predictableEntity.HandleReconciliation(authoritativeState);
         }
 
+        int myId = ClientManager.Instance?.GetNetworkId() ?? 0;
         for (int i = 0; i < _predictedStates.Count; i++)
         {
             var remainingInput = _predictedStates[i];
             MonkeLogger.Debug($"[PRED-SPAWN-RESIM] resimTick={remainingInput.Tick} input={remainingInput.Input}");
             // Only re-apply inputs for the newly-spawned entities. Other entities were
             // already correctly stepped during natural predict; replaying their inputs
-            // would double-apply them.
-            foreach (ClientPredictedEntity predictableEntity in remainingInput.Entities.Keys)
+            // would double-apply them. Iterate the explicit newlySpawnedEntities list
+            // (not remainingInput.Entities.Keys) so new entities that weren't yet a
+            // key for this tick's natural predict still get resimulated.
+            //
+            // Per-entity input routing matches RollbackAndResimulate: the
+            // locally-driven entity replays the local input recorded for this past
+            // tick; any other newly-spawned entity (a remote player reconnecting
+            // with the same EntityId, a server-owned passive prop) replays the
+            // most recently-cached server input — or null, if none has arrived yet.
+            // Without this, ResimulateTick on a remote player would receive the
+            // LOCAL client's input and drive the remote body around with whatever
+            // keys the local user happens to be holding.
+            foreach (var predictableEntity in newlySpawnedEntities)
             {
-                if (newlyInitializedIds.Contains(predictableEntity.EntityId))
-                    predictableEntity.ResimulateTick(remainingInput.Input);
+                IPackableElement entityInput = (predictableEntity.Authority == myId)
+                    ? remainingInput.Input
+                    : ResolveRemoteInput(predictableEntity.EntityId, remainingInput.Tick);
+                predictableEntity.ResimulateTick(entityInput);
             }
 
             PhysicsServer3D.SpaceStep(MonkeNetManager.Instance.PhysicsSpace, PhysicsUtils.DeltaTime);
             PhysicsServer3D.SpaceFlushQueries(MonkeNetManager.Instance.PhysicsSpace);
 
-            // Only capture post-step state for newly-spawned entities. Non-new
-            // entities' recorded predicted states stay at their original (correctly-
-            // predicted) values; their bodies are now N ticks of velocity ahead of
-            // where natural prediction would have left them, and the smoother will
-            // decay that small offset out over DecayTime.
-            foreach (ClientPredictedEntity predictableEntity in remainingInput.Entities.Keys)
+            // Capture post-step state for every newly-spawned entity into this tick's
+            // record. The dictionary-index assignment creates the entry if missing,
+            // so entities that weren't keys for this tick get backfilled — the next
+            // live PRED-CHECK then compares against a populated slot instead of a
+            // default(RigidbodyState). Non-new entities' recorded predicted states
+            // stay at their original (correctly-predicted) values; their bodies are
+            // restored to their pre-resim pose after the loop so subsequent PRED-REGs
+            // match.
+            foreach (var predictableEntity in newlySpawnedEntities)
             {
-                if (!newlyInitializedIds.Contains(predictableEntity.EntityId)) continue;
                 var post = predictableEntity.GetSnapshotState();
                 remainingInput.Entities[predictableEntity] = post;
                 MonkeLogger.Debug($"[PRED-SPAWN-RESIM]   eid={predictableEntity.EntityId} postPos=({post.Position.X:F3},{post.Position.Y:F3},{post.Position.Z:F3}) postVel=({post.LinearVelocity.X:F3},{post.LinearVelocity.Y:F3},{post.LinearVelocity.Z:F3})");
+            }
+        }
+
+        // Restore non-new entity body poses to their pre-resim state. The catch-up
+        // resim's SpaceStep calls advanced these bodies by resimTicks of velocity-
+        // driven motion they had no business undergoing twice; this puts them back.
+        //
+        // Gate on actual movement: if the resim didn't disturb the body (typical
+        // for sleeping/resting bodies, which Jolt does not activate during a
+        // SpaceStep), skip the restore. A "restore" to the current pose is a
+        // no-op transform write that still invalidates Jolt's persistent contact
+        // manifolds (see PredictionRigidbody3D.SnapToRest's docstring) — for a
+        // body resting on the floor that produces the observed end-of-push
+        // visual jitter on stacked bodies, with no benefit (the body is already
+        // where we want it).
+        if (preResimPoses != null)
+        {
+            const float RestorePosEpsilonSq = 1e-6f;    // (1 mm)²
+            const float RestoreVelEpsilonSq = 1e-4f;    // (1 cm/s)²
+            foreach (var (entity, savedState) in preResimPoses)
+            {
+                var postState = entity.GetSnapshotState();
+                float posDeltaSq = (postState.Position - savedState.Position).LengthSquared();
+                float velDeltaSq = (postState.LinearVelocity - savedState.LinearVelocity).LengthSquared();
+                if (posDeltaSq < RestorePosEpsilonSq && velDeltaSq < RestoreVelEpsilonSq)
+                {
+                    MonkeLogger.Debug($"[PRED-SPAWN-RESTORE-SKIP] eid={entity.EntityId} body unchanged by resim (posΔ²={posDeltaSq:E2}m², velΔ²={velDeltaSq:E2}m²/s²)");
+                    continue;
+                }
+                entity.RestoreBodyState(savedState);
+                MonkeLogger.Debug($"[PRED-SPAWN-RESTORE] eid={entity.EntityId} pos=({savedState.Position.X:F3},{savedState.Position.Y:F3},{savedState.Position.Z:F3}) vel=({savedState.LinearVelocity.X:F3},{savedState.LinearVelocity.Y:F3},{savedState.LinearVelocity.Z:F3}) posΔ²={posDeltaSq:E2}m² velΔ²={velDeltaSq:E2}m²/s²");
             }
         }
 
@@ -447,6 +702,12 @@ public partial class ClientPredictionManager : InternalClientComponent
     private void RollbackAndResimulate(IEntityStateData[] authoritativeStates, PredictedState predictedStateData)
     {
         bool isListenServer = MonkeNetManager.Instance != null && MonkeNetManager.Instance.IsServer;
+
+        // Capture rollback depth before _predictedStates is mutated by the resim loop.
+        // Depth = ticks of resim that the misprediction triggered = current local tick
+        // − reconciled-from tick. Surfaced via LastRollbackDepth for quantitative tests
+        // that build a P50/P95/P99 distribution across a scenario.
+        _lastRollbackDepth = _predictedStates.Count;
 
         MonkeLogger.Debug($"[PRED-ROLLBACK] tick={predictedStateData.Tick} entities={predictedStateData.Entities.Count} resimTicks={_predictedStates.Count} listenServer={isListenServer}");
 
@@ -487,15 +748,18 @@ public partial class ClientPredictionManager : InternalClientComponent
             MonkeLogger.Debug($"[PRED-RESIM] resimTick={remainingInput.Tick} entities={remainingInput.Entities.Count} input={remainingInput.Input}");
             foreach (ClientPredictedEntity predictableEntity in remainingInput.Entities.Keys)
             {
-                // Same per-entity input routing as Predict(): the locally-driven
-                // entity replays the local input recorded at this past tick; other
-                // entities replay the most recently-cached server input. The cache
-                // is "latest" rather than per-tick, so resim of distant past ticks
-                // for non-owned entities is approximate, but at the resim depths
-                // we use (≤ 1s) the approximation tracks well enough to converge.
+                // Per-entity input routing: the locally-driven entity replays the
+                // local input recorded at this past tick; other entities replay
+                // the server input the snapshot history records for this
+                // specific tick. The cache is per-(entity, tick) so resim of
+                // distant past ticks for non-owned entities replays the actual
+                // input the server applied at each tick rather than
+                // approximating with "latest cached input for everything in
+                // the rollback window" — the rollback now converges against
+                // the same input timeline the server saw.
                 IPackableElement entityInput = (predictableEntity.Authority == myId)
                     ? remainingInput.Input
-                    : GetLastInputForEntity(predictableEntity.EntityId);
+                    : ResolveRemoteInput(predictableEntity.EntityId, remainingInput.Tick);
                 predictableEntity.ResimulateTick(entityInput);
             }
 
@@ -549,7 +813,7 @@ public partial class ClientPredictionManager : InternalClientComponent
         }
     }
 
-    private void LogMispredictionThrottled(ClientPredictedEntity entity, Vector3 predictedPos, IEntityStateData authoritativeState, int tick, bool networkDegraded)
+    private void LogMispredictionThrottled(ClientPredictedEntity entity, RigidbodyState predictedState, IEntityStateData authoritativeState, int tick, bool networkDegraded)
     {
         ulong now = Time.GetTicksMsec();
         if (now - _mispredictionWindowStartMsec >= 1000)
@@ -566,23 +830,88 @@ public partial class ClientPredictionManager : InternalClientComponent
         // CURRENT pose, possibly several ticks past the snapshot tick — which made
         // small steady-state drifts look like the misprediction.
         Vector3 authPos = entity.ExtractAuthoritativePosition(authoritativeState);
-        Vector3 diff = authPos - predictedPos;
-        string cause = ClassifyMisprediction(diff.Length(), networkDegraded);
-        MonkeLogger.Info($"Misprediction [{cause}]: entity {entity.EntityId} type {entity.EntityType} tick {tick} predicted {predictedPos} authoritative {authPos} diff {diff} |diff|={diff.Length():F3}m");
+        Vector3 authVel = entity.ExtractAuthoritativeVelocity(authoritativeState);
+        Quaternion authRot = entity.ExtractAuthoritativeRotation(authoritativeState);
+        Vector3 posDiff = authPos - predictedState.Position;
+        Vector3 velDiff = authVel - predictedState.LinearVelocity;
+        // Rotation diff as axis-angle (degrees). When neither |posDiff| nor
+        // |velDiff| trips the documented threshold but a reconcile still fires,
+        // it's the rotation threshold; without this in the log the reader has
+        // to guess which threshold tripped.
+        float rotDiffDeg = Mathf.RadToDeg(authRot.AngleTo(predictedState.Rotation));
+        Quaternion rotDiffQuat = authRot * predictedState.Rotation.Inverse();
+        // Axis from a unit quaternion: (x, y, z) / sin(angle/2). Guard against
+        // a near-identity rotation where sin(angle/2)≈0 makes the axis
+        // arbitrary — report the Y axis as a safe default.
+        Vector3 rotAxis = Vector3.Up;
+        float sinHalf = Mathf.Sqrt(Mathf.Max(0f, 1f - rotDiffQuat.W * rotDiffQuat.W));
+        if (sinHalf > 0.0001f)
+            rotAxis = new Vector3(rotDiffQuat.X, rotDiffQuat.Y, rotDiffQuat.Z) / sinHalf;
+        // Tag which check triggered the reconcile. Useful for distinguishing
+        // "position drifted past tolerance" from "rotation tumbled enough to
+        // exceed the 5° budget while pose-and-vel still agree". The classifier
+        // already produces a [cause] label for the physics-classification
+        // dimension (external-force vs nondeterminism vs degraded-network);
+        // this adds the orthogonal dimension of WHICH threshold check fired.
+        // Delegated to the entity (rather than a hardcoded threshold table)
+        // so entities with custom thresholds — notably the rigid-body player,
+        // whose velocity threshold is tighter than the prop default — report
+        // correctly. Hardcoded fallback would produce "below-thresholds" when
+        // the player's tighter check actually fired.
+        string trippedBy = entity.DescribeMispredictTrigger(authoritativeState, predictedState);
+        string cause = ClassifyMisprediction(velDiff, predictedState.LinearVelocity, networkDegraded);
+        MonkeLogger.Info($"Misprediction [{cause} trippedBy={trippedBy}]: entity {entity.EntityId} type {entity.EntityType} tick {tick} predicted {predictedState.Position} authoritative {authPos} diff {posDiff} |diff|={posDiff.Length():F3}m velDiff {velDiff} |velDiff|={velDiff.Length():F3}m/s rotDiff={rotDiffDeg:F2}° axis=({rotAxis.X:F2},{rotAxis.Y:F2},{rotAxis.Z:F2})");
     }
+
+    // Hardcoded ClassifyTrippedThreshold removed — see
+    // ClientPredictedEntity.DescribeMispredictTrigger. Each entity overrides
+    // with its own actual threshold values so the trippedBy tag is correct
+    // for entities with non-default thresholds (the rigid-body player has a
+    // tighter velocity threshold than the prop default).
+
+    // Bounce-timing guard threshold for the classifier — squared form (~2 m/s magnitude).
+    // A vertical-velocity-dominated residual on a falling body with |velDiff| below this
+    // cap is treated as cross-process Jolt contact-resolution timing skew, not an external
+    // force. Above the cap the magnitude is large enough that a genuine vertical impulse
+    // (jump pad, server-side knockback) is the more likely explanation.
+    private const float BounceTimingVelMagSquaredCap = 4f;
 
     // Heuristic cause label for misprediction log messages, matching the known scenario table:
     //   degraded-network  — prediction buffer was trimmed before this snapshot arrived,
     //                       indicating snapshot packet-loss or an RTT spike (server used stale input).
-    //   external-force    — diff well above threshold; another body applied an impulse the
-    //                       client couldn't predict (remote player collision, server-side knockback).
-    //   physics-nondeterminism — small drift near threshold; Jolt cross-process floating-point
-    //                       divergence accumulating over time (expected in solo or low-contact play).
-    private static string ClassifyMisprediction(float diffLength, bool networkDegraded)
+    //   external-force    — velocity residual exceeds threshold AND the residual doesn't
+    //                       match the bounce-timing signature; the server applied an
+    //                       impulse the client didn't replay (remote-player collision,
+    //                       server-side knockback). Position diff alone is ambiguous:
+    //                       a 0.5 m Y-axis pos delta with matching velocity is just N
+    //                       ticks of accumulated gravity drift, not a force the client
+    //                       missed. The velocity residual is the load-bearing signal.
+    //   physics-nondeterminism — either a small velocity diff (Jolt cross-process float
+    //                       divergence accumulating over time, expected in solo or
+    //                       low-contact play), OR a vertical-velocity-dominated residual
+    //                       on a body the client still has in free-fall (bounce-timing
+    //                       skew — server's contact normal fired one tick earlier than
+    //                       the client's, producing a sub-2-m/s vertical velocity gap
+    //                       that resolves on the next tick).
+    private static string ClassifyMisprediction(Vector3 velDiff, Vector3 predictedVel, bool networkDegraded)
     {
         if (networkDegraded)
             return "degraded-network";
-        if (diffLength >= ExternalForceThresholdM)
+
+        // Bounce-timing guard. Without this, every bouncing ball trips external-force
+        // on the snapshot tick where the server's contact normal fires before the
+        // client's — the residual is purely on the gravity axis, ≤ 2 m/s, and the
+        // predicted body is still in free-fall. Real impulses produce horizontal
+        // residual components or magnitudes far above 2 m/s.
+        float vertSq = velDiff.Y * velDiff.Y;
+        float horizSq = velDiff.X * velDiff.X + velDiff.Z * velDiff.Z;
+        bool verticalDominated = vertSq > 4f * horizSq;
+        bool predictedFalling = predictedVel.Y < 0f;
+        bool boundedMagnitude = velDiff.LengthSquared() < BounceTimingVelMagSquaredCap;
+        if (verticalDominated && predictedFalling && boundedMagnitude)
+            return "physics-nondeterminism";
+
+        if (velDiff.LengthSquared() >= ExternalForceVelThresholdSquared)
             return "external-force";
         return "physics-nondeterminism";
     }

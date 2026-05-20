@@ -63,14 +63,26 @@ public class MultiProcessRampMotionTests : MultiProcessTestBase
     // InputFlags.Space (jump). Must match demo/players/SharedPlayerMovement.cs.
     private const int SpaceKeyBit = 0b_0000_0001;
 
+    // TestArena is the bare scene: 200×200 floor, environment + light, and
+    // nothing else (no walls/borders/extra ramps/cylinder/offline-ball). Using
+    // it here means the only static collider in the world besides the floor is
+    // the ramp we spawn ourselves, so any contact-normal change or reconcile
+    // can only be attributed to floor↔ramp transitions, not to incidental
+    // collisions with map clutter.
+    private const string TestArenaScene = "res://demo/TestArena.tscn";
+
     // ── Ramp geometry ────────────────────────────────────────────────────────
-    // Length along the slope (local Z). Width and thickness picked so the player
-    // (~0.6 m wide capsule) has visible margin on either side and the slab is
-    // thick enough to never tunnel under the floor when tilted.
-    private const float RampLength = 8f;
+    // Length along the slope (local Z). Long enough that a 5 m/s walker
+    // (WalkOnlyTicks + JumpPhaseTicks = 4 s ⇒ up to ~20 m of -Z travel) stays
+    // on the slab the entire run, including on shallow angles where the
+    // horizontal projection is nearly the full slope length. Width and
+    // thickness picked so the player (~0.6 m wide capsule) has visible margin
+    // on either side and the slab is thick enough to never tunnel under the
+    // floor when tilted.
+    private const float RampLength = 40f;
     private const float RampWidth = 4f;
     private const float RampThickness = 0.5f;
-    // Floor top surface in MainScene is Y=-2 (CSGBox at -2.5 with size.y=1).
+    // Floor top surface (TestArena's CSGBox at Y=-2.5 with size.y=1).
     private const float FloorTopY = -2f;
 
     // ── Timing (client ticks @ 60 Hz) ────────────────────────────────────────
@@ -79,8 +91,9 @@ public class MultiProcessRampMotionTests : MultiProcessTestBase
     // above the ramp's high end so the fall can be longer in that case; using a
     // single generous value keeps the schedule shape identical across cases.
     private const int PlayerFallTicks = 90;
-    // Walk-only phase: long enough at 5 m/s to traverse the 8 m slope plus a
-    // metre of run-up either side, ~2 s.
+    // Walk-only phase: ~2 s at 5 m/s. Combined with JumpPhaseTicks the player
+    // covers up to ~20 m of -Z travel; the ramp (RampLength) is sized so the
+    // player remains on the slab for the entire phase across all six angles.
     private const int WalkOnlyTicks = 120;
     // Walk-and-jump phase: jump pulses every 30 ticks (0.5 s) repeated for 2 s
     // give ~4 jumps. The schedule pulses Space on a 30-tick rising-edge
@@ -123,17 +136,22 @@ public class MultiProcessRampMotionTests : MultiProcessTestBase
         using var steps = new StepLogger(paths, label, $"MP-RAMP-MOTION-{label}");
 
         // ── 1. Spawn server + two clients (both record video) ────────────────
+        // All three processes load TestArena (bare floor + lighting, no other
+        // colliders) so the only static-collider transition the player crosses
+        // is floor → spawned-ramp → floor.
         int port = NextPort();
-        steps.Log($"spawning server on port {port}");
-        var server = Orch.Spawn("server", enetPort: port, label: "srv");
+        steps.Log($"spawning server on port {port} (TestArena.tscn)");
+        var server = Orch.Spawn("server", enetPort: port, label: "srv", scenePath: TestArenaScene);
         server.WaitReady(networkReady: true, timeoutMs: 30_000);
         ServerLogPath = server.RemoteLogPath;
 
         string observerVideoPath = System.IO.Path.Combine(paths.Directory, label + ".observer.mp4");
         steps.Log("spawning client A (actor, records video)");
-        var clientA = Orch.Spawn("client", enetPort: port, label: "cA", recordVideoPath: paths.Mp4);
+        var clientA = Orch.Spawn("client", enetPort: port, label: "cA",
+            recordVideoPath: paths.Mp4, scenePath: TestArenaScene);
         steps.Log("spawning client B (observer, records video)");
-        var clientB = Orch.Spawn("client", enetPort: port, label: "cB", recordVideoPath: observerVideoPath);
+        var clientB = Orch.Spawn("client", enetPort: port, label: "cB",
+            recordVideoPath: observerVideoPath, scenePath: TestArenaScene);
         clientA.WaitReady(networkReady: true, timeoutMs: 30_000);
         clientB.WaitReady(networkReady: true, timeoutMs: 30_000);
         ClientLogPath = clientA.RemoteLogPath;
@@ -192,8 +210,9 @@ public class MultiProcessRampMotionTests : MultiProcessTestBase
                                        highEndZ_world - 1.0f);
         }
 
-        // Player B (observer): off to the side, well clear of the ramp footprint
-        // and any walls. Floor is 30×30 centered at origin; east wall at X=+14.5.
+        // Player B (observer): off to the side, well clear of the ramp footprint.
+        // TestArena's floor is 200×200 centered at origin so there is plenty of
+        // clearance and no walls to bounce off.
         Vector3 playerBSpawn = new Vector3(8f, 0f, 3f);
 
         steps.Log($"ramp: angleDeg(installed)={installedAngleDeg:F1} center={rampCenter} halfLenCos={halfLen * cos:F2}");
@@ -228,6 +247,27 @@ public class MultiProcessRampMotionTests : MultiProcessTestBase
         WaitForClientEntity(clientA, playerBEid, timeoutMs: 5_000);
         WaitForClientEntity(clientB, playerAEid, timeoutMs: 5_000);
         WaitForClientEntity(clientB, playerBEid, timeoutMs: 5_000);
+
+        // Frame both recordings on player A throughout the run. The actor and
+        // observer both follow A from a fixed side-view offset (+X side, a
+        // few metres up) so the slope profile reads cleanly in the video and
+        // the player stays roughly centered even as A climbs or descends
+        // several metres along the ramp. The harness only installs an
+        // observer camera in windowed (video-recording) mode, so this command
+        // errors on headless clients — swallow that.
+        try
+        {
+            var followReq = new
+            {
+                cmd = "camera-follow-entity",
+                entity_id = playerAEid,
+                offset = new[] { 12.0, 3.0, 0.0 },
+                lookOffset = new[] { 0.0, 0.5, 0.0 },
+            };
+            clientA.Send(followReq);
+            clientB.Send(followReq);
+        }
+        catch { /* headless: no camera to follow with */ }
 
         // ── 5. Build A's input schedule + B's idle schedule ──────────────────
         int aAnchor = clientA.ReadClientTick() + PlayerFallTicks;

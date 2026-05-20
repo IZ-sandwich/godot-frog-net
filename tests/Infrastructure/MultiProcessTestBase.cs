@@ -48,11 +48,42 @@ public abstract class MultiProcessTestBase
     protected string ServerLogPath { get; set; }
     protected string ClientLogPath { get; set; }
 
-    // Single project-wide ENet port counter. Starts above the previous per-test
-    // counters (9100/9300/9400/9500/9600) so concurrent runs from a single
-    // gdUnit4 worker don't collide.
-    private static int _enetPortCounter = 9100;
-    protected static int NextPort() => Interlocked.Increment(ref _enetPortCounter);
+    // ENet port allocation. ENet uses UDP; we ask the OS for a free ephemeral
+    // UDP port by binding a UdpClient on port 0, reading the assigned port off
+    // LocalEndPoint, and closing the socket. The port is then handed to the
+    // server harness which re-binds with ENet. There's a microscopic TOCTOU
+    // window between close and re-bind, but the ephemeral-port range is large
+    // enough (49152-65535 on Windows by default) that a collision with another
+    // process is effectively impossible.
+    //
+    // This replaces the previous static counter (started at 9100, incremented
+    // per call) which broke parallel `dotnet test` invocations: two test
+    // processes both started at 9100 and the second's CreateServer failed with
+    // WSAEADDRINUSE. OS-assigned ports work across any number of concurrent
+    // test runs.
+    protected static int NextPort()
+    {
+        using var udp = new System.Net.Sockets.UdpClient(
+            new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        return ((System.Net.IPEndPoint)udp.Client.LocalEndPoint).Port;
+    }
+
+    /// <summary>Active UDP relays, owned by the test base so they live alongside the
+    /// orchestrator and are torn down in <see cref="TearDownInternal"/>.</summary>
+    private readonly List<UdpRelay> _relays = new();
+
+    /// <summary>Start a UDP relay in front of <paramref name="serverEnetPort"/>.
+    /// Clients should connect to the returned relay's <c>ListenPort</c> instead
+    /// of the server's port directly. Use <see cref="UdpRelay.SetConditions"/>
+    /// to configure latency, jitter, and packet loss; the relay starts in
+    /// transparent (zero-condition) mode so the call is safe even for baseline
+    /// runs.</summary>
+    protected UdpRelay StartRelay(int serverEnetPort)
+    {
+        var relay = new UdpRelay(serverEnetPort);
+        _relays.Add(relay);
+        return relay;
+    }
 
     /// <summary>Walks up from CWD looking for the nearest <c>project.godot</c>.
     /// When tests run via <c>dotnet test</c>, CWD is typically the <c>tests/</c>
@@ -81,16 +112,88 @@ public abstract class MultiProcessTestBase
         Orch = new MultiProcessOrchestrator(GodotBin, ProjectPath);
     }
 
-    /// <summary>Derived <c>[AfterTest]</c> calls this. Kills all spawned children.</summary>
+    /// <summary>Derived <c>[AfterTest]</c> calls this. Kills all spawned children
+    /// and tears down any active UDP relays.</summary>
     protected void TearDownInternal()
     {
         Orch?.Dispose();
         Orch = null;
+        foreach (var r in _relays) { try { r.Dispose(); } catch { /* best effort */ } }
+        _relays.Clear();
     }
 
     /// <summary>Get the artifact path bundle for a given label. Always under
     /// <c>{projectPath}/TestResults/{ArtifactSubdir}/{label}.{ext}</c>.</summary>
     protected ArtifactPaths ArtifactsFor(string label) => ArtifactPaths.For(ProjectPath, ArtifactSubdir, label);
+
+    /// <summary>Per-scenario observer log path captured by <see cref="SpawnTriad"/>.
+    /// Tests that use SpawnTriad call <see cref="CopyObserverLog"/> in the artefacts
+    /// phase to land this alongside server/client logs.</summary>
+    protected string ObserverLogPath { get; set; }
+
+    /// <summary>Spawn one server + one active client + one passive observer client.
+    /// All three processes load the default <c>MainScene.tscn</c> unless
+    /// <paramref name="scenePath"/> is set. The active client gets
+    /// <c>recordVideoPath = paths.Mp4</c> and the observer gets
+    /// <c>{paths.Directory}/{label}.observer.mp4</c> when <paramref name="recordVideo"/>
+    /// is true. The observer is parked on an idle input schedule so it doesn't
+    /// emit inputs that could perturb its predicted state.
+    ///
+    /// Use this from any physics test where you have an active driver but would
+    /// otherwise spawn no second client — it adds a passive witness so a third-
+    /// party perspective is recorded.</summary>
+    protected (TestProcess server, TestProcess client, TestProcess observer) SpawnTriad(
+        string label, bool recordVideo = false, string scenePath = null)
+    {
+        int port = NextPort();
+        var server = Orch.Spawn("server", enetPort: port, label: "srv", scenePath: scenePath);
+        server.WaitReady(networkReady: true, timeoutMs: 30_000);
+
+        string clientVideo = null, observerVideo = null;
+        if (recordVideo)
+        {
+            var paths = ArtifactsFor(label);
+            clientVideo   = paths.Mp4;
+            observerVideo = System.IO.Path.Combine(paths.Directory, label + ".observer.mp4");
+        }
+
+        var client   = Orch.Spawn("client", enetPort: port, label: "c1",
+            recordVideoPath: clientVideo, scenePath: scenePath);
+        var observer = Orch.Spawn("client", enetPort: port, label: "observer",
+            recordVideoPath: observerVideo, scenePath: scenePath);
+        client.WaitReady(networkReady: true, timeoutMs: 30_000);
+        observer.WaitReady(networkReady: true, timeoutMs: 30_000);
+
+        ServerLogPath = server.RemoteLogPath;
+        ClientLogPath = client.RemoteLogPath;
+        ObserverLogPath = observer.RemoteLogPath;
+
+        WaitForClockSync(server, client,   maxGapTicks: 5, timeoutMs: 5_000);
+        WaitForClockSync(server, observer, maxGapTicks: 5, timeoutMs: 5_000);
+
+        int clientNetId = client.NetworkId;
+        AssertThat(clientNetId).OverrideFailureMessage("client must have a non-zero ENet peer id").IsNotEqual(0);
+
+        // Park the observer idle from its current tick so it doesn't try to
+        // generate inputs of its own. The harness's default input is already
+        // zeroed, but installing an explicit schedule of one idle entry keeps
+        // the harness's input-producer pipeline consistent with the driver.
+        observer.Send(new
+        {
+            cmd = "set-input-schedule",
+            entries = new[] { new { tick = observer.ReadClientTick(), moveX = 0.0, moveY = 0.0, yaw = 0.0, keys = 0 } },
+        });
+
+        return (server, client, observer);
+    }
+
+    /// <summary>Copy the observer's MonkeLogger output into the artefact dir
+    /// under <c>{label}.observer.log</c>. Pairs with <see cref="SpawnTriad"/>.</summary>
+    protected void CopyObserverLog(ArtifactPaths paths, string label)
+    {
+        if (string.IsNullOrEmpty(ObserverLogPath)) return;
+        CopyProcessLog(paths.Directory, ObserverLogPath, label + ".observer.log");
+    }
 
     /// <summary>Spawn one server + one client, wait for both to be network-ready,
     /// wait for the clocks to converge, and return the pair. The client is
@@ -164,6 +267,11 @@ public abstract class MultiProcessTestBase
         using var doc = client.Send(new { cmd = "mispredict-count" });
         return doc.RootElement.GetProperty("data").GetProperty("count").GetInt32();
     }
+
+    /// <summary>Public wrapper around <see cref="CaptureSample"/> so non-subclass
+    /// callers (the quantitative test scenarios) can read the same snapshot.</summary>
+    public static Sample CaptureSampleStatic(TestProcess proc, int sampleTick) =>
+        CaptureSample(proc, sampleTick);
 
     /// <summary>Capture a <see cref="Sample"/> from a process's harness state.
     /// Reads <c>sample-state</c> and pulls every entity's position, velocity,

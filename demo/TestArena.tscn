@@ -1,0 +1,326 @@
+[gd_scene format=3 uid="uid://byj1rpsavtewl"]
+
+; Flat-arena variant of MainScene.tscn used by multi-process tests that need a
+; large unobstructed floor (e.g. a vehicle pushing cubes for several seconds).
+; Shares MainScene.cs as its root script so all server/client hooks, vehicle-
+; ownership approver, and --test-harness bootstrap behave identically; the only
+; difference from MainScene is the Map subtree — borders/walls/ramps/cylinder/
+; offline-ball are gone and the Floor is enlarged to 200×200 so a vehicle has
+; room to drive.
+
+[ext_resource type="Script" uid="uid://b26awixuhuq6l" path="res://demo/MainScene.cs" id="1_a3xwa"]
+[ext_resource type="Script" uid="uid://dnkbivw2aixxo" path="res://addons/monke-net/src/Shared/Nodes/MonkeNetConfig.cs" id="2_rf2cd"]
+[ext_resource type="Environment" uid="uid://c5xw5iwomn8qo" path="res://demo/map/DefaultEnvironment.tres" id="4_4tv7j"]
+[ext_resource type="Script" uid="uid://1rpyl54svogx" path="res://addons/monke-net/src/Shared/Nodes/Entities/EntitySpawnConfiguration.cs" id="6_p5x2j"]
+[ext_resource type="PackedScene" uid="uid://cdm6b7x3omwnr" path="res://demo/ball/LocalBall.tscn" id="7_torvr"]
+[ext_resource type="PackedScene" uid="uid://dr73i1u4dj11g" path="res://demo/ball/ServerBall.tscn" id="9_yvb8b"]
+[ext_resource type="PackedScene" uid="uid://cu3w7mhyotfhv" path="res://demo/vehicle/LocalVehicle.tscn" id="11_lveh"]
+[ext_resource type="PackedScene" uid="uid://b6sqb51sprj38" path="res://demo/vehicle/ServerVehicle.tscn" id="12_sveh"]
+[ext_resource type="Script" uid="uid://cq1cu8wwxm0td" path="res://addons/monke-net/src/Shared/Nodes/Entities/OwnershipPolicy.cs" id="11_ownpol"]
+[ext_resource type="PackedScene" uid="uid://cxytv2su15ym8" path="res://demo/players/rigid_player/LocalRigidPlayer.tscn" id="15_lrp"]
+[ext_resource type="PackedScene" uid="uid://d1a7s0xyfwt6u" path="res://demo/players/rigid_player/ServerRigidPlayer.tscn" id="16_srp"]
+[ext_resource type="PackedScene" uid="uid://hnno4lwknkkq" path="res://demo/cube/LocalCube.tscn" id="18_lcube"]
+[ext_resource type="PackedScene" uid="uid://c7jvpob6fjg7d" path="res://demo/cube/ServerCube.tscn" id="19_scube"]
+
+[sub_resource type="Resource" id="Resource_3hf6u"]
+script = ExtResource("6_p5x2j")
+EntityType = 1
+ClientScene = ExtResource("7_torvr")
+ServerScene = ExtResource("9_yvb8b")
+metadata/_custom_type_script = "uid://1rpyl54svogx"
+
+[sub_resource type="Resource" id="Resource_veh_policy"]
+script = ExtResource("11_ownpol")
+RequireUnowned = true
+MaxRequesterDistance = 4.0
+AllowOwnerRelease = true
+metadata/_custom_type_script = "uid://cq1cu8wwxm0td"
+
+[sub_resource type="Resource" id="Resource_veh"]
+script = ExtResource("6_p5x2j")
+EntityType = 2
+ClientScene = ExtResource("11_lveh")
+ServerScene = ExtResource("12_sveh")
+OwnershipPolicy = SubResource("Resource_veh_policy")
+metadata/_custom_type_script = "uid://1rpyl54svogx"
+
+[sub_resource type="Resource" id="Resource_rplyr"]
+script = ExtResource("6_p5x2j")
+EntityType = 3
+ClientScene = ExtResource("15_lrp")
+ServerScene = ExtResource("16_srp")
+metadata/_custom_type_script = "uid://1rpyl54svogx"
+
+[sub_resource type="Resource" id="Resource_cube"]
+script = ExtResource("6_p5x2j")
+EntityType = 4
+ClientScene = ExtResource("18_lcube")
+ServerScene = ExtResource("19_scube")
+metadata/_custom_type_script = "uid://1rpyl54svogx"
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_lcinv"]
+albedo_color = Color(0.101961, 0.101961, 0.101961, 1)
+
+[node name="MainScene" type="Node3D" unique_id=27712328]
+script = ExtResource("1_a3xwa")
+
+[node name="MonkeNetConfig" type="Node" parent="." unique_id=1801734743]
+script = ExtResource("2_rf2cd")
+EntitySpawnConfiguration = Array[Object]([SubResource("Resource_3hf6u"), SubResource("Resource_veh"), SubResource("Resource_rplyr"), SubResource("Resource_cube")])
+metadata/_custom_type_script = "uid://dnkbivw2aixxo"
+
+[node name="Menu" type="Control" parent="." unique_id=796659374]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="SpawnBallButton" type="Button" parent="Menu" unique_id=1672447597]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -160.0
+offset_top = 32.0
+offset_bottom = 63.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Spawn Ball"
+
+[node name="SpawnVehicleButton" type="Button" parent="Menu" unique_id=1672447598]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -160.0
+offset_top = 64.0
+offset_bottom = 95.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Spawn Vehicle"
+
+[node name="SpawnRigidPlayerButton" type="Button" parent="Menu" unique_id=1672447600]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -160.0
+offset_top = 96.0
+offset_bottom = 127.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Spawn Rigid Player"
+
+[node name="ClaimVehicleButton" type="Button" parent="Menu" unique_id=1672447599]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -160.0
+offset_top = 128.0
+offset_bottom = 159.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Claim Vehicle"
+
+[node name="SpawnCubeButton" type="Button" parent="Menu" unique_id=1672447601]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -160.0
+offset_top = 160.0
+offset_bottom = 191.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Spawn Cube"
+
+[node name="HostButton" type="Button" parent="Menu" unique_id=2000725900]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -320.0
+offset_right = -160.0
+offset_bottom = 31.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Host Server"
+
+[node name="ConnectButton" type="Button" parent="Menu" unique_id=127255530]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -320.0
+offset_top = 32.0
+offset_right = -160.0
+offset_bottom = 63.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Connect to Server"
+
+[node name="HostAndConnectButton" type="Button" parent="Menu" unique_id=1890646881]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -320.0
+offset_top = 64.0
+offset_right = -160.0
+offset_bottom = 95.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Host and Connect"
+
+[node name="ReconnectButton" type="Button" parent="Menu" unique_id=1947638210]
+visible = false
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -320.0
+offset_top = 96.0
+offset_right = -160.0
+offset_bottom = 127.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Reconnect & Reclaim"
+
+[node name="DisconnectButton" type="Button" parent="Menu" unique_id=396112843]
+visible = false
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -320.0
+offset_top = 96.0
+offset_right = -160.0
+offset_bottom = 127.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Disconnect"
+
+[node name="SimulateTimeoutButton" type="Button" parent="Menu" unique_id=734826195]
+visible = false
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -320.0
+offset_top = 128.0
+offset_right = -160.0
+offset_bottom = 159.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Simulate Timeout"
+
+[node name="ConnectingLabel" type="Label" parent="Menu" unique_id=312984756]
+visible = false
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -100.0
+offset_top = -11.5
+offset_right = 100.0
+offset_bottom = 11.5
+grow_horizontal = 2
+grow_vertical = 2
+text = "Connecting..."
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="CancelButton" type="Button" parent="Menu" unique_id=523847219]
+visible = false
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -320.0
+offset_top = 128.0
+offset_right = -160.0
+offset_bottom = 159.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Cancel"
+
+[node name="StopServerButton" type="Button" parent="Menu" unique_id=654321987]
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -320.0
+offset_top = 160.0
+offset_right = -160.0
+offset_bottom = 191.0
+grow_horizontal = 0
+focus_mode = 0
+text = "Stop Server"
+
+[node name="Map" type="Node" parent="." unique_id=719413025]
+
+[node name="Floor" type="CSGBox3D" parent="Map" unique_id=961545461]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -2.5, 0)
+use_collision = true
+size = Vector3(200, 1, 200)
+material = SubResource("StandardMaterial3D_lcinv")
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="Map" unique_id=1298610788]
+transform = Transform3D(0.686106, 0.361498, -0.63133, 0.109382, 0.806681, 0.580776, 0.719232, -0.46753, 0.513927, 0, 8, 10)
+shadow_enabled = true
+directional_shadow_mode = 0
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="Map" unique_id=1998058048]
+environment = ExtResource("4_4tv7j")
+
+[node name="MenuCamera" type="Camera3D" parent="Map" unique_id=1253539839]
+transform = Transform3D(1, 0, 0, 0, -4.37114e-08, 1, 0, -1, -4.37114e-08, 0, 30, 0)
+projection = 1
+size = 60.0
+
+[node name="NetworkStatusPanel" type="VBoxContainer" parent="." unique_id=550312741]
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -200.0
+offset_bottom = 80.0
+grow_horizontal = 0
+grow_vertical = 2
+mouse_filter = 2
+
+[node name="HighPingLabel" type="Label" parent="NetworkStatusPanel" unique_id=620183451]
+visible = false
+layout_mode = 2
+text = "⚠ High Ping"
+horizontal_alignment = 2
+
+[node name="PacketLossLabel" type="Label" parent="NetworkStatusPanel" unique_id=730294562]
+visible = false
+layout_mode = 2
+text = "⚠ Packet Loss"
+horizontal_alignment = 2
+
+[node name="NoResponseLabel" type="Label" parent="NetworkStatusPanel" unique_id=840405673]
+visible = false
+layout_mode = 2
+text = "⚠ No Server Response"
+horizontal_alignment = 2
+
+[connection signal="pressed" from="Menu/SpawnBallButton" to="." method="OnSpawnBallButtonPressed"]
+[connection signal="pressed" from="Menu/SpawnVehicleButton" to="." method="OnSpawnVehicleButtonPressed"]
+[connection signal="pressed" from="Menu/SpawnRigidPlayerButton" to="." method="OnSpawnRigidPlayerButtonPressed"]
+[connection signal="pressed" from="Menu/ClaimVehicleButton" to="." method="OnClaimVehicleButtonPressed"]
+[connection signal="pressed" from="Menu/SpawnCubeButton" to="." method="OnSpawnCubeButtonPressed"]
+[connection signal="pressed" from="Menu/HostButton" to="." method="OnHostButtonPressed"]
+[connection signal="pressed" from="Menu/ConnectButton" to="." method="OnConnectButtonPressed"]
+[connection signal="pressed" from="Menu/HostAndConnectButton" to="." method="OnHostAndConnectButtonPressed"]
+[connection signal="pressed" from="Menu/ReconnectButton" to="." method="OnReconnectButtonPressed"]
+[connection signal="pressed" from="Menu/DisconnectButton" to="." method="OnDisconnectButtonPressed"]
+[connection signal="pressed" from="Menu/SimulateTimeoutButton" to="." method="OnSimulateTimeoutButtonPressed"]
+[connection signal="pressed" from="Menu/CancelButton" to="." method="OnCancelButtonPressed"]
+[connection signal="pressed" from="Menu/StopServerButton" to="." method="OnStopServerButtonPressed"]

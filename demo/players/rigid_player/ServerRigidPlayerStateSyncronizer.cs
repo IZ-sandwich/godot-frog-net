@@ -18,6 +18,66 @@ public partial class ServerRigidPlayerStateSyncronizer : ServerStateSyncronizer
     // and inherit it. Mirrors the client-side field in LocalRigidPlayerPrediction.
     private int _lastRiddenVehicleEntityId;
 
+    // Latest AdvancePhysics result from OnProcessTick, consumed by OnServerPostPhysicsTick
+    // for the [PHYS-RIGIDPLAYER-POST] diagnostic. Mirrors the client-side fields in
+    // LocalRigidPlayerPrediction. The pair is the only way to compute "what Jolt
+    // applied during the step" without intrumenting every Jolt contact callback —
+    // residual = postVel − (preVel + queuedImpulse + gravity*dt) isolates the
+    // contact-resolution impulse.
+    private RigidPlayerPhysics.AdvanceResult _lastAdvanceResult;
+    private bool _hasLastAdvanceResult;
+
+    private bool _signalSubscribed;
+    private MonkeNet.Server.ServerManager _subscribedServer;
+
+    private void EnsurePostPhysicsTickSubscription()
+    {
+        // Late-binding subscription. ServerManager.Instance may be null when this
+        // syncronizer's _Ready runs (test setups that load a syncronizer scene before
+        // the ServerManager scene), so subscribing here on the first OnProcessTick
+        // sidesteps the ordering question — the syncronizer's OnProcessTick /
+        // OnServerPostPhysicsTick are only meaningful once the entity has been spawned
+        // into a live server session anyway.
+        if (_signalSubscribed) return;
+        _subscribedServer = MonkeNet.Server.ServerManager.Instance;
+        if (_subscribedServer == null) return;
+        _subscribedServer.PostPhysicsTick += OnServerPostPhysicsTick;
+        _signalSubscribed = true;
+    }
+
+    public override void _ExitTree()
+    {
+        if (_signalSubscribed && _subscribedServer != null && IsInstanceValid(_subscribedServer))
+            _subscribedServer.PostPhysicsTick -= OnServerPostPhysicsTick;
+        _signalSubscribed = false;
+        _subscribedServer = null;
+        base._ExitTree();
+    }
+
+    private void OnServerPostPhysicsTick(int serverTick)
+    {
+        // Dismount-inheritance runs HERE (not in OnProcessTick) so that the vehicle's
+        // LinearVelocity read for inheritance reflects this tick's post-step state —
+        // the same value the server will ship in the vehicle's snapshot. Reading at
+        // OnProcessTick (pre-step) got the previous tick's velocity, which differed
+        // from the client's pre-step read by one tick of integration; the asymmetric
+        // inheritance produced the chronic ~0.5 m/s post-dismount Y-velocity gap that
+        // tripped RIDER-MISPREDICT-TRIP after a vehicle release.
+        UpdateRideFreezeState(isPostStep: true);
+
+        // Mirror LocalRigidPlayerPrediction.OnPostPhysicsTick: emit the post-step
+        // contact + residual-velocity diagnostic so client and server side-by-side
+        // logs can be compared for the same tick. Skipped when the body is anchored
+        // or when no AdvancePhysics ran this tick (e.g. server tick with no client
+        // input available).
+        var body = _predictionRb?.Body;
+        if (_hasLastAdvanceResult && body != null && !body.Freeze)
+        {
+            RigidPlayerPhysics.LogPostPhysics(body, _lastAdvanceResult.PreVel, _lastAdvanceResult.QueuedImpulse, phase: "live");
+        }
+        _hasLastAdvanceResult = false;
+    }
+
     public override void OnProcessTick(int tick, IPackableElement input)
     {
         // Mirror LocalRigidPlayerPrediction: while this player owns a vehicle, pin the
@@ -25,11 +85,28 @@ public partial class ServerRigidPlayerStateSyncronizer : ServerStateSyncronizer
         // player keeps walking each tick and PushRigidBodies-style collision impulses
         // get routed into the server's vehicle, drifting it away from the client's
         // predicted vehicle every snapshot.
-        UpdateRideFreezeState();
-        if (TryAnchorToOwnedVehicle()) return;
+        //
+        // Mount-only here: freeze BEFORE this tick's SpaceStep so the body holds the
+        // anchor pose. Dismount-with-velocity-inheritance fires from OnServerPostPhysicsTick
+        // so we read the vehicle's just-integrated LinearVelocity instead of the
+        // previous tick's stale value — see UpdateRideFreezeState for the rationale.
+        EnsurePostPhysicsTickSubscription();
+        UpdateRideFreezeState(isPostStep: false);
+        if (TryAnchorToOwnedVehicle())
+        {
+            _hasLastAdvanceResult = false;
+            return;
+        }
 
         if (input is CharacterInputMessage cmd)
-            RigidPlayerPhysics.AdvancePhysics(_predictionRb, cmd);
+        {
+            _lastAdvanceResult = RigidPlayerPhysics.AdvancePhysics(_predictionRb, cmd, phase: "live");
+            _hasLastAdvanceResult = true;
+        }
+        else
+        {
+            _hasLastAdvanceResult = false;
+        }
     }
 
     private NetworkBehaviour FindRiddenVehicleEntity()
@@ -46,18 +123,34 @@ public partial class ServerRigidPlayerStateSyncronizer : ServerStateSyncronizer
     // linear velocity so jumping off a moving vehicle preserves momentum on the
     // authoritative side as well — keeps the post-release snapshot consistent
     // with the client's locally-inherited velocity.
-    private void UpdateRideFreezeState()
+    //
+    // isPostStep gates which transition fires this call:
+    //   - false (called from OnProcessTick): handle MOUNT only. Freezing the body
+    //     before this tick's SpaceStep keeps it pinned at the anchor pose for the
+    //     integration. The mount-tracking _lastRiddenVehicleEntityId is updated
+    //     here too so OnPostPhysicsTick can resolve the vehicle on dismount.
+    //   - true (called from OnPostPhysicsTick): handle DISMOUNT only. Reading
+    //     vehicle.LinearVelocity here gets this tick's post-step value, which is
+    //     the same value packed into the vehicle's outgoing snapshot. The client
+    //     mirror also reads at the post-step phase, so the inherited velocity
+    //     agrees on both sides and the player doesn't enter free-fall with a
+    //     ~0.5 m/s Y-axis gap that compounded over the next several gravity ticks.
+    private void UpdateRideFreezeState(bool isPostStep)
     {
         var body = _predictionRb?.Body;
         if (body == null) return;
         var ridden = FindRiddenVehicleEntity();
         bool ridingNow = ridden != null;
-        if (ridingNow && !body.Freeze)
+
+        if (!isPostStep && ridingNow && !body.Freeze)
         {
             body.FreezeMode = RigidBody3D.FreezeModeEnum.Kinematic;
             body.Freeze = true;
+            _lastRiddenVehicleEntityId = ridden.EntityId;
+            return;
         }
-        else if (!ridingNow && body.Freeze)
+
+        if (isPostStep && !ridingNow && body.Freeze)
         {
             Vector3 inheritedVel = Vector3.Zero;
             if (_lastRiddenVehicleEntityId != 0)
@@ -75,8 +168,8 @@ public partial class ServerRigidPlayerStateSyncronizer : ServerStateSyncronizer
             body.Freeze = false;
             body.LinearVelocity = inheritedVel;
             body.AngularVelocity = Vector3.Zero;
+            _lastRiddenVehicleEntityId = 0;
         }
-        _lastRiddenVehicleEntityId = ridingNow ? ridden.EntityId : 0;
     }
 
     private bool TryAnchorToOwnedVehicle()
@@ -127,15 +220,29 @@ public partial class ServerRigidPlayerStateSyncronizer : ServerStateSyncronizer
     public override IEntityStateData PackEntityState()
     {
         var state = _predictionRb.SnapshotState();
+        var body = _predictionRb.Body;
+        // When the body is anchored to a vehicle (Freeze=Kinematic), AnchorBodyToVehicle
+        // rewrites the transform every tick. Jolt then derives a LinearVelocity from
+        // (newTransform - oldTransform) / dt internally for the kinematic body so contacts
+        // can react — and on the authority-change tick that delta is the teleport from
+        // the standalone pose to the anchor pose, producing a velocity in the hundreds
+        // of m/s. SnapshotState reads body.LinearVelocity AFTER SpaceStep, so the snapshot
+        // ships that bogus derived velocity to clients, tripping a misprediction with
+        // |velDiff|=205 m/s the moment the player boards a vehicle. The visible motion is
+        // the anchor (driven by GlobalTransform), so we send zero velocity — both the
+        // client mirror in LocalRigidPlayerPrediction.GetSnapshotState and observer
+        // anchoring keep the rider locked to vehicle pose without needing a velocity hint.
+        bool anchored = body != null && body.Freeze
+                        && body.FreezeMode == RigidBody3D.FreezeModeEnum.Kinematic;
         return new EntityStateMessage
         {
             EntityId = this.EntityId,
             Yaw = 0,
             Position = state.Position,
             Rotation = state.Rotation,
-            Velocity = state.LinearVelocity,
-            AngularVelocity = state.AngularVelocity,
-            ServerSleeping = _predictionRb.Body != null && _predictionRb.Body.Sleeping,
+            Velocity = anchored ? Vector3.Zero : state.LinearVelocity,
+            AngularVelocity = anchored ? Vector3.Zero : state.AngularVelocity,
+            ServerSleeping = body != null && body.Sleeping,
         };
     }
 }

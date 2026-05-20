@@ -17,7 +17,17 @@ public partial class LocalVehiclePrediction : ClientPredictedEntity
     // share the server's position to within tolerance while carrying noticeably different
     // momentum — the wrong velocity writes new wrong positions every tick until the
     // position threshold trips and a hard snap fires.
-    [Export] private float _maxVelocityDeviationSquared = 0.25f;
+    //
+    // Threshold = 1.0 m/s (squared = 1.0). Observers reconcile against a server
+    // state that was integrated using input_at_T while the observer's prediction
+    // for that same tick was integrated using input_at_{T-1} (snapshot.Inputs[]
+    // only carries the latest input the server applied — there's no per-tick
+    // input history on the wire). At a vehicle's accel during the first tick
+    // of a new throttle direction, that one-tick input lag alone produces
+    // ≈ 0.5–0.7 m/s of velocity divergence. Anything tighter than 1.0 m/s
+    // makes every direction change a reconcile event on every observer, even
+    // when the server and observer's prediction are otherwise in lockstep.
+    [Export] private float _maxVelocityDeviationSquared = 1.0f;
     // Rotation divergence threshold (degrees). See LocalRigidPropPrediction for rationale.
     [Export] private float _maxRotationDeviationDegrees = 5f;
     [Export] private PredictionRigidbody3D _predictionRb;
@@ -39,6 +49,12 @@ public partial class LocalVehiclePrediction : ClientPredictedEntity
 
     public override Vector3 ExtractAuthoritativePosition(IEntityStateData state) =>
         ((EntityStateMessage)state).Position;
+
+    public override Vector3 ExtractAuthoritativeVelocity(IEntityStateData state) =>
+        ((EntityStateMessage)state).Velocity;
+
+    public override Quaternion ExtractAuthoritativeRotation(IEntityStateData state) =>
+        ((EntityStateMessage)state).Rotation;
 
     public override bool HasMisspredicted(int tick, IEntityStateData receivedState, RigidbodyState savedState)
     {

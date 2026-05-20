@@ -532,9 +532,25 @@ public class VehicleTests : MultiProcessTestBase
 
         foreach (var (t, newAuth) in authChanges)
             plot.AddVerticalMarker(t, $"auth→{newAuth}");
+        // Mispredict markers — one per (sample, client) where the client's
+        // running mispredict count incremented since the previous sample.
+        AddMispredictMarkers(plot, clientA, "driver mispredict", MaxPlotTick);
+        AddMispredictMarkers(plot, clientB, "observer mispredict", MaxPlotTick);
 
         plot.Save(paths.Svg);
         Godot.GD.Print($"[MP-VEHICLE-CYCLE] wrote {paths.Csv}, {paths.Svg} ({n2} samples)");
+    }
+
+    private static void AddMispredictMarkers(SvgPlot plot, List<Sample> samples, string label, int maxTick)
+    {
+        int prev = int.MinValue;
+        foreach (var s in samples)
+        {
+            if (s.Tick > maxTick) break;
+            if (prev != int.MinValue && s.MispredictionsCount > prev)
+                plot.AddVerticalMarker(s.Tick, label);
+            prev = s.MispredictionsCount;
+        }
     }
 
     // Parse the client A log for [SMOOTH-FRAME] / [RIDER-FRAME] entries and emit

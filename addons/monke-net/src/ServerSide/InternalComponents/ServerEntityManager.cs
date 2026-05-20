@@ -14,6 +14,38 @@ namespace MonkeNet.Server;
 public partial class ServerEntityManager : InternalServerComponent
 {
     /// <summary>
+    /// Number of recent (tick, input) pairs per entity to include in each
+    /// <see cref="GameSnapshotMessage"/>. Each observer caches these by
+    /// (entityId, tick) so its rollback resim applies the correct per-tick
+    /// input at each replayed tick instead of falling back to "latest cached
+    /// input for everything in the rollback window" — the prior approximation
+    /// flagged in <c>ClientPredictionManager.RollbackAndResimulate</c>. Default
+    /// 5 trades a small bandwidth bump (5 × ~12 bytes per active-input entity
+    /// per snapshot) for a measurable drop in observer mispredict counts on
+    /// scenarios with frequent input direction changes.
+    /// </summary>
+    [Export] public int InputHistoryPerSnapshot { get; set; } = 5;
+
+    /// <summary>
+    /// Number of ticks to delay a newly-spawned entity's physics activation
+    /// after the spawn event is broadcast. The server holds the body
+    /// "frozen + no-collide" for this many ticks, broadcasts the spawn event
+    /// stamped with <c>ActivationTick = serverTick + SpawnActivationDelayTicks</c>,
+    /// and every client holds its replica in the same state until its synced
+    /// clock reaches ActivationTick. All peers then go live on the same tick,
+    /// closing the asymmetric-spawn contact window where the server's body
+    /// would otherwise resolve contacts against a body that doesn't yet exist
+    /// on a connected client — those impulses used to leak into the server's
+    /// authoritative state and the client could only catch up via reconcile,
+    /// producing the "cube settling on a stack" mispredict pattern.
+    ///
+    /// Default 2 ticks (≈ 33 ms at 60 Hz) — sized to cover typical localhost
+    /// latency for the entity-event message. Increase for higher-latency
+    /// networks; set to 0 to disable the delay entirely (legacy behaviour).
+    /// </summary>
+    [Export] public int SpawnActivationDelayTicks { get; set; } = 2;
+
+    /// <summary>
     /// Game-defined approval policy for client-initiated authority requests. Returns
     /// true to grant ownership, false to reject. Default is reject — the game must
     /// opt-in by assigning this delegate so an unconfigured server doesn't let any
@@ -259,22 +291,29 @@ public partial class ServerEntityManager : InternalServerComponent
             States = new IEntityStateData[entityCount]
         };
 
-        // Include per-entity inputs so observers can drive their local prediction
-        // of entities they don't own with the same input the server applied. The
+        // Include per-entity per-tick input history so observers can drive their
+        // local prediction of entities they don't own with the same input the
+        // server applied — for each tick, not just the latest. The
         // ServerInputReceiver lives as a sibling under ServerManager; look it up
         // once per snapshot rather than caching to keep restart paths simple.
         var inputReceiver = GetParent().GetNodeOrNull<ServerInputReceiver>("ServerInputReceiver");
-        var inputs = new List<EntityInput>(entityCount);
+        var inputs = new List<EntityInput>(entityCount * InputHistoryPerSnapshot);
 
         for (int i = 0; i < entityCount; i++)
         {
             snapshot.States[i] = includedEntities[i].PackEntityState();
             if (inputReceiver != null)
             {
-                var lastInput = inputReceiver.GetLastInputFor(includedEntities[i]);
-                if (lastInput != null)
+                var recent = inputReceiver.GetRecentAppliedInputs(
+                    includedEntities[i], InputHistoryPerSnapshot, currentTick);
+                foreach (var (tick, input) in recent)
                 {
-                    inputs.Add(new EntityInput { EntityId = includedEntities[i].EntityId, Input = lastInput });
+                    inputs.Add(new EntityInput
+                    {
+                        EntityId = includedEntities[i].EntityId,
+                        Tick = tick,
+                        Input = input,
+                    });
                 }
             }
         }
@@ -292,12 +331,23 @@ public partial class ServerEntityManager : InternalServerComponent
     /// <param name="authority"></param>
     public T SpawnEntity<T>(byte entityType, int authority, Vector3? position = null, string metadata = "") where T : Node3D
     {
+        // Stamp the activation tick BEFORE the local server-side spawn so the
+        // server's own EntitySpawner sees the same ActivationTick it broadcasts
+        // to clients and holds its body frozen for the same delay window.
+        // Without this the server's body would go live immediately while
+        // clients held theirs frozen — the inverse asymmetry of the bug this
+        // fixes.
+        int spawnTick = ResolveCurrentServerTick();
+        int activationTick = (SpawnActivationDelayTicks > 0 && spawnTick > 0)
+            ? spawnTick + SpawnActivationDelayTicks
+            : 0; // 0 means "no delay" (see EntityEventMessage.ActivationTick docs)
         var entityEvent = new EntityEventMessage
         {
             Event = EntityEventEnum.Created,
             EntityId = ++_entityIdCount,
             EntityType = entityType,
             Authority = authority,
+            ActivationTick = activationTick,
             Metadata = metadata
         };
 
@@ -371,5 +421,15 @@ public partial class ServerEntityManager : InternalServerComponent
             ImGui.Text($"Entity Count {_entityIdCount}");
             ImGui.Text($"Entities Packed {_lastEntitiesPacked}");
         }
+    }
+
+    // Resolve the server's current network tick for stamping EntityEventMessage.ActivationTick.
+    // Returns -1 when the clock isn't initialised yet (very early-boot spawns,
+    // e.g. autoload-time setup) — in that case the caller falls back to a
+    // zero ActivationTick, which means "no delay" and matches legacy behaviour.
+    private int ResolveCurrentServerTick()
+    {
+        var clock = GetParent()?.GetNodeOrNull<ServerNetworkClock>("ServerNetworkClock");
+        return clock?.CurrentTick ?? -1;
     }
 }

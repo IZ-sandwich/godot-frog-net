@@ -19,7 +19,14 @@
        primary assembly so res:// scene loading works at runtime. No ProjectReference needed. -->
   <ItemGroup>
     <PackageReference Include="ImGui.NET" Version="1.91.0.1" />
-    <PackageReference Include="gdUnit4.api" Version="5.*" />
+    <!-- Pinned to 5.1.0-rc4 for the per-assembly named-pipe fix: the v5.0.0
+         release hard-codes the pipe name as "gdunit4-message-pipe" so two
+         parallel `dotnet test` invocations always collide on the named pipe
+         (NamedPipeClientStream ConnectInternal times out, surfacing as
+         "All pipe instances are busy."). rc4 derives the pipe name from
+         the test assembly so each `dotnet test` gets its own pipe. Upgrade
+         to stable 5.1.0 when released. -->
+    <PackageReference Include="gdUnit4.api" Version="5.1.0-rc4" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.*" />
     <PackageReference Include="gdUnit4.test.adapter" Version="3.*" />
   </ItemGroup>

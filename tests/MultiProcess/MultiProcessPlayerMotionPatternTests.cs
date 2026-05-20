@@ -234,13 +234,16 @@ public class MultiProcessPlayerMotionPatternTests : MultiProcessTestBase
         // we measure only the pattern phase, not the falling-onto-floor phase.
         clientB.WaitForClientTick(anchorA);
         int baseline = ReadMispredictCount(clientB);
-        steps.Log($"baseline observer mispredicts at anchor={anchorA}: {baseline}");
+        int moverBaseline = ReadMispredictCount(clientA);
+        steps.Log($"baseline observer mispredicts at anchor={anchorA}: {baseline} (mover baseline {moverBaseline})");
 
         int endTick = anchorA + runTicks;
         clientB.WaitForClientTick(endTick);
         int finalCount = ReadMispredictCount(clientB);
         int patternMispredicts = finalCount - baseline;
-        steps.Log($"pattern complete @ tick={endTick}: total={finalCount}, baseline={baseline}, observerMispredicts={patternMispredicts}");
+        int moverMispredicts = ReadMispredictCount(clientA) - moverBaseline;
+        steps.Log($"pattern complete @ tick={endTick}: total={finalCount}, baseline={baseline}, " +
+            $"observerMispredicts={patternMispredicts}, moverMispredicts={moverMispredicts}");
 
         CopyProcessLogs(paths);
         // Also preserve the mover's (clientA) log alongside the observer's so we
@@ -257,6 +260,17 @@ public class MultiProcessPlayerMotionPatternTests : MultiProcessTestBase
                 $"(stale after the owner stops sending), so the observer's prediction accelerates the body " +
                 $"every resim tick using stale input. Trace at TestResults/PlayerMotionPattern/{label}.client.log " +
                 $"— look for RIDER-MISPREDICT-TRIP for which threshold fires.")
+            .IsLessEqual(MispredictBudget);
+        // The active mover (clientA) holds the same budget as the observer.
+        // Owning prediction is the smoother path — local inputs drive a local
+        // body whose snapshot is its own integration — so the mover should
+        // accrue at most the same number of reconciles as a passive observer.
+        AssertThat(moverMispredicts)
+            .OverrideFailureMessage(
+                $"mover accrued {moverMispredicts} mispredictions during '{label}' (budget {MispredictBudget}). " +
+                $"The mover owns the entity — its prediction loop should match the server. Exceeding this means " +
+                $"cross-process Jolt drift is breaking owner-side determinism. " +
+                $"Trace at TestResults/PlayerMotionPattern/{label}.mover.log.")
             .IsLessEqual(MispredictBudget);
     }
 }

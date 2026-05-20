@@ -103,11 +103,131 @@ public partial class EntitySpawner : Node
         EmitSignal(SignalName.EntitySpawned, instance);
         networkBehaviour.OnEntitySpawned();
 
+        // Spawn activation delay. The server stamps EntityEventMessage.ActivationTick
+        // with the future server tick at which the body should go live (see
+        // ServerEntityManager.SpawnEntity). Until that tick is reached on this
+        // peer's clock, the body is held "frozen + no-collide" so neither it nor
+        // anything else can collide against it — that closes the asymmetric-
+        // spawn window where the server's body experiences contacts before the
+        // clients' replicas exist locally.
+        //
+        // ActivationTick == 0 means "no delay requested" (legacy spawn path):
+        // skip the freeze/activate dance entirely.
+        int currentTick = ResolveCurrentTick();
+        if (@event.ActivationTick > 0 && @event.ActivationTick > currentTick)
+        {
+            DeactivateForPendingSpawn(instance, networkBehaviour.EntityId, @event.ActivationTick);
+        }
+
         string layerInfo = instance is CollisionObject3D co
             ? $" Layer={co.CollisionLayer} Mask={co.CollisionMask}"
             : "";
-        MonkeLogger.Info($"Spawned entity:{@event.EntityId} ({@event.EntityType}) Auth:{@event.Authority} ServerSpawn:{isServerSpawn}{layerInfo}");
+        string activationInfo = @event.ActivationTick > 0
+            ? $" ActivationTick={@event.ActivationTick} (currentTick={currentTick})"
+            : "";
+        MonkeLogger.Info($"Spawned entity:{@event.EntityId} ({@event.EntityType}) Auth:{@event.Authority} ServerSpawn:{isServerSpawn}{layerInfo}{activationInfo}");
         return instance;
+    }
+
+    // Per-entity bookkeeping for spawns that are currently held frozen and
+    // waiting to go live. Activation tick comes from the EntityEventMessage;
+    // the cached collision layer/mask are what we restore on activation so the
+    // body's wiring isn't lost across the freeze window.
+    private sealed class PendingActivation
+    {
+        public int EntityId;
+        public int ActivationTick;
+        public Node3D Root;
+        public uint SavedLayer;
+        public uint SavedMask;
+        public bool WasFrozenBefore;
+    }
+    private readonly List<PendingActivation> _pendingActivations = new();
+
+    private void DeactivateForPendingSpawn(Node root, int entityId, int activationTick)
+    {
+        var pending = new PendingActivation
+        {
+            EntityId = entityId,
+            ActivationTick = activationTick,
+            Root = root as Node3D,
+        };
+        // Most networked entities are a single CollisionObject3D root (rigid
+        // body, character body, or static body) with one or more
+        // CollisionShape3D children. Cache the root's layer/mask so we can
+        // restore exactly what was configured by the scene + listen-server
+        // layer-swap above, then zero them so nothing collides.
+        if (root is CollisionObject3D co)
+        {
+            pending.SavedLayer = co.CollisionLayer;
+            pending.SavedMask = co.CollisionMask;
+            co.CollisionLayer = 0;
+            co.CollisionMask = 0;
+        }
+        // For RigidBody3D specifically, also freeze the body so gravity doesn't
+        // accumulate motion during the delay window — without this every peer
+        // would unfreeze a body that has fallen a different distance based on
+        // when its local clock processed the spawn event, defeating the
+        // synchronisation we're trying to establish.
+        if (root is RigidBody3D rb)
+        {
+            pending.WasFrozenBefore = rb.Freeze;
+            rb.Freeze = true;
+            rb.FreezeMode = RigidBody3D.FreezeModeEnum.Kinematic;
+        }
+        _pendingActivations.Add(pending);
+        MonkeLogger.Debug($"[SPAWN-DEACTIVATE] eid={entityId} activationTick={activationTick} held with layer/mask=(0/0), freeze=true");
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        if (_pendingActivations.Count == 0) return;
+        int currentTick = ResolveCurrentTick();
+        if (currentTick <= 0) return;
+        // Walk backwards so RemoveAt during iteration is safe.
+        for (int i = _pendingActivations.Count - 1; i >= 0; i--)
+        {
+            var pending = _pendingActivations[i];
+            if (currentTick < pending.ActivationTick) continue;
+            if (pending.Root == null || !IsInstanceValid(pending.Root))
+            {
+                _pendingActivations.RemoveAt(i);
+                continue;
+            }
+            if (pending.Root is CollisionObject3D co)
+            {
+                co.CollisionLayer = pending.SavedLayer;
+                co.CollisionMask = pending.SavedMask;
+            }
+            if (pending.Root is RigidBody3D rb)
+            {
+                rb.Freeze = pending.WasFrozenBefore;
+            }
+            MonkeLogger.Debug($"[SPAWN-ACTIVATE] eid={pending.EntityId} activationTick={pending.ActivationTick} currentTick={currentTick} restored layer={pending.SavedLayer} mask={pending.SavedMask}");
+            _pendingActivations.RemoveAt(i);
+        }
+    }
+
+    // Resolve "current tick" from whichever clock is available in this process.
+    // Server side: ServerManager exposes the tick via signal but we read the
+    // ServerNetworkClock node directly. Client side: ClientNetworkClock
+    // provides the network-synced tick. In listen-server mode both exist and
+    // they agree within ±1 tick — either source is fine. Returns -1 if no
+    // clock is found (pre-init or torn-down state); callers should treat -1
+    // as "skip activation this frame, retry next physics tick".
+    private static int ResolveCurrentTick()
+    {
+        if (ClientManager.Instance != null)
+        {
+            var cc = ClientManager.Instance.GetNodeOrNull<MonkeNet.Client.ClientNetworkClock>("ClientNetworkClock");
+            if (cc != null) return cc.GetCurrentTick();
+        }
+        if (Server.ServerManager.Instance != null)
+        {
+            var sc = Server.ServerManager.Instance.GetNodeOrNull<Server.ServerNetworkClock>("ServerNetworkClock");
+            if (sc != null) return sc.CurrentTick;
+        }
+        return -1;
     }
 
     public void DestroyEntity(EntityEventMessage @event)

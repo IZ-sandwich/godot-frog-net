@@ -153,7 +153,7 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
     {
         if (Orch == null) return;
 
-        var (server, client) = SpawnPair("tower_run", recordVideo: true);
+        var (server, client, observer) = SpawnTriad("tower_run", recordVideo: true);
 
         // Brief warmup so clock-sync stabilises before any entities exist.
         server.WaitForTicks(SnapshotArmTicks);
@@ -215,6 +215,7 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
 
         client.WaitForClientTick(anchorTick);
         int baselineMispredictsAfterFall = ReadMispredictCount(client);
+        int observerBaselineMispredicts = ReadMispredictCount(observer);
 
         // Capture BOTH server and client samples at every sample tick. The
         // body/visual/rotation deviation panels need the server pose to
@@ -234,6 +235,7 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
 
         int finalMispredicts = ReadMispredictCount(client);
         int mispredictsThisRun = finalMispredicts - baselineMispredictsAfterFall;
+        int observerMispredictsThisRun = ReadMispredictCount(observer) - observerBaselineMispredicts;
 
         var paths = ArtifactsFor("tower_run");
         WriteTowerPlot(paths, clientSamples, playerEid, cubeEids, baselineMispredictsAfterFall);
@@ -244,11 +246,22 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
         WriteDivergencePlot(paths, clientSamples, serverSamples, playerEid, cubeEids, baselineMispredictsAfterFall);
         Godot.GD.Print($"[MP-MISPREDICT] wrote {paths.Csv}, {paths.Svg} ({clientSamples.Count} samples)");
         CopyProcessLogs(paths);
+        CopyObserverLog(paths, "tower_run");
 
         AssertThat(mispredictsThisRun)
             .OverrideFailureMessage(
                 $"client mispredicted {mispredictsThisRun} times in {RunTicks} ticks while charging the tower " +
                 $"(budget {MispredictBudget}). Trace + video at TestResults/MispredictPlots/tower_run.{{csv,svg,mp4}}")
+            .IsLessEqual(MispredictBudget);
+        // Observer is parked idle and shouldn't accrue more reconciles than
+        // the active driver — same budget as the driver. If the observer
+        // exceeds this, it indicates a snapshot/input-forwarding gap where
+        // observers can't reproduce the server's authoritative motion.
+        AssertThat(observerMispredictsThisRun)
+            .OverrideFailureMessage(
+                $"observer mispredicted {observerMispredictsThisRun} times in {RunTicks} ticks (budget {MispredictBudget}). " +
+                $"Likely cause: server isn't forwarding the driver's input to observers via GameSnapshotMessage.Inputs, " +
+                $"so the observer's prediction diverges every tick the driver is moving.")
             .IsLessEqual(MispredictBudget);
     }
 

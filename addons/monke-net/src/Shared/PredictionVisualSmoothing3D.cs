@@ -248,6 +248,62 @@ public partial class PredictionVisualSmoothing3D : Node3D
         return new Quaternion(axis, speed * dt);
     }
 
+    /// <summary>
+    /// Synchronously absorb a body teleport that's about to happen / just
+    /// happened in the same physics frame. Called from
+    /// <see cref="PredictionRigidbody3D.Reconcile"/> after the body's transform
+    /// has been written to the authoritative pose. Updates the offset so the
+    /// visual stays at the PRE-teleport pose, baselines <c>_prevBodyPos</c> to
+    /// the POST-teleport pose so the next <c>_PhysicsProcess</c> doesn't double-
+    /// capture the same jump, and writes <c>Visual.GlobalTransform</c>
+    /// immediately so any same-frame reader (CSV samples, render frame between
+    /// the reconcile and the next physics step) sees Visual at the pre-teleport
+    /// pose rather than following the body to its new location.
+    ///
+    /// Without this hook the smoother would still capture the jump on its next
+    /// <c>_PhysicsProcess</c>, but Visual (a non-top_level child of Body) auto-
+    /// follows the body's transform in the interim — producing a single-frame
+    /// visual jump that any reader hitting that window observes as a teleport.
+    /// </summary>
+    public void AbsorbBodyTeleport(Vector3 prePos, Quaternion preRot, Vector3 postPos, Quaternion postRot)
+    {
+        if (Body == null || Visual == null)
+        {
+            MonkeLogger.Debug($"[SMOOTH-ABSORB] body={Body?.Name} SKIPPED Body/Visual null (Body={(Body==null?"null":"set")} Visual={(Visual==null?"null":"set")})");
+            return;
+        }
+
+        Vector3 jump = postPos - prePos;
+        _posOffset -= jump;
+        MonkeLogger.Debug($"[SMOOTH-ABSORB] body={Body.Name} prePos=({prePos.X:F3},{prePos.Y:F3},{prePos.Z:F3}) postPos=({postPos.X:F3},{postPos.Y:F3},{postPos.Z:F3}) jump=({jump.X:F3},{jump.Y:F3},{jump.Z:F3}) newOffset=({_posOffset.X:F3},{_posOffset.Y:F3},{_posOffset.Z:F3})");
+
+        Quaternion rotJump = (postRot * preRot.Inverse()).Normalized();
+        _rotOffset = (_rotOffset * rotJump.Inverse()).Normalized();
+
+        // Cap a runaway offset to a clean teleport, matching the per-frame
+        // TeleportDistance threshold so a multi-meter snap doesn't smear an
+        // unreadable offset across DecayTime.
+        if (TeleportDistance > 0f && _posOffset.Length() > TeleportDistance)
+        {
+            _posOffset = Vector3.Zero;
+            _rotOffset = Quaternion.Identity;
+        }
+
+        // Baseline the next-frame capture against the POST pose. Without this,
+        // _PhysicsProcess at the next frame would see delta = (postPos -
+        // _prevBodyPos) and re-capture the same jump on top of what we just
+        // absorbed.
+        _prevBodyPos = postPos;
+        _prevBodyRot = postRot;
+        _hasPrev = true;
+
+        // Write Visual immediately so any read between now and the next
+        // _PhysicsProcess sees the absorbed pose, not the body's raw pose.
+        Visual.GlobalTransform = new Transform3D(
+            new Basis((_rotOffset * postRot).Normalized()),
+            postPos + _posOffset);
+    }
+
     /// <summary>True while the visual is meaningfully offset from the body.</summary>
     public bool IsSmoothing =>
         _posOffset.LengthSquared() > 1e-8f

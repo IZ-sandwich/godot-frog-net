@@ -56,6 +56,13 @@ public partial class MultiClientHarness : Node
     private string _desiredWindowTitle;
     private HarnessVideoRecorder _videoRecorder;
 
+    // When non-zero, the observer camera tracks the entity with this id each
+    // _Process at a fixed offset; the camera looks at the entity. Set via the
+    // "camera-follow-entity" orch command; cleared by passing entity_id=0.
+    private int _cameraFollowEntityId;
+    private Vector3 _cameraFollowOffset = new(10f, 6f, 10f);
+    private Vector3 _cameraFollowLookOffset = Vector3.Zero;
+
     // Runtime-spawned static collider ramps. Per-process; each side independently
     // creates its own StaticBody3D via the spawn-ramp orch command and stores it
     // here for lifetime tracking. See SpawnRamp.
@@ -235,6 +242,8 @@ public partial class MultiClientHarness : Node
         if (_observerCamera != null && IsInstanceValid(_observerCamera) && !_observerCamera.Current)
             _observerCamera.Current = true;
 
+        UpdateCameraFollow();
+
         // Re-assert the deterministic window title every frame so an external
         // recorder's window-title match (ffmpeg gdigrab `-i title=...`) keeps
         // working. Godot's main loop overwrites the title during startup (sets
@@ -344,6 +353,10 @@ public partial class MultiClientHarness : Node
                 "get-all-entities" => GetAllEntities(),
                 "get-entity" => GetEntity(doc.RootElement),
                 "mispredict-count" => MispredictCount(),
+                "mispredict-classification-counts" => MispredictClassificationCounts(),
+                "rollback-depth-sample" => RollbackDepthSample(),
+                "missed-input-count" => MissedInputCount(),
+                "bandwidth-stats" => BandwidthStats(),
                 "server-peer-count" => ServerPeerCount(),
                 "pending-reclaim-for" => PendingReclaimFor(doc.RootElement),
                 "sample-state" => SampleState(),
@@ -351,6 +364,8 @@ public partial class MultiClientHarness : Node
                 "reconnect-client" => ReconnectClient(),
                 "client-persistent-id" => ClientPersistentId(),
                 "clear-input-schedule" => ClearInputSchedule(),
+                "camera-follow-entity" => CameraFollowEntity(doc.RootElement),
+                "set-camera" => SetCamera(doc.RootElement),
                 "shutdown" => Shutdown(),
                 _ => Err($"unknown cmd '{cmd}'"),
             };
@@ -789,7 +804,13 @@ public partial class MultiClientHarness : Node
             {
                 if (_schedule[i].Tick <= now) return _schedule[i].Input;
             }
-            return null;
+            // Schedule installed but no entry has reached its tick yet (current
+            // tick < first scheduled tick). Fall through to NextInput so the
+            // mover keeps emitting an idle input every tick — without this, the
+            // server sees no input for this client until the first scheduled
+            // tick, snapshots don't carry an Inputs[] entry for the entity, and
+            // observer clients log [PRED-NO-INPUT] for the entire setup window.
+            return NextInput;
         }
     }
 
@@ -871,6 +892,15 @@ public partial class MultiClientHarness : Node
         if (_inputProducer == null)
         {
             _inputProducer = new HarnessInputProducer();
+            // Default to an all-zero idle CharacterInputMessage so the producer never
+            // returns null. The ClientInputManager early-returns (sending nothing) when
+            // the producer yields null — which used to mean every test client transmitted
+            // ZERO inputs until set-input/set-input-schedule landed. The server therefore
+            // had no input for this client to broadcast in GameSnapshotMessage.Inputs[],
+            // and observer clients logged [PRED-NO-INPUT] for the entity until the first
+            // real scheduled tick. Real player clients always stream an idle input from
+            // connection, so defaulting matches production behavior.
+            _inputProducer.NextInput = new CharacterInputMessage();
             // Add to the tree so _Ready / lifecycle hooks fire normally; parent under the
             // harness node itself (which is in MainScene). InputProducerComponent's
             // lifecycle wires it into MonkeNetConfig on AddChild, but we still assign
@@ -897,6 +927,68 @@ public partial class MultiClientHarness : Node
         if (cm == null) return Ok(new { count = 0 });
         var pm = FindChildOfType<ClientPredictionManager>(cm);
         return Ok(new { count = pm?.MispredictionsCount ?? 0 });
+    }
+
+    // Per-classification mispredict counts. The total mispredict count alone is
+    // ambiguous — most "mispredicts" in MonkeNet are sub-millimeter Jolt FP
+    // divergence (physics-nondeterminism class). The user-visible class is
+    // external-force; degraded-network signals snapshots arriving past the
+    // rollback window. See ClientPredictionManager.ClassifyMisprediction for
+    // the classifier and the quantitative test plan for the threshold rationale.
+    private string MispredictClassificationCounts()
+    {
+        if (_role != "client") return Err("mispredict-classification-counts is client-only");
+        var cm = ClientManager.Instance;
+        if (cm == null) return Ok(new { externalForce = 0, physicsNondeterminism = 0, degradedNetwork = 0 });
+        var pm = FindChildOfType<ClientPredictionManager>(cm);
+        return Ok(new
+        {
+            externalForce = pm?.MispredictsExternalForce ?? 0,
+            physicsNondeterminism = pm?.MispredictsPhysicsNondeterminism ?? 0,
+            degradedNetwork = pm?.MispredictsDegradedNetwork ?? 0,
+        });
+    }
+
+    // Depth (in ticks) of the most recent rollback. Quantitative tests poll
+    // this after each observed increase in MispredictionsCount to assemble a
+    // rollback-depth distribution (P50, P95, P99) across a scenario.
+    private string RollbackDepthSample()
+    {
+        if (_role != "client") return Err("rollback-depth-sample is client-only");
+        var cm = ClientManager.Instance;
+        if (cm == null) return Ok(new { depth = 0 });
+        var pm = FindChildOfType<ClientPredictionManager>(cm);
+        return Ok(new { depth = pm?.LastRollbackDepth ?? 0 });
+    }
+
+    // Cumulative count of (tick × entity) pairs where the predictor had to
+    // fall back to a null input for a remote entity because no server-reported
+    // input was cached. Quantitative-suite M9 metric.
+    private string MissedInputCount()
+    {
+        if (_role != "client") return Err("missed-input-count is client-only");
+        var cm = ClientManager.Instance;
+        if (cm == null) return Ok(new { count = 0 });
+        var pm = FindChildOfType<ClientPredictionManager>(cm);
+        return Ok(new { count = pm?.MissedInputCount ?? 0 });
+    }
+
+    // Cumulative bandwidth counters (sent and received bytes/packets) since
+    // the previous call. ENet's PopStatistic is destructive — the host
+    // resets the counter on read — so each call returns the delta since the
+    // previous read on this process. Quantitative-suite M10 metric.
+    private string BandwidthStats()
+    {
+        if (_role != "client") return Err("bandwidth-stats is client-only");
+        var cm = ClientManager.Instance;
+        if (cm == null) return Ok(new { sentBytes = 0, recvBytes = 0, sentPackets = 0, recvPackets = 0 });
+        return Ok(new
+        {
+            sentBytes   = cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.SentBytes),
+            recvBytes   = cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.ReceivedBytes),
+            sentPackets = cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.SentPackets),
+            recvPackets = cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.ReceivedPackets),
+        });
     }
 
     // Voluntary client disconnect via the same code path the demo's
@@ -1144,6 +1236,103 @@ public partial class MultiClientHarness : Node
             }
         }
         return Err($"entity {eid} not found");
+    }
+
+    // Make the observer camera track a specific entity each frame, looking at it
+    // from a fixed offset. Used by tests where the action travels far enough to
+    // leave the default fixed view; the test calls this once per client with the
+    // vehicle's entity id and an offset that frames the run. Pass entity_id=0 to
+    // clear the follow and return the camera to its installed pose.
+    private string CameraFollowEntity(JsonElement req)
+    {
+        if (_observerCamera == null || !IsInstanceValid(_observerCamera))
+            return Err("observer camera not installed (clients only)");
+
+        int eid = req.GetProperty("entity_id").GetInt32();
+        if (req.TryGetProperty("offset", out var off))
+            _cameraFollowOffset = ReadVec3(off);
+        if (req.TryGetProperty("lookOffset", out var lo))
+            _cameraFollowLookOffset = ReadVec3(lo);
+        _cameraFollowEntityId = eid;
+        return Ok(new { followEntityId = eid, offset = SerializeVec3(_cameraFollowOffset) });
+    }
+
+    // One-shot fixed-pose placement of the observer camera. Useful when the
+    // recorded shot wants a static framing rather than chase-cam tracking; the
+    // camera does NOT update per-frame the way camera-follow-entity does, so
+    // there's no per-physics-frame jitter from sampling the entity pose. Also
+    // clears any active follow so the two modes don't fight.
+    private string SetCamera(JsonElement req)
+    {
+        if (_observerCamera == null || !IsInstanceValid(_observerCamera))
+            return Err("observer camera not installed (clients only)");
+        if (req.TryGetProperty("position", out var p))
+            _observerCamera.GlobalPosition = ReadVec3(p);
+        if (req.TryGetProperty("lookAt", out var la))
+            _observerCamera.LookAt(ReadVec3(la), Vector3.Up);
+        _cameraFollowEntityId = 0;
+        return Ok(new
+        {
+            position = SerializeVec3(_observerCamera.GlobalPosition),
+        });
+    }
+
+    private void UpdateCameraFollow()
+    {
+        if (_cameraFollowEntityId == 0) return;
+        if (_observerCamera == null || !IsInstanceValid(_observerCamera)) return;
+        if (EntitySpawner.Instance == null) return;
+        var collection = _role == "server"
+            ? (IEnumerable<NetworkBehaviour>)EntitySpawner.Instance.Entities
+            : EntitySpawner.Instance.ClientEntities;
+        NetworkBehaviour target = null;
+        foreach (var e in collection)
+        {
+            if (e.EntityId == _cameraFollowEntityId) { target = e; break; }
+        }
+        if (target == null) return;
+        var root = EntitySpawner.Instance.GetEntityRoot(target);
+        if (root == null) return;
+
+        // Camera-follow runs every _Process (render rate), which on a 144-Hz
+        // monitor is 2-3× the 60-Hz physics tick. Reading the rigid body's
+        // GlobalPosition directly here would show the same value across
+        // 2-3 render frames in a row then jump — stair-stepping that the
+        // recorded video shows as jitter. Prefer the smoothed visual node
+        // (PredictionVisualSmoothing3D.Visual) whose pose is interpolated
+        // between physics ticks via Engine.GetPhysicsInterpolationFraction(),
+        // so successive render frames see a continuous-in-time pose.
+        // Fall back to the body's pose when no smoother is wired (e.g. a
+        // server-authoritative entity whose client representation is purely
+        // snapshot-driven; we extrapolate one render frame's worth of velocity
+        // so the camera doesn't pin to the snapshot tick).
+        Vector3 worldPos;
+        Vector3 lookTarget;
+        var smoother = FindDescendantOfType<PredictionVisualSmoothing3D>(root);
+        if (smoother?.Visual != null)
+        {
+            worldPos = smoother.Visual.GlobalPosition;
+            lookTarget = worldPos + _cameraFollowLookOffset;
+        }
+        else
+        {
+            worldPos = root.GlobalPosition;
+            if (root is RigidBody3D rb)
+            {
+                // Frame-rate-aware velocity extrapolation: project from the
+                // last physics-tick pose forward by the fraction of a tick
+                // elapsed since that step. Matches the same interpolation
+                // Godot would do internally if physics_interpolation_mode is
+                // enabled on the node; doing it manually here keeps the
+                // camera smooth even for entities that haven't opted into
+                // Godot's built-in interpolation.
+                float pif = (float)Engine.GetPhysicsInterpolationFraction();
+                worldPos += rb.LinearVelocity * pif * (float)PhysicsUtils.DeltaTime;
+            }
+            lookTarget = worldPos + _cameraFollowLookOffset;
+        }
+        _observerCamera.GlobalPosition = worldPos + _cameraFollowOffset;
+        _observerCamera.LookAt(lookTarget, Vector3.Up);
     }
 
     private string Shutdown()

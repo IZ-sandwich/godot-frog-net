@@ -40,6 +40,67 @@ public partial class PredictionRigidbody3D : Node
     /// </summary>
     public PredictionVisualSmoothing3D Smoothing => _smoothing;
 
+    /// <summary>
+    /// Enables contact-monitor on the wrapped <see cref="RigidBody3D"/> and
+    /// connects body_entered / body_exited signals so each contact pair that
+    /// starts or ends during physics integration emits a [CONTACT-START] /
+    /// [CONTACT-END] debug log. Used to diagnose stack-spawn races where the
+    /// server's body experiences a contact one or more ticks before the client's
+    /// replica exists locally: with this enabled the server log directly shows
+    /// "[CONTACT-START] eid=3 with body=ServerCube (auth=0)" at server tick T,
+    /// while the client log shows the same event at a later tick — proof that
+    /// the contact happened asymmetrically rather than inferring it from
+    /// position/velocity divergence.
+    ///
+    /// Default 4 reported contacts — the most cubes the framework expects to
+    /// touch any one body at the same time in the existing demos. Adjust per
+    /// body if a different ceiling is needed.
+    /// </summary>
+    [Export] public int MaxContactsReportedForDiagnostics { get; set; } = 4;
+
+    public override void _Ready()
+    {
+        if (_body == null) return;
+        // Contact monitoring is OPT-IN per body in Godot. Enable it here so the
+        // body emits body_entered / body_exited signals for diagnostic logging.
+        // Note: this has a (very small) per-physics-tick cost; if profiles ever
+        // surface it as a hot spot, gate it on a debug flag.
+        _body.ContactMonitor = true;
+        _body.MaxContactsReported = MaxContactsReportedForDiagnostics;
+        _body.BodyEntered += OnBodyContactStart;
+        _body.BodyExited += OnBodyContactEnd;
+    }
+
+    public override void _ExitTree()
+    {
+        if (_body == null) return;
+        // Defensive — the parent rigid body may be freed independently in some
+        // teardown orders (rare, but harmless to be careful).
+        if (IsInstanceValid(_body))
+        {
+            _body.BodyEntered -= OnBodyContactStart;
+            _body.BodyExited -= OnBodyContactEnd;
+        }
+    }
+
+    private void OnBodyContactStart(Node body)
+    {
+        if (_body == null || body == null) return;
+        MonkeLogger.Debug(
+            $"[CONTACT-START] body={_body.Name} (layer={_body.CollisionLayer} mask={_body.CollisionMask}) " +
+            $"otherBody={body.Name} otherType={body.GetType().Name} " +
+            $"thisPos=({_body.GlobalPosition.X:F3},{_body.GlobalPosition.Y:F3},{_body.GlobalPosition.Z:F3}) " +
+            $"thisVel=({_body.LinearVelocity.X:F3},{_body.LinearVelocity.Y:F3},{_body.LinearVelocity.Z:F3})");
+    }
+
+    private void OnBodyContactEnd(Node body)
+    {
+        if (_body == null || body == null) return;
+        MonkeLogger.Debug(
+            $"[CONTACT-END] body={_body.Name} otherBody={body.Name} " +
+            $"thisVel=({_body.LinearVelocity.X:F3},{_body.LinearVelocity.Y:F3},{_body.LinearVelocity.Z:F3})");
+    }
+
     private enum PendingKind
     {
         Force,
@@ -157,6 +218,7 @@ public partial class PredictionRigidbody3D : Node
         if (_body == null) return;
 
         Vector3 prePos = _body.GlobalPosition;
+        Quaternion preRot = _body.Quaternion;
         Vector3 preVel = _body.LinearVelocity;
         Vector3 posDelta = authoritative.Position - prePos;
         Vector3 velDelta = authoritative.LinearVelocity - preVel;
@@ -187,6 +249,17 @@ public partial class PredictionRigidbody3D : Node
         // bogus interpolated frame between two unrelated rotations. ResetPhysicsInterpolation
         // collapses both buffers to the new transform, so the body teleports cleanly.
         _body.ResetPhysicsInterpolation();
+
+        // Synchronously hand the (pre, post) pair to the smoother. Without this,
+        // the smoother only sees the jump on its next _PhysicsProcess, by which
+        // point Visual (parented under Body, non-top_level) has already auto-
+        // followed the body's new pose for one frame — producing a single-frame
+        // visual snap that any sampler/renderer hitting that window observes as
+        // a teleport. The smoother updates its offset, baselines _prevBodyPos
+        // to the post pose so the next capture doesn't double-count, and writes
+        // Visual.GlobalTransform immediately so the visual stays at prePos.
+        if (smoothingEnabled)
+            _smoothing.AbsorbBodyTeleport(prePos, preRot, authoritative.Position, authoritative.Rotation);
     }
 
     // Tight tolerances for "we already match this target" — used only by SnapToRest,

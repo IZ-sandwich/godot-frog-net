@@ -54,60 +54,27 @@ public class ClockTests
         _clientRunner?.Dispose();
     }
 
-    // B-01 ─────────────────────────────────────────────────────────────────────
+    // B-01 / B-02 / B-03 (merged) ─────────────────────────────────────────────
+    // Under the EWMA-based clock-sync (replacing the previous windowed-average
+    // batching that emitted once per N samples), every non-immediate-correction
+    // sync sample feeds the EWMA accumulator and emits LatencyCalculated. There
+    // is no longer a window/buffer that needs to fill before an emit; the
+    // "buffer clears after emit" assertion no longer applies because there is
+    // no buffer. The single combined test below confirms the new contract:
+    // every steady-state sample emits.
     [TestCase]
-    public async Task Clock_NoLatencyCalculated_BeforeSampleSize()
+    public async Task Clock_EmitsLatencyCalculated_OnEverySteadyStateSample()
     {
-        SetSampleSize(3);
-
-        bool signalFired = false;
-        _client.LatencyCalculated += (_, __) => signalFired = true;
-
-        // Send 2 clock syncs (one short of _sampleSize = 3)
-        SendClockSync();
-        SendClockSync();
-        await _clientRunner.AwaitIdleFrame();
-
-        AssertThat(signalFired).IsFalse();
-    }
-
-    // B-02 ─────────────────────────────────────────────────────────────────────
-    [TestCase]
-    public async Task Clock_EmitsLatencyCalculated_OnNthSample()
-    {
-        SetSampleSize(3);
-
         int emitCount = 0;
         _client.LatencyCalculated += (_, __) => emitCount++;
 
-        SendClockSync();
-        SendClockSync();
-        SendClockSync(); // 3rd sample → should emit
+        // Five small-offset samples — none cross the immediate-correction
+        // threshold, so each takes the steady-state EWMA path and emits.
+        for (int i = 0; i < 5; i++)
+            InjectAlignedSync();
         await _clientRunner.AwaitIdleFrame();
 
-        AssertThat(emitCount).IsEqual(1);
-    }
-
-    // B-03 ─────────────────────────────────────────────────────────────────────
-    [TestCase]
-    public async Task Clock_SampleBuffer_ClearsAfterEmit()
-    {
-        SetSampleSize(3);
-
-        int emitCount = 0;
-        _client.LatencyCalculated += (_, __) => emitCount++;
-
-        // Fill first batch → emit
-        SendClockSync(); SendClockSync(); SendClockSync();
-        await _clientRunner.AwaitIdleFrame();
-
-        AssertThat(emitCount).IsEqual(1);
-
-        // Send 2 more (incomplete second batch)
-        SendClockSync(); SendClockSync();
-        await _clientRunner.AwaitIdleFrame();
-
-        AssertThat(emitCount).IsEqual(1); // second batch not complete yet
+        AssertThat(emitCount).IsEqual(5);
     }
 
     // B-04 ─────────────────────────────────────────────────────────────────────
@@ -142,11 +109,11 @@ public class ClockTests
         }
     }
 
-    // B-06 ─────────────────────────────────────────────────────────────────────
+    // B-06 (post-EWMA rewrite) ────────────────────────────────────────────────
     // Fast-correction path: a sync sample whose offset estimate exceeds
     // ClientNetworkClock._immediateCorrectionMinAbsTicks should pump _lastOffset
-    // immediately (not wait for the averaged-window buffer to fill), so the
-    // next ProcessTick advances _currentTick by the offset. This is the
+    // immediately (not feed the EWMA accumulator), so the next ProcessTick
+    // advances _currentTick by the offset. This is the
     // Photon-Fusion-2-style "first-packet correction" that brings the clock
     // to within a few ticks of the server within ~0.5 s of connecting.
     [TestCase]
@@ -185,31 +152,46 @@ public class ClockTests
     // grow with each ProcessTick and made the test flaky in the suite (where
     // physics-frame catch-up can advance _currentTick by 5–10 ticks per idle
     // frame), even though it passed in isolation.
+    // Post-EWMA rewrite of the previous "buffer-clearing" test. The original
+    // test guarded against a windowed-average bug where pre-correction samples
+    // would re-bias the post-correction window. With EWMA there is no window,
+    // but the same class of bug exists in a different form: the EWMA
+    // accumulator (_ewmaOffset) must reset to zero after an immediate
+    // correction, otherwise the just-applied large offset would also drive
+    // subsequent slew corrections on the next sample.
     [TestCase]
-    public async Task Clock_ImmediateCorrection_ClearsBuffersToAvoidWindowDoubleCount()
+    public async Task Clock_ImmediateCorrection_ResetsEwmaAccumulator()
     {
-        SetSampleSize(3);
-
-        // Big-offset sync → immediate path, clears buffers.
+        // Big-offset sync → immediate-correction path. No LatencyCalculated
+        // emit fires on that sample (the path returns before EmitSignal); the
+        // EWMA accumulator should be reset to zero alongside applying the
+        // step correction.
         InjectClockSyncEchoToClient(serverTime: 80, clientTime: (int)Godot.Time.GetTicksMsec());
         await _clientRunner.AwaitIdleFrame();
 
-        // After the immediate correction the buffer should be empty, so two
-        // more small-offset samples shouldn't complete the window of 3.
-        bool fired = false;
-        _client.LatencyCalculated += (_, __) => fired = true;
+        float ewmaAfterImmediate = GetEwmaOffset();
+        AssertThat(ewmaAfterImmediate).IsEqual(0f);
 
-        // Each post-correction sync uses the current raw tick as ServerTime,
-        // so the inferred offset stays ≈0 regardless of how many ProcessTicks
-        // the engine has run since the immediate correction.
-        InjectAlignedSync();
+        // Drain one ProcessTick so the immediate-correction offset lands on
+        // _currentTick before we measure the next steady-state sample.
+        _clock.ProcessTick();
+
+        // A single aligned (offset ≈ 0) sync afterwards feeds the EWMA path
+        // with a small value — no double-counting of the prior big offset.
         InjectAlignedSync();
         await _clientRunner.AwaitIdleFrame();
-        AssertThat(fired).IsFalse(); // buffer still only has 2 post-correction samples
 
-        InjectAlignedSync(); // 3rd → window emits
-        await _clientRunner.AwaitIdleFrame();
-        AssertThat(fired).IsTrue();
+        // EWMA should still be near zero (one small-offset sample weighted by
+        // alpha doesn't move it significantly).
+        float ewmaAfterAligned = GetEwmaOffset();
+        AssertThat(System.Math.Abs(ewmaAfterAligned)).IsLessEqual(1f);
+    }
+
+    private float GetEwmaOffset()
+    {
+        return (float)(typeof(ClientNetworkClock)
+            .GetField("_ewmaOffset", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?.GetValue(_clock) ?? 0f);
     }
 
     // Injects a clock-sync echo whose ServerTime equals the client's current

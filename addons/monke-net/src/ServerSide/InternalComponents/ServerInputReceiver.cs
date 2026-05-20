@@ -4,6 +4,7 @@ using MonkeNet.NetworkMessages;
 using MonkeNet.Serializer;
 using MonkeNet.Shared;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace MonkeNet.Server;
 
@@ -32,6 +33,24 @@ public partial class ServerInputReceiver : InternalServerComponent
     // Side index of which ticks each entity currently has queued, for O(log n) eviction
     // of the oldest tick when MaximumServerReplicates is exceeded.
     private readonly Dictionary<NetworkBehaviour, SortedSet<int>> _pendingTicksPerEntity = [];
+
+    /// <summary>
+    /// Maximum per-entity rolling history of (tick, applied-input) pairs kept by the
+    /// server so <see cref="GetRecentAppliedInputs"/> can return the last N inputs
+    /// each snapshot. Capped at 30 (2× the largest N <see cref="ServerEntityManager"/>
+    /// is likely to request) to bound the memory footprint per entity while leaving
+    /// headroom for future tuning.
+    /// </summary>
+    private const int AppliedInputHistoryCap = 30;
+
+    // Per-entity sorted history of inputs ACTUALLY APPLIED at each tick (i.e. the
+    // result of GetInputForEntityTick, which may be "received", "repeat-stale" or
+    // "default" depending on whether the owner sent input that tick). Maintained
+    // here so PackSnapshot can hand observers a per-tick history they can replay
+    // exactly — without it, the resim loop on the client side falls back to
+    // "latest cached input for all replayed ticks", which is wrong whenever the
+    // owner's input changed during the rollback window.
+    private readonly Dictionary<NetworkBehaviour, SortedDictionary<int, IPackableElement>> _appliedInputHistory = [];
 
     private int _trimmedInputTotal = 0;
 
@@ -93,6 +112,23 @@ public partial class ServerInputReceiver : InternalServerComponent
             // keys after a directional change).
             _lastInputStored[serverEntity] = result;
         }
+        // Record the input we actually applied at this tick into the per-entity
+        // history so PackSnapshot can later replay the last N (tick, input) pairs
+        // to observers. Skip null entries (server-owned passive props with no
+        // input ever) so the snapshot doesn't carry meaningless rows.
+        if (result != null)
+        {
+            if (!_appliedInputHistory.TryGetValue(serverEntity, out var history))
+            {
+                history = new SortedDictionary<int, IPackableElement>();
+                _appliedInputHistory[serverEntity] = history;
+            }
+            history[tick] = result;
+            while (history.Count > AppliedInputHistoryCap)
+            {
+                history.Remove(history.Keys.First());
+            }
+        }
         MonkeLogger.Debug($"[NET-INPUT-CONSUME] tick={tick} eid={serverEntity.EntityId} authority={serverEntity.Authority} source={source} input={result?.ToString() ?? "null"}");
 
         int authority = serverEntity.Authority;
@@ -117,6 +153,58 @@ public partial class ServerInputReceiver : InternalServerComponent
     public IPackableElement GetLastInputFor(NetworkBehaviour serverEntity)
     {
         return _lastInputStored.TryGetValue(serverEntity, out var input) ? input : null;
+    }
+
+    /// <summary>
+    /// Returns the most recent <paramref name="maxPastCount"/> applied (tick, input)
+    /// pairs PLUS any pending future (tick, input) pairs the server has received
+    /// from the owner but not yet applied (typical with an owner-side input
+    /// delay: the input is sent ahead of its apply tick so it propagates to the
+    /// server with time to spare). Sorted oldest-first so observers can ingest
+    /// in tick order.
+    ///
+    /// Used by <see cref="ServerEntityManager.PackSnapshot"/>:
+    /// - Past entries let an observer's rollback resim apply the correct
+    ///   per-tick input at each replayed tick.
+    /// - Future entries let an observer learn an upcoming input BEFORE its own
+    ///   clock reaches the apply tick — so its forward prediction at tick
+    ///   T uses the same input the server will apply at T, eliminating the
+    ///   "one-tick-of-input-lag" reconcile that fires on every direction change
+    ///   when an owner-side delay is paired with snapshot-relayed inputs.
+    /// </summary>
+    public List<(int Tick, IPackableElement Input)> GetRecentAppliedInputs(
+        NetworkBehaviour serverEntity, int maxPastCount, int currentServerTick)
+    {
+        var result = new List<(int, IPackableElement)>();
+
+        // Past applied history — most recent N ticks.
+        if (maxPastCount > 0
+            && _appliedInputHistory.TryGetValue(serverEntity, out var history)
+            && history.Count > 0)
+        {
+            int take = System.Math.Min(maxPastCount, history.Count);
+            foreach (var kv in history.Skip(history.Count - take))
+                result.Add((kv.Key, kv.Value));
+        }
+
+        // Future pending inputs the server has received but not yet applied.
+        // _pendingInputs is keyed by tick → (entity → input); iterate ticks
+        // > currentServerTick that have an entry for this entity. Bounded by
+        // MaximumServerReplicates so the loop is short.
+        if (_pendingTicksPerEntity.TryGetValue(serverEntity, out var futureTicks))
+        {
+            foreach (int tick in futureTicks)
+            {
+                if (tick <= currentServerTick) continue;
+                if (_pendingInputs.TryGetValue(tick, out var perTick)
+                    && perTick.TryGetValue(serverEntity, out var input))
+                {
+                    result.Add((tick, input));
+                }
+            }
+        }
+
+        return result;
     }
 
     public int GetMissedInputTotal(int clientId) =>

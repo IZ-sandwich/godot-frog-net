@@ -61,6 +61,22 @@ public struct EntityEventMessage : IPackableMessage
     public required int Authority { get; set; }
     public Vector3 Position { get; set; }
     public float Yaw { get; set; }
+    /// <summary>
+    /// Server tick at which the body's physics collider should become active on
+    /// every peer. The server stamps this at <c>serverTick + SpawnActivationDelayTicks</c>
+    /// when broadcasting a <see cref="EntityEventEnum.Created"/> event, and each
+    /// peer (server and clients) holds the body in "frozen + no-collide" until
+    /// its local clock reaches this tick. This eliminates the asymmetric-spawn
+    /// contact window where the server simulates contacts against a body the
+    /// clients haven't received yet, leaking impulses into the server's
+    /// authoritative state that the client can't reproduce until reconcile —
+    /// each spawn now goes live on every peer at exactly the same server tick.
+    ///
+    /// Zero (the default for legacy callers) means "activate immediately on
+    /// receipt", preserving the prior behaviour for any code path that
+    /// constructs an EntityEventMessage without setting this field.
+    /// </summary>
+    public int ActivationTick { get; set; }
     public string Metadata { get; set; } //TODO: his should contain Position, Yaw, etc all the other specific stuff
 
     public void ReadBytes(MessageReader reader)
@@ -71,6 +87,7 @@ public struct EntityEventMessage : IPackableMessage
         Authority = reader.ReadInt32();
         Position = reader.ReadVector3();
         Yaw = reader.ReadSingle();
+        ActivationTick = reader.ReadInt32();
         Metadata = reader.ReadString();
     }
 
@@ -82,6 +99,7 @@ public struct EntityEventMessage : IPackableMessage
         writer.Write(Authority);
         writer.Write(Position);
         writer.Write(Yaw);
+        writer.Write(ActivationTick);
         writer.Write(Metadata);
     }
 
@@ -125,19 +143,23 @@ public struct GameSnapshotMessage : IPackableMessage
 }
 
 /// <summary>
-/// One entity's most recent input as observed by the server, included in every
-/// <see cref="GameSnapshotMessage"/>. Tagged with the entity id so the client can
-/// route it to the correct predicted body even if the server's snapshot ordering
-/// differs from the client's ClientEntities ordering.
+/// One per-(entity, tick) input as observed by the server, included in every
+/// <see cref="GameSnapshotMessage"/>. Multiple entries per entity are now
+/// possible — a snapshot carries the last N inputs per entity so observers can
+/// look up the correct per-tick input during forward prediction and rollback
+/// resim. Tagged with both the entity id (route to the right body) and the
+/// server tick (route to the right past/future tick).
 /// </summary>
 public struct EntityInput : IPackableElement
 {
     public required int EntityId { get; set; }
+    public required int Tick { get; set; }
     public required IPackableElement Input { get; set; }
 
     public readonly void WriteBytes(MessageWriter writer)
     {
         writer.Write(EntityId);
+        writer.Write(Tick);
         writer.Write(MessageSerializer.GetByteTypeFromMessage(Input));
         Input.WriteBytes(writer);
     }
@@ -145,6 +167,7 @@ public struct EntityInput : IPackableElement
     public void ReadBytes(MessageReader reader)
     {
         EntityId = reader.ReadInt32();
+        Tick = reader.ReadInt32();
         byte typeId = reader.ReadByte();
         Input = (IPackableElement)MessageSerializer.GetMessageFromByteType(typeId);
         Input.ReadBytes(reader);

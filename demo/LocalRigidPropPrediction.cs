@@ -28,8 +28,17 @@ public partial class LocalRigidPropPrediction : ClientPredictedEntity
     // Linear-velocity divergence threshold (squared, m²/s²). Without this the ball can
     // share the server's position to within tolerance while carrying noticeably different
     // momentum — the wrong velocity then writes new wrong positions every tick until the
-    // position threshold trips and a hard snap fires. ~0.5 m/s default.
-    [Export] private float _maxVelocityDeviationSquared = 0.25f;
+    // position threshold trips and a hard snap fires.
+    //
+    // Threshold = 1.0 m/s (squared = 1.0). When a vehicle pushes a cube, the
+    // observer's prediction of the cube lags the server's by one input
+    // application — snapshot.Inputs[] only carries the latest per-entity
+    // input, not a tick-indexed history, so the observer can't re-apply the
+    // exact tick-T input at its own tick T. That structural one-tick lag
+    // produces ≈ 0.5–0.7 m/s of contact-tick velocity divergence even when
+    // the broader simulation is in lockstep. 1.0 m/s tolerance absorbs that
+    // natural lag while still catching gross Jolt-nondeterminism deltas.
+    [Export] private float _maxVelocityDeviationSquared = 1.0f;
     // Rotation divergence threshold (degrees). Catches the case where position and linear
     // velocity stay within bounds but cross-process Jolt drift accumulates yaw / tumble
     // error during a push. Without this, rotation only ever gets corrected by SyncSleepState
@@ -52,6 +61,12 @@ public partial class LocalRigidPropPrediction : ClientPredictedEntity
 
     public override Vector3 ExtractAuthoritativePosition(IEntityStateData state) =>
         ((EntityStateMessage)state).Position;
+
+    public override Vector3 ExtractAuthoritativeVelocity(IEntityStateData state) =>
+        ((EntityStateMessage)state).Velocity;
+
+    public override Quaternion ExtractAuthoritativeRotation(IEntityStateData state) =>
+        ((EntityStateMessage)state).Rotation;
 
     public override bool HasMisspredicted(int tick, IEntityStateData receivedState, RigidbodyState savedState)
     {

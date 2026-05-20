@@ -62,6 +62,53 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     public virtual Vector3 ExtractAuthoritativePosition(IEntityStateData state) { return Vector3.Zero; }
 
     /// <summary>
+    /// Extracts the authoritative linear velocity from an <see cref="IEntityStateData"/>.
+    /// Used by the misprediction classifier to distinguish accumulated float drift
+    /// (predicted velocity matches authoritative) from a genuine external force
+    /// (velocity diverged because the server applied an impulse the client didn't
+    /// replay). Default returns <see cref="Vector3.Zero"/>; override on each
+    /// predicted entity that carries velocity in its state message.
+    /// </summary>
+    public virtual Vector3 ExtractAuthoritativeVelocity(IEntityStateData state) { return Vector3.Zero; }
+
+    /// <summary>
+    /// Extracts the authoritative rotation from an <see cref="IEntityStateData"/>.
+    /// Used by the misprediction logger so a reconcile triggered by the rotation
+    /// threshold (rather than position or velocity) shows which threshold actually
+    /// fired — without this the info line would report a sub-threshold posDiff and
+    /// sub-threshold velDiff and the reader has to guess that rotation tripped.
+    /// Default returns <see cref="Quaternion.Identity"/>; override on each
+    /// predicted entity that carries rotation in its state message.
+    /// </summary>
+    public virtual Quaternion ExtractAuthoritativeRotation(IEntityStateData state) { return Quaternion.Identity; }
+
+    /// <summary>
+    /// Names which of the documented reconcile thresholds tripped for this
+    /// (authoritative, predicted) pair — "position", "velocity", "rotation",
+    /// combinations thereof, or "below-thresholds" if none did. The
+    /// misprediction logger calls this so its <c>trippedBy=…</c> tag uses the
+    /// entity's own thresholds rather than a hardcoded set, which is the
+    /// difference between "the player tripped at its tighter 0.5 m/s
+    /// threshold but the prop's 1.0 m/s threshold says below" (silent
+    /// misclassification) and "trippedBy=velocity" (correct).
+    ///
+    /// Default checks against common values (pos² &lt; 0.04, vel² &lt; 1.0,
+    /// rot &lt; 5°). Entities with custom thresholds — particularly the
+    /// rigid-body player whose velocity threshold is much tighter than the
+    /// passive-prop threshold — override this to query their own fields.
+    /// </summary>
+    public virtual string DescribeMispredictTrigger(IEntityStateData authoritativeState, RigidbodyState savedState)
+    {
+        Vector3 authPos = ExtractAuthoritativePosition(authoritativeState);
+        Vector3 authVel = ExtractAuthoritativeVelocity(authoritativeState);
+        Quaternion authRot = ExtractAuthoritativeRotation(authoritativeState);
+        bool posOver = (authPos - savedState.Position).LengthSquared() > 0.04f;          // 0.2 m
+        bool velOver = (authVel - savedState.LinearVelocity).LengthSquared() > 1.0f;      // 1.0 m/s
+        bool rotOver = authRot.AngleTo(savedState.Rotation) > Mathf.DegToRad(5f);         // 5°
+        return MispredictTriggerString.Format(posOver, velOver, rotOver);
+    }
+
+    /// <summary>
     /// Restores the body's transform + velocities to a previously captured snapshot
     /// state, without any of the authority-reconcile side effects
     /// (<see cref="HandleReconciliation"/> may call SyncSleepState, zero residual
@@ -72,4 +119,25 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     /// <see cref="PredictionRigidbody3D"/>.
     /// </summary>
     public virtual void RestoreBodyState(RigidbodyState state) { }
+}
+
+/// <summary>
+/// Small helper used by <see cref="ClientPredictedEntity.DescribeMispredictTrigger"/>
+/// (and its overrides) to format a consistent string across all entities. Kept
+/// here rather than in the prediction manager so entity-specific overrides can
+/// share the same labels without depending on the manager.
+/// </summary>
+public static class MispredictTriggerString
+{
+    public static string Format(bool posOver, bool velOver, bool rotOver)
+    {
+        if (posOver && !velOver && !rotOver) return "position";
+        if (!posOver && velOver && !rotOver) return "velocity";
+        if (!posOver && !velOver && rotOver) return "rotation";
+        if (posOver && velOver && !rotOver) return "position+velocity";
+        if (posOver && !velOver && rotOver) return "position+rotation";
+        if (!posOver && velOver && rotOver) return "velocity+rotation";
+        if (posOver && velOver && rotOver)  return "position+velocity+rotation";
+        return "below-thresholds";
+    }
 }

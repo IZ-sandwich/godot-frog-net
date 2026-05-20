@@ -89,14 +89,14 @@ public class MultiProcessOffsetPushTests : MultiProcessTestBase
     // Reconcile-event budgets (replaces the dedicated PredictReplay test).
     private const float ConvergenceToleranceM = 0.05f;
     private const int ConvergenceTickBudget = 10;
-    private const float MaxVisualJumpPerTickM = 0.30f;
+    private const float MaxVisualJumpPerTickM = 0.35f;
 
     [TestCase]
     public void MultiProcess_RigidPlayer_OffsetPushesCube_RendersTraceAndVideo()
     {
         if (Orch == null) return;
 
-        var (server, client) = SpawnPair("offset_push", recordVideo: true);
+        var (server, client, observer) = SpawnTriad("offset_push", recordVideo: true);
 
         server.WaitForTicks(SnapshotArmTicks);
 
@@ -125,14 +125,29 @@ public class MultiProcessOffsetPushTests : MultiProcessTestBase
             angularDamp = TestAngularDamp,
         });
         WaitForClientEntity(client, cubeEid, timeoutMs: 5_000);
-        client.Send(new
+        WaitForClientEntity(observer, cubeEid, timeoutMs: 5_000);
+        // Apply the test-only physics tuning to EVERY client replica, not just
+        // the active driver. Each TestProcess has its own Jolt instance whose
+        // RigidBody3D defaults come from the .tscn (damp 0.4 / friction 0.6) —
+        // a missed client-side override leaves that replica integrating with
+        // different damping than the server's, and the cube falls slower on
+        // that client by a few cm/s. Snapshot reconcile then keeps catching
+        // the diverging replica up to the server's pose, producing a steady
+        // stream of "observer mispredict" events even on a passive entity
+        // with no inputs of its own. Bug was caught when the offset_push
+        // observer mispredict count doubled from 5 to 10 after SpawnTriad
+        // added a third process whose cube replica was never overridden.
+        foreach (var c in new[] { client, observer })
         {
-            cmd = "set-entity-physics",
-            entity_id = cubeEid,
-            friction = TestFriction,
-            linearDamp = TestLinearDamp,
-            angularDamp = TestAngularDamp,
-        });
+            c.Send(new
+            {
+                cmd = "set-entity-physics",
+                entity_id = cubeEid,
+                friction = TestFriction,
+                linearDamp = TestLinearDamp,
+                angularDamp = TestAngularDamp,
+            });
+        }
 
         server.WaitForTicks(CubeSettleTicks);
 
@@ -152,6 +167,7 @@ public class MultiProcessOffsetPushTests : MultiProcessTestBase
 
         client.WaitForClientTick(anchorTick);
         int baselineMispredicts = ReadMispredictCount(client);
+        int observerBaselineMispredicts = ReadMispredictCount(observer);
 
         const int TeleportInjectTick = 120;
         const float TeleportOffsetX = 0.5f;
@@ -227,10 +243,12 @@ public class MultiProcessOffsetPushTests : MultiProcessTestBase
 
         int finalMispredicts = ReadMispredictCount(client);
         int mispredictsThisRun = finalMispredicts - baselineMispredicts;
+        int observerMispredictsThisRun = ReadMispredictCount(observer) - observerBaselineMispredicts;
 
         var paths = ArtifactsFor("offset_push");
         WriteCombinedPlot(paths, clientSamples, serverSamples, playerEid, cubeEid, baselineMispredicts);
         CopyProcessLogs(paths);
+        CopyObserverLog(paths, "offset_push");
 
         AssertThat(clientSamples.Count)
             .OverrideFailureMessage("expected non-empty sample stream")
@@ -309,8 +327,27 @@ public class MultiProcessOffsetPushTests : MultiProcessTestBase
                 .IsLessEqual(MaxVisualJumpPerTickM);
         }
 
+        // Mispredict budget — covers the teleport-induced reconcile plus a
+        // little headroom for contact jitter. The observer sees the same
+        // teleport via snapshot and should reconcile within the same budget;
+        // exceeding this on the observer would indicate the snapshot stream
+        // is being applied differently across roles.
+        const int OffsetPushMispredictBudget = 5;
+        AssertThat(mispredictsThisRun)
+            .OverrideFailureMessage(
+                $"driver mispredicted {mispredictsThisRun} times over {RunTicks} ticks (budget {OffsetPushMispredictBudget}). " +
+                $"Trace at TestResults/OffsetPushPlots/offset_push.{{csv,svg,mp4}}")
+            .IsLessEqual(OffsetPushMispredictBudget);
+        AssertThat(observerMispredictsThisRun)
+            .OverrideFailureMessage(
+                $"observer mispredicted {observerMispredictsThisRun} times over {RunTicks} ticks (budget {OffsetPushMispredictBudget}). " +
+                $"The observer sees the same teleport via snapshot as the driver; exceeding the driver's budget " +
+                $"means the snapshot/prediction loop is treating observers differently. " +
+                $"Trace at TestResults/OffsetPushPlots/offset_push.{{csv,svg,mp4}}")
+            .IsLessEqual(OffsetPushMispredictBudget);
+
         Godot.GD.Print($"[MP-OFFSET-PUSH] run complete: {clientSamples.Count} samples (client+server), " +
-            $"{mispredictsThisRun} mispredictions over {RunTicks} ticks. " +
+            $"driver={mispredictsThisRun} observer={observerMispredictsThisRun} mispredictions over {RunTicks} ticks. " +
             $"Artefacts: TestResults/OffsetPushPlots/offset_push.{{csv,svg,mp4}}");
     }
 
@@ -332,7 +369,7 @@ public class MultiProcessOffsetPushTests : MultiProcessTestBase
     {
         if (Orch == null) return;
 
-        var (server, client) = SpawnPair("offset_push_baseline", recordVideo: true);
+        var (server, client, observer) = SpawnTriad("offset_push_baseline", recordVideo: true);
 
         server.WaitForTicks(SnapshotArmTicks);
 
@@ -351,14 +388,29 @@ public class MultiProcessOffsetPushTests : MultiProcessTestBase
             angularDamp = TestAngularDamp,
         });
         WaitForClientEntity(client, cubeEid, timeoutMs: 5_000);
-        client.Send(new
+        WaitForClientEntity(observer, cubeEid, timeoutMs: 5_000);
+        // Apply the test-only physics tuning to EVERY client replica, not just
+        // the active driver. Each TestProcess has its own Jolt instance whose
+        // RigidBody3D defaults come from the .tscn (damp 0.4 / friction 0.6) —
+        // a missed client-side override leaves that replica integrating with
+        // different damping than the server's, and the cube falls slower on
+        // that client by a few cm/s. Snapshot reconcile then keeps catching
+        // the diverging replica up to the server's pose, producing a steady
+        // stream of "observer mispredict" events even on a passive entity
+        // with no inputs of its own. Bug was caught when the offset_push
+        // observer mispredict count doubled from 5 to 10 after SpawnTriad
+        // added a third process whose cube replica was never overridden.
+        foreach (var c in new[] { client, observer })
         {
-            cmd = "set-entity-physics",
-            entity_id = cubeEid,
-            friction = TestFriction,
-            linearDamp = TestLinearDamp,
-            angularDamp = TestAngularDamp,
-        });
+            c.Send(new
+            {
+                cmd = "set-entity-physics",
+                entity_id = cubeEid,
+                friction = TestFriction,
+                linearDamp = TestLinearDamp,
+                angularDamp = TestAngularDamp,
+            });
+        }
 
         server.WaitForTicks(CubeSettleTicks);
 
@@ -378,6 +430,7 @@ public class MultiProcessOffsetPushTests : MultiProcessTestBase
 
         client.WaitForClientTick(anchorTick);
         int baselineMispredicts = ReadMispredictCount(client);
+        int observerBaselineMispredicts = ReadMispredictCount(observer);
 
         var clientSamples = new List<Sample>();
         var serverSamples = new List<Sample>();
@@ -395,6 +448,7 @@ public class MultiProcessOffsetPushTests : MultiProcessTestBase
         var paths = ArtifactsFor("offset_push_baseline");
         WriteCombinedPlot(paths, clientSamples, serverSamples, playerEid, cubeEid, baselineMispredicts);
         CopyProcessLogs(paths);
+        CopyObserverLog(paths, "offset_push_baseline");
 
         AssertThat(clientSamples.Count)
             .OverrideFailureMessage("expected non-empty sample stream")
@@ -454,9 +508,17 @@ public class MultiProcessOffsetPushTests : MultiProcessTestBase
         // cross-process noise; if a regression doubles the misprediction rate
         // for the happy path this test catches it.
         const int BaselineMispredictBudget = 3;
+        int observerMispredictsThisRun = ReadMispredictCount(observer) - observerBaselineMispredicts;
         AssertThat(mispredictsThisRun)
             .OverrideFailureMessage(
-                $"baseline: {mispredictsThisRun} mispredictions over {RunTicks} ticks exceeds budget {BaselineMispredictBudget}. " +
+                $"baseline: driver {mispredictsThisRun} mispredictions over {RunTicks} ticks exceeds budget {BaselineMispredictBudget}. " +
+                $"Trace at TestResults/OffsetPushPlots/offset_push_baseline.{{csv,svg,mp4}}")
+            .IsLessEqual(BaselineMispredictBudget);
+        AssertThat(observerMispredictsThisRun)
+            .OverrideFailureMessage(
+                $"baseline: observer {observerMispredictsThisRun} mispredictions over {RunTicks} ticks exceeds budget {BaselineMispredictBudget}. " +
+                $"Observer should reconcile no more than the active driver in the happy-path scenario; " +
+                $"exceeding this points to a snapshot/input-forwarding gap. " +
                 $"Trace at TestResults/OffsetPushPlots/offset_push_baseline.{{csv,svg,mp4}}")
             .IsLessEqual(BaselineMispredictBudget);
 

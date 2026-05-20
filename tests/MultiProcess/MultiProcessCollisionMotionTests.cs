@@ -97,7 +97,7 @@ public class MultiProcessCollisionMotionTests : MultiProcessTestBase
     {
         if (Orch == null) return;
 
-        var (server, client) = SpawnPair(label, recordVideo: true);
+        var (server, client, observer) = SpawnTriad(label, recordVideo: true);
 
         server.WaitForTicks(SnapshotArmTicks);
 
@@ -108,14 +108,20 @@ public class MultiProcessCollisionMotionTests : MultiProcessTestBase
         // hide pre-anchor events from both the marker rendering and the
         // post-run budget assertion.
         int baselineMispredicts = ReadMispredictCount(client);
+        int observerBaselineMispredicts = ReadMispredictCount(observer);
 
         int targetEid = SpawnEntity(server, targetEntityType, authority: 0,
             TargetStartX, TargetStartY, TargetStartZ);
 
-        // Apply low-friction/low-damping override on BOTH replicas so the two
+        // Apply low-friction/low-damping override on EVERY replica so the two
         // Jolt sims run with identical parameters and the coast phase is long
-        // enough to read off the plot. Wait for the client's replica to exist
-        // before issuing the client-side override.
+        // enough to read off the plot. Wait for each client's replica to
+        // exist before issuing the client-side override. Both the active
+        // driver AND the passive observer get the override — without it the
+        // observer's replica keeps the .tscn defaults (damp 0.4 / friction 0.6)
+        // and falls / coasts noticeably differently from the server's tuned
+        // body, producing a stream of "observer mispredict" events that have
+        // nothing to do with prediction quality.
         server.Send(new
         {
             cmd = "set-entity-physics",
@@ -125,14 +131,18 @@ public class MultiProcessCollisionMotionTests : MultiProcessTestBase
             angularDamp = TestAngularDamp,
         });
         WaitForClientEntity(client, targetEid, timeoutMs: 5_000);
-        client.Send(new
+        WaitForClientEntity(observer, targetEid, timeoutMs: 5_000);
+        foreach (var c in new[] { client, observer })
         {
-            cmd = "set-entity-physics",
-            entity_id = targetEid,
-            friction = TestFriction,
-            linearDamp = TestLinearDamp,
-            angularDamp = TestAngularDamp,
-        });
+            c.Send(new
+            {
+                cmd = "set-entity-physics",
+                entity_id = targetEid,
+                friction = TestFriction,
+                linearDamp = TestLinearDamp,
+                angularDamp = TestAngularDamp,
+            });
+        }
 
         // Sample start = right after both replicas exist and physics is set,
         // so the entire test lifecycle (target settle → player fall → push →
@@ -175,10 +185,12 @@ public class MultiProcessCollisionMotionTests : MultiProcessTestBase
 
         int finalMispredicts = ReadMispredictCount(client);
         int mispredictsThisRun = finalMispredicts - baselineMispredicts;
+        int observerMispredictsThisRun = ReadMispredictCount(observer) - observerBaselineMispredicts;
 
         var paths = ArtifactsFor(label);
         WriteCombinedPlot(paths, clientSamples, serverSamples, playerEid, targetEid, baselineMispredicts, label);
         CopyProcessLogs(paths);
+        CopyObserverLog(paths, label);
 
         AssertThat(clientSamples.Count)
             .OverrideFailureMessage("expected non-empty sample stream")
@@ -233,6 +245,13 @@ public class MultiProcessCollisionMotionTests : MultiProcessTestBase
                 $"Trace at TestResults/CollisionMotionPlots/{label}.{{csv,svg,mp4}}")
             .IsLessEqual(VisualToleranceM);
 
+        AssertThat(observerMispredictsThisRun)
+            .OverrideFailureMessage(
+                $"observer accrued {observerMispredictsThisRun} mispredictions (budget {MispredictBudget}). " +
+                $"Observer is idle; reconciles here indicate the snapshot/input-forwarding path can't keep " +
+                $"the observer's predicted body in lockstep with the server's authoritative one. " +
+                $"Trace at TestResults/CollisionMotionPlots/{label}.{{csv,svg,mp4}}")
+            .IsLessEqual(MispredictBudget);
         AssertThat(mispredictsThisRun)
             .OverrideFailureMessage(
                 $"{mispredictsThisRun} mispredictions over the full sample window " +

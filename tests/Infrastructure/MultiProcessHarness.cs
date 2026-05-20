@@ -36,7 +36,25 @@ public class MultiProcessOrchestrator : IDisposable
     private readonly string _godotBin;
     private readonly string _projectPath;
     private readonly List<TestProcess> _processes = new();
-    private static int _nextOrchPort = 9500;
+
+    // Orch port allocation. The orchestrator talks to each spawned harness over
+    // TCP; we ask the OS for a free ephemeral TCP port by binding a TcpListener
+    // on port 0, reading the assigned port, and closing the listener. The
+    // child Godot process then re-binds with TcpListener on the same port.
+    // Same TOCTOU caveat as NextPort above — negligible in practice.
+    //
+    // Replaces the previous static counter (started at 9500, incremented per
+    // Spawn) which collided when two `dotnet test` invocations ran in
+    // parallel: both processes started at 9500 and child #2 of run B couldn't
+    // bind. OS-assigned ports work across any number of concurrent test runs.
+    private static int NextOrchPort()
+    {
+        var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
+    }
 
     public MultiProcessOrchestrator(string godotBinPath, string projectPath)
     {
@@ -46,9 +64,9 @@ public class MultiProcessOrchestrator : IDisposable
 
     public TestProcess Spawn(string role, int enetPort, string label = null,
         string serverAddr = "127.0.0.1", string recordVideoPath = null,
-        string clientPersistentId = null)
+        string clientPersistentId = null, string scenePath = null)
     {
-        int orchPort = Interlocked.Increment(ref _nextOrchPort);
+        int orchPort = NextOrchPort();
         label ??= role;
 
         // Normalize the project path to forward slashes — Godot's res:// resolver
@@ -88,10 +106,16 @@ public class MultiProcessOrchestrator : IDisposable
             args.Add("--headless");
         }
 
+        // Default to MainScene (the project's main scene) for harness loading
+        // reliability inside the gdUnit4 runner. Tests that need a different
+        // arena layout (e.g. a large unobstructed floor for vehicle driving)
+        // pass scenePath; only sibling .tscn files under demo/ are known-safe
+        // to load through this codepath.
+        string scene = scenePath ?? "res://demo/MainScene.tscn";
         args.AddRange(new[]
         {
             "--path", projectPath,
-            "res://demo/MainScene.tscn",
+            scene,
             "--",
             "--test-harness",
             $"--role={role}",

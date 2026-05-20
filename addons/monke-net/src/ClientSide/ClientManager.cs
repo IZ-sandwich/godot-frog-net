@@ -284,8 +284,20 @@ public partial class ClientManager : Node
 
     public int GetNetworkId()
     {
-        return _networkManager.GetNetworkId();
+        // Null-safe: _networkManager is only set by Initialize, but _PhysicsProcess
+        // runs every physics frame from the moment the scene is loaded. Tests that
+        // load the ClientManager scene and let one idle frame elapse before calling
+        // Initialize would NRE through Predict() → ClientManager.GetNetworkId() →
+        // _networkManager.GetNetworkId() without this guard. 0 is the conventional
+        // "no peer id" value already returned elsewhere (see DisplayDebugInformation).
+        return _networkManager?.GetNetworkId() ?? 0;
     }
+
+    /// <summary>Pop a network statistic (ENet host counter) from the underlying
+    /// network manager. Reads are destructive (the counter resets); intended
+    /// for telemetry / tests that sample bandwidth over a known interval.</summary>
+    public int PopNetworkStatistic(INetworkManager.NetworkStatisticEnum stat) =>
+        _networkManager?.PopStatistic(stat) ?? 0;
 
     private void OnLatencyCalculated(int currentTick, int latencyAverageTicks, int jitterAverageTicks, int averageClockOffset)
     {

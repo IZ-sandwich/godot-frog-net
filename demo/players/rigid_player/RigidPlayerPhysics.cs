@@ -61,10 +61,41 @@ public static class RigidPlayerPhysics
     private const float GroundProbeOriginUp = 0.1f;
     private const float GroundProbeReachDown = 0.05f;
 
-    public static void AdvancePhysics(PredictionRigidbody3D predictionRb, CharacterInputMessage input)
+    // Gravity magnitude (m/s²) read from the Godot project setting. Used only by
+    // LogPostPhysics to compute the "expected" post-step velocity (preVel + queued
+    // impulse + gravity*dt) so residual = post - expected isolates the contact-impulse
+    // Jolt applied during the step. Cached at static-init time; if the project setting
+    // is missing falls back to 9.81 (matching project.godot default and MainScene.tscn
+    // value of 9.8 close enough for diagnostics).
+    private static readonly float Gravity = (float)(double)ProjectSettings.GetSetting(
+        "physics/3d/default_gravity", 9.81);
+
+    // Phase tag for the [PHYS-RIGIDPLAYER] log line. "live" = called from OnProcessTick
+    // (the regular per-tick predict path on client OR server); "resim" = called from
+    // ResimulateTick during a client-side rollback resimulation; "spawn-catchup" =
+    // called from the spawn-tick catch-up path. Without this tag the log mixes
+    // live-tick and resim-tick entries with no way to distinguish them — a misprediction
+    // can produce 3-30 PHYS-RIGIDPLAYER lines for the same tick number, all tagged
+    // identically, making it impossible to tell which corresponds to the body's real
+    // post-step state vs an intermediate resim state.
+    /// <summary>
+    /// Snapshot of the pre-step state and the impulse this tick's
+    /// <see cref="AdvancePhysics"/> queued into the body. Returned by AdvancePhysics
+    /// so the caller can hand it to <see cref="LogPostPhysics"/> after SpaceStep
+    /// completes and isolate "what Jolt applied during the step" from "what
+    /// AdvancePhysics applied before the step" in the post-step diagnostic.
+    /// </summary>
+    public struct AdvanceResult
+    {
+        public Vector3 PreVel;
+        public Vector3 QueuedImpulse;   // (deltaVel) if applied; plus the Y-component of a jump if it fired
+        public bool Jumped;
+    }
+
+    public static AdvanceResult AdvancePhysics(PredictionRigidbody3D predictionRb, CharacterInputMessage input, string phase = "live")
     {
         var body = predictionRb?.Body;
-        if (body == null) return;
+        if (body == null) return default;
 
         var move2D = new Vector2(input.MoveX, input.MoveY);
         float inputMagnitude = Mathf.Min(move2D.Length(), 1f);
@@ -101,16 +132,18 @@ public static class RigidPlayerPhysics
         Quaternion preRot = body.Quaternion;
         Vector3 preAngVel = body.AngularVelocity;
         var contacts = QueryContacts(body);
-        MonkeLogger.Debug($"[PHYS-RIGIDPLAYER] body={body.Name} input=({input}) desiredHoriz=({desiredHoriz.X:F3},{desiredHoriz.Z:F3}) deltaVel=({deltaVel.X:F3},{deltaVel.Z:F3}) prePos=({prePos.X:F3},{prePos.Y:F3},{prePos.Z:F3}) preVel=({preVel.X:F3},{preVel.Y:F3},{preVel.Z:F3}) preRot=({preRot.X:F3},{preRot.Y:F3},{preRot.Z:F3},{preRot.W:F3}) preAngVel=({preAngVel.X:F3},{preAngVel.Y:F3},{preAngVel.Z:F3}) contacts={contacts.Count} onGround={onGround} jumping={isJumping} walking={isWalking} sleeping={body.Sleeping}");
+        MonkeLogger.Debug($"[PHYS-RIGIDPLAYER] phase={phase} body={body.Name} input=({input}) desiredHoriz=({desiredHoriz.X:F3},{desiredHoriz.Z:F3}) deltaVel=({deltaVel.X:F3},{deltaVel.Z:F3}) prePos=({prePos.X:F3},{prePos.Y:F3},{prePos.Z:F3}) preVel=({preVel.X:F3},{preVel.Y:F3},{preVel.Z:F3}) preRot=({preRot.X:F3},{preRot.Y:F3},{preRot.Z:F3},{preRot.W:F3}) preAngVel=({preAngVel.X:F3},{preAngVel.Y:F3},{preAngVel.Z:F3}) preContacts={contacts.Count} onGround={onGround} jumping={isJumping} walking={isWalking} sleeping={body.Sleeping}");
         for (int i = 0; i < contacts.Count; i++)
         {
             var c = contacts[i];
-            MonkeLogger.Debug($"[PHYS-RIGIDPLAYER]   contact[{i}] collider={c.Name} at=({c.Position.X:F3},{c.Position.Y:F3},{c.Position.Z:F3})");
+            MonkeLogger.Debug($"[PHYS-RIGIDPLAYER]   preContact[{i}] collider={c.Name} at=({c.Position.X:F3},{c.Position.Y:F3},{c.Position.Z:F3})");
         }
 
+        Vector3 horizImpulse = new(deltaVel.X, 0, deltaVel.Z);
         if (deltaVel.LengthSquared() > 0)
-            predictionRb.AddImpulse(new Vector3(deltaVel.X, 0, deltaVel.Z) * body.Mass);
+            predictionRb.AddImpulse(horizImpulse * body.Mass);
 
+        bool jumped = false;
         if (isJumping && onGround)
         {
             // Jump: replace Y velocity outright so we don't compound an existing fall
@@ -119,9 +152,62 @@ public static class RigidPlayerPhysics
             Vector3 jumpVel = body.LinearVelocity;
             jumpVel.Y = JumpVelocity;
             predictionRb.SetLinearVelocity(jumpVel);
+            jumped = true;
         }
 
         predictionRb.Simulate();
+
+        // Effective velocity delta this tick queued by AdvancePhysics (before
+        // SpaceStep runs). For a non-jump tick this is the horizontal-only capped
+        // delta. For a jump tick the Y velocity was REPLACED (not added) — express
+        // that as a delta from preVel.Y so LogPostPhysics' "expected post = preVel
+        // + queuedImpulse + gravity*dt" formula remains correct.
+        Vector3 queuedImpulse = horizImpulse;
+        if (jumped) queuedImpulse.Y = JumpVelocity - preVel.Y;
+
+        return new AdvanceResult
+        {
+            PreVel = preVel,
+            QueuedImpulse = queuedImpulse,
+            Jumped = jumped,
+        };
+    }
+
+    // Post-step diagnostic. Call AFTER SpaceStep completes (so the body holds its
+    // post-step pose and velocity, and any Jolt-internal contact impulses have been
+    // resolved). Reports:
+    //   - post-step pos / vel / rot
+    //   - contact list at the post-step pose (what the body is touching now)
+    //   - "unexplained" velocity delta (post − expected) where expected = preVel +
+    //     (queued impulse / mass) + gravity*dt; anything beyond a small ULP-tolerance
+    //     here was applied by Jolt during the step itself, i.e. a contact response
+    //     (or wake impulse, or some other Jolt-internal effect).
+    //
+    // The combination of these is what disambiguates "the body collided with X
+    // during the step" from "AdvancePhysics applied a strange impulse". The
+    // pre-step contact list inside AdvancePhysics misses contacts that come into
+    // existence DURING the step (the player capsule moves into a cube at
+    // 5 m/s and the broadphase only flags it once the swept AABB crosses) —
+    // exactly the case at tick=943 of the user's 2026-05-19 18:48 session, where
+    // pre-step contacts=0 but the body's post-step velocity changed by 4 m/s
+    // along the contact normal.
+    public static void LogPostPhysics(RigidBody3D body, Vector3 preVel, Vector3 expectedImpulse, string phase = "live")
+    {
+        if (body == null) return;
+        Vector3 postPos = body.GlobalPosition;
+        Vector3 postVel = body.LinearVelocity;
+        Vector3 postAngVel = body.AngularVelocity;
+        // Expected post-step velocity assuming free-flight (impulse + gravity).
+        // Anything else in the residual is contact / Jolt-internal.
+        Vector3 expectedPost = preVel + expectedImpulse + new Vector3(0, -Gravity, 0) * TickDt;
+        Vector3 residual = postVel - expectedPost;
+        var contacts = QueryContacts(body);
+        MonkeLogger.Debug($"[PHYS-RIGIDPLAYER-POST] phase={phase} body={body.Name} postPos=({postPos.X:F3},{postPos.Y:F3},{postPos.Z:F3}) postVel=({postVel.X:F3},{postVel.Y:F3},{postVel.Z:F3}) postAngVel=({postAngVel.X:F3},{postAngVel.Y:F3},{postAngVel.Z:F3}) residualVel=({residual.X:F3},{residual.Y:F3},{residual.Z:F3}) |residual|={residual.Length():F3}m/s postContacts={contacts.Count}");
+        for (int i = 0; i < contacts.Count; i++)
+        {
+            var c = contacts[i];
+            MonkeLogger.Debug($"[PHYS-RIGIDPLAYER-POST]   postContact[{i}] collider={c.Name} at=({c.Position.X:F3},{c.Position.Y:F3},{c.Position.Z:F3})");
+        }
     }
 
     private struct ContactInfo

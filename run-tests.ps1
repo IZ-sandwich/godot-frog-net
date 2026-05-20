@@ -6,6 +6,12 @@ param(
     [Parameter(Position=0)]
     [string]$Test,
 
+    # Run inside a transient working-tree copy so multiple invocations can run
+    # in parallel without colliding on the shared `.godot/mono/temp/bin/Debug`
+    # build output dir, gdUnit4's per-assembly named pipe, or the `TestResults/`
+    # artifact dir. See tools/Invoke-TestInWorktree.ps1 for the why.
+    [switch]$Worktree,
+
     # Print usage and exit. -h is recognised as a short alias.
     [Alias('h')]
     [switch]$Help
@@ -13,7 +19,7 @@ param(
 
 if ($Help) {
     Write-Host @'
-Usage: run-tests.ps1 [<TestSelector>] [-Help]
+Usage: run-tests.ps1 [<TestSelector>] [-Worktree] [-Help]
 
 Runs the inner-loop test suite (everything EXCEPT MonkeNet.Tests.MultiProcess).
 The multi-process suite is excluded because each of its tests spawns separate
@@ -29,6 +35,15 @@ Arguments:
                  process test, name it explicitly here.
 
 Options:
+  -Worktree      Run inside a transient working-tree copy so multiple invocations
+                 can run in parallel. The copy lives in $env:TEMP, has its own
+                 .godot/ build output, its own TestResults/ artifact dir, and
+                 its own gdUnit4 pipe (per-PID dll filename). Uncommitted/
+                 untracked files ARE carried over. Artefacts are merged back
+                 into tests/TestResults/ (per-test-class subdirs); when two
+                 parallel runs target the same test class, the later writer
+                 wins. Safe to run in parallel with run-multiprocess-tests.ps1
+                 -Worktree.
   -Help, -h      Print this message and exit.
 
 Outputs:
@@ -52,6 +67,10 @@ Examples:
   run-tests.ps1 NetworkConditions
       Run every test whose name contains "NetworkConditions" (the whole
       NetworkConditionTests class).
+
+  run-tests.ps1 -Worktree ClockTests
+      Run ClockTests inside a transient worktree. Safe to run alongside
+      another test invocation in a separate terminal.
 '@
     exit 0
 }
@@ -74,6 +93,19 @@ if ($Test) {
     $filter = "FullyQualifiedName~$Test"
 } else {
     $filter = "FullyQualifiedName!~MonkeNet.Tests.MultiProcess"
+}
+
+# ── Worktree path ─────────────────────────────────────────────────────────
+# Delegate to the shared helper. Same isolation mechanism as
+# run-multiprocess-tests.ps1 -Worktree, just a different default filter.
+if ($Worktree) {
+    & (Join-Path $PSScriptRoot "tools\Invoke-TestInWorktree.ps1") `
+        -Filter $filter `
+        -StdoutLog "test-output.log" `
+        -StderrLog "test-error.log" `
+        -TimeoutMs 540000 `
+        -Scenario "inner"
+    exit $LASTEXITCODE
 }
 
 $proc = Start-Process -FilePath "dotnet" -ArgumentList "test tests/MonkeNetTests.csproj --logger console;verbosity=normal --filter $filter" -RedirectStandardOutput "test-output.log" -RedirectStandardError "test-error.log" -NoNewWindow -PassThru

@@ -188,17 +188,34 @@ public partial class ClientNetworkClock : InternalClientComponent
             return;
         }
 
-        // Steady-state offset smoothing. EWMA over the most recent samples;
-        // surfaced for telemetry via _averageOffsetInTicks. Sub-threshold
-        // offsets don't drive any local correction — the rollback / resim
-        // path absorbs the resulting input-timing variance (physics-sync
-        // libraries' standard approach; see Glenn Fiedler, Unity NfE,
-        // Photon Quantum). Above-threshold offsets fall through to the
-        // coarse-correction path above.
+        // Steady-state integer slew. Accumulate the EWMA-weighted offset
+        // and apply a single ±1 tick correction whenever the accumulator
+        // crosses unit magnitude. One tick (≈16.7 ms) is the smallest
+        // discrete step the local tick counter can take, so this is the
+        // most conservative correction shape possible — *not* the
+        // fractional clock-stretch (Option B) that was stripped earlier,
+        // which advanced _currentTick by a non-integer amount every
+        // physics frame and produced visible judder. The integer slew
+        // fires only when the smoothed offset has built up to a full
+        // tick and then drains by exactly one tick; under typical jitter
+        // it fires every few seconds, keeping the local clock within
+        // ±2 ticks of the server without per-frame motion artefacts.
+        //
+        // Above-threshold offsets (≥ _immediateCorrectionMinAbsTicks)
+        // take the coarse-snap path above; this path handles sub-
+        // threshold steady-state drift that the snap path would
+        // otherwise let accumulate until it crossed the threshold and
+        // produced a much larger 10+ tick step.
         _ewmaOffset = _ewmaOffset * (1f - _offsetEwmaAlpha) + immediateOffsetInTicks * _offsetEwmaAlpha;
+        if (System.Math.Abs(_ewmaOffset) >= 1f)
+        {
+            int slew = _ewmaOffset > 0f ? 1 : -1;
+            _lastOffset = slew;
+            _ewmaOffset -= slew;
+            _syncWindowsApplied++;
+        }
         _averageOffsetInTicks = (int)System.Math.Round(_ewmaOffset);
-        _syncWindowsApplied++;
-        MonkeLogger.Debug($"[CLOCK-EWMA] immediateOffset={immediateOffsetInTicks} ewmaOffset={_ewmaOffset:F3} avgLat={_averageLatencyInTicks} jitter={_jitterInTicks}");
+        MonkeLogger.Debug($"[CLOCK-EWMA] immediateOffset={immediateOffsetInTicks} ewmaOffset={_ewmaOffset:F3} pendingSlew={_lastOffset} avgLat={_averageLatencyInTicks} jitter={_jitterInTicks}");
 
         // Drop fast-start cadence once warm-up is done.
         if (_samplesReceived == _fastStartSampleCount && _timer != null)

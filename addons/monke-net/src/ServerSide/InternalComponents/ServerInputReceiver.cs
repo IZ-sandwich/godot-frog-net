@@ -171,10 +171,28 @@ public partial class ServerInputReceiver : InternalServerComponent
         int authority = serverEntity.Authority;
         _missedInputTotal.TryAdd(authority, 0);
         _missedInputWindow.TryAdd(authority, new Queue<bool>());
-        if (!received) _missedInputTotal[authority]++;
-        var window = _missedInputWindow[authority];
-        window.Enqueue(received);
-        if (window.Count > MissedInputWindowSize) window.Dequeue();
+        // Only count misses (both per-authority total and the rolling window
+        // used by ServerConnectionMonitor) for entities that have received
+        // at least one input from their owner. Before the first received,
+        // the entity exists on the server but the client hasn't started
+        // sending — that's not a real "missed input" event, it's just
+        // "input pipeline hasn't started yet". Without this gate, the
+        // multi-second pre-drive warm-up window at scenario start would
+        // dominate the M13 metric (S7 C0 traces show ~270 default events
+        // from tick 220-489 before the first input arrives at tick 490,
+        // entirely accounting for the ~30% M13 floor) and would also
+        // falsely trip the connection monitor's "client is lagging"
+        // detection. _lastReceivedTick is the right gate: it's only set
+        // in the received branch above, so its presence means "we have
+        // seen at least one fresh input from this entity".
+        bool hasEverReceived = _lastReceivedTick.ContainsKey(serverEntity);
+        if (hasEverReceived)
+        {
+            if (!received) _missedInputTotal[authority]++;
+            var window = _missedInputWindow[authority];
+            window.Enqueue(received);
+            if (window.Count > MissedInputWindowSize) window.Dequeue();
+        }
 
         return result;
     }

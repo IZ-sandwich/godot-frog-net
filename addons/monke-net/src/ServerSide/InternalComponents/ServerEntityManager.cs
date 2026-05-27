@@ -319,6 +319,24 @@ public partial class ServerEntityManager : InternalServerComponent
         }
         snapshot.Inputs = inputs.ToArray();
 
+        // Option C: stamp the per-client input-frontier signal so each
+        // client can detect engine-tick-rate drift relative to the server.
+        if (inputReceiver != null)
+        {
+            var frontierDict = inputReceiver.LastReceivedInputTickByClient;
+            var frontiers = new InputFrontier[frontierDict.Count];
+            int idx = 0;
+            foreach (var kv in frontierDict)
+            {
+                frontiers[idx++] = new InputFrontier
+                {
+                    ClientNetworkId = kv.Key,
+                    LastInputTick = kv.Value,
+                };
+            }
+            snapshot.InputFrontiers = frontiers;
+        }
+
         return snapshot;
     }
 

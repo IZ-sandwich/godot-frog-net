@@ -121,6 +121,18 @@ public struct GameSnapshotMessage : IPackableMessage
     /// prediction matches the server modulo cross-process Jolt drift.
     /// </summary>
     public EntityInput[] Inputs { get; set; }
+    /// <summary>
+    /// Option C clock-sync feedback: sparse map of (clientNetworkId, last
+    /// input-tick the server consumed from that client). Each client picks
+    /// its own entry, computes <c>lead = currentTick − lastInputTick</c>,
+    /// and adjusts its clock-stretch to keep <c>lead</c> in a target band.
+    /// Independent of RTT estimation, so it catches clock drift caused by
+    /// engine-tick-rate slowdown under physics load — exactly the bug the
+    /// ping-pong RTT measurement is blind to. Sparse because not every
+    /// client will have sent input by every snapshot (passive observers,
+    /// freshly-joined clients before their first input).
+    /// </summary>
+    public InputFrontier[] InputFrontiers { get; set; }
 
     public readonly void WriteBytes(MessageWriter writer)
     {
@@ -132,6 +144,10 @@ public struct GameSnapshotMessage : IPackableMessage
         var boxed = new IPackableMessage[inputs.Length];
         for (int i = 0; i < inputs.Length; i++) boxed[i] = inputs[i];
         writer.Write(boxed);
+        var frontiers = InputFrontiers ?? System.Array.Empty<InputFrontier>();
+        var boxedFrontiers = new IPackableMessage[frontiers.Length];
+        for (int i = 0; i < frontiers.Length; i++) boxedFrontiers[i] = frontiers[i];
+        writer.Write(boxedFrontiers);
     }
 
     public void ReadBytes(MessageReader reader)
@@ -139,7 +155,26 @@ public struct GameSnapshotMessage : IPackableMessage
         Tick = reader.ReadInt32();
         States = reader.ReadArray<IEntityStateData>();
         Inputs = reader.ReadArray<EntityInput>();
+        InputFrontiers = reader.ReadArray<InputFrontier>();
     }
+}
+
+/// <summary>Option C per-client input-frontier entry in a snapshot.</summary>
+public struct InputFrontier : IPackableElement
+{
+    public required int ClientNetworkId { get; set; }
+    public required int LastInputTick { get; set; }
+    public readonly void WriteBytes(MessageWriter writer)
+    {
+        writer.Write(ClientNetworkId);
+        writer.Write(LastInputTick);
+    }
+    public void ReadBytes(MessageReader reader)
+    {
+        ClientNetworkId = reader.ReadInt32();
+        LastInputTick = reader.ReadInt32();
+    }
+    public readonly IPackableElement GetCopy() => this;
 }
 
 /// <summary>

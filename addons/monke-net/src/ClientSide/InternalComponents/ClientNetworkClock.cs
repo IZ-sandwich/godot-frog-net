@@ -103,8 +103,13 @@ public partial class ClientNetworkClock : InternalClientComponent
 
     public void ProcessTick()
     {
-        _currentTick += 1 + _lastOffset;
-        _lastOffset = 0;
+        if (_lastOffset != 0)
+        {
+            _currentTick += 1 + _lastOffset;
+            _lastOffset = 0;
+            return;
+        }
+        _currentTick += 1;
     }
 
     public int GetCurrentTick()
@@ -144,24 +149,31 @@ public partial class ClientNetworkClock : InternalClientComponent
         _samplesReceived++;
         MonkeLogger.Debug($"[CLOCK-SYNC-RX] sample={_samplesReceived} rttMs={rttMsec} halfRttMs={_immediateLatencyMsec} halfRttTicks={immediateLatencyInTicks} srvTick={sync.ServerTime} cliTick={_currentTick} immediateOffset={immediateOffsetInTicks}");
 
-        // Min-RTT filter (NTP best-of-N): keep last _sampleSize latency samples
-        // and use the MINIMUM as the smoothed latency estimate. Network jitter
-        // only ADDS to one-way latency (it never subtracts below the underlying
-        // path RTT), so the minimum observation is the closest approximation of
-        // true latency. Replaces the previous "median-clipped mean" which
-        // accumulated integer-tick quantization noise into the latency
-        // estimate. Jitter is reported as (max − min) of the same window.
+        // Median-RTT filter (P50 of the last _sampleSize samples). Replaces
+        // the previous pure-min filter, which had a documented under-
+        // estimation bias on networks where OS scheduling jitter
+        // contributes significantly to the observed RTT (notably C0/C1
+        // where real network latency is near zero — the min picks the
+        // few "lucky" samples where everything aligned, while the mean
+        // delivery time is several ticks higher). Median captures the
+        // *typical* transit time, ignoring both occasional jitter spikes
+        // (which inflate (min+max)/2-style midrange estimators when a
+        // single spike persists in the sample window) and the unrealistic
+        // best-case that pure-min latches onto.
+        //
+        // jitter is reported as (max − min) of the same window so the
+        // existing forward-prediction lead computation in GetCurrentTick
+        // continues to budget for the full observed jitter range.
         _recentLatencies.Enqueue(immediateLatencyInTicks);
         while (_recentLatencies.Count > _sampleSize) _recentLatencies.Dequeue();
-        int minLatency = int.MaxValue, maxLatency = int.MinValue;
-        foreach (var l in _recentLatencies)
-        {
-            if (l < minLatency) minLatency = l;
-            if (l > maxLatency) maxLatency = l;
-        }
-        _averageLatencyInTicks = System.Math.Max(_minLatencyInTicks, minLatency);
+        var sorted = _recentLatencies.OrderBy(x => x).ToArray();
+        int minLatency = sorted[0];
+        int maxLatency = sorted[sorted.Length - 1];
+        int medianLatency = sorted[sorted.Length / 2];
+        // _averageLatencyInTicks = System.Math.Max(_minLatencyInTicks, minLatency);  // pre-Option-A baseline (pure min)
+        _averageLatencyInTicks = System.Math.Max(_minLatencyInTicks, medianLatency);
         _jitterInTicks = System.Math.Max(0, maxLatency - minLatency);
-        MonkeLogger.Debug($"[CLOCK-SYNC-STATE] window={_recentLatencies.Count} minLatTicks={minLatency} maxLatTicks={maxLatency} avgLatTicksUsed={_averageLatencyInTicks} jitterTicks={_jitterInTicks}");
+        MonkeLogger.Debug($"[CLOCK-SYNC-STATE] window={_recentLatencies.Count} minLatTicks={minLatency} medianLatTicks={medianLatency} maxLatTicks={maxLatency} avgLatTicksUsed={_averageLatencyInTicks} jitterTicks={_jitterInTicks}");
 
         // Photon-Fusion-2-style coarse correction: when a single sample
         // estimates a large clock offset, apply it IMMEDIATELY to _currentTick
@@ -176,21 +188,17 @@ public partial class ClientNetworkClock : InternalClientComponent
             return;
         }
 
-        // Steady-state slew: accumulate the EWMA-weighted offset and drain it
-        // at ±1 tick per sample. Mirror Networking uses an equivalent EWMA
-        // structure for NetworkTime; the Overwatch netcode talk (GDC 2017)
-        // recommends slew-only adjustment in steady state to avoid physics
-        // hitches that step corrections would cause. Apply at most one tick
-        // of correction per sample so the visible clock motion is smooth.
+        // Steady-state offset smoothing. EWMA over the most recent samples;
+        // surfaced for telemetry via _averageOffsetInTicks. Sub-threshold
+        // offsets don't drive any local correction — the rollback / resim
+        // path absorbs the resulting input-timing variance (physics-sync
+        // libraries' standard approach; see Glenn Fiedler, Unity NfE,
+        // Photon Quantum). Above-threshold offsets fall through to the
+        // coarse-correction path above.
         _ewmaOffset = _ewmaOffset * (1f - _offsetEwmaAlpha) + immediateOffsetInTicks * _offsetEwmaAlpha;
-        if (System.Math.Abs(_ewmaOffset) >= 1f)
-        {
-            int slew = _ewmaOffset > 0f ? 1 : -1;
-            _lastOffset = slew;
-            _ewmaOffset -= slew;
-            _syncWindowsApplied++;
-        }
         _averageOffsetInTicks = (int)System.Math.Round(_ewmaOffset);
+        _syncWindowsApplied++;
+        MonkeLogger.Debug($"[CLOCK-EWMA] immediateOffset={immediateOffsetInTicks} ewmaOffset={_ewmaOffset:F3} avgLat={_averageLatencyInTicks} jitter={_jitterInTicks}");
 
         // Drop fast-start cadence once warm-up is done.
         if (_samplesReceived == _fastStartSampleCount && _timer != null)

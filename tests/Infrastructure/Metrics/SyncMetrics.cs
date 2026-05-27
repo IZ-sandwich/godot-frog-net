@@ -22,6 +22,10 @@ namespace MonkeNet.Tests.Infrastructure.Metrics;
 ///   <item><b>M6 VisualSmoothRatio</b> — mean(|visual − auth|) ÷ mean(|body − auth|).</item>
 ///   <item><b>M7 PostRollbackConvergenceTicks P95</b> — ticks until post-correction error drops below 0.1 m.</item>
 ///   <item><b>M8 entity-count scaling</b> — recorded externally by comparing M5 across scenarios with different body counts.</item>
+///   <item><b>M9 MissedInputRate</b> — missed-input events ÷ observation ticks.</item>
+///   <item><b>M10 BandwidthKBps</b> — (sent + recv bytes) ÷ duration.</item>
+///   <item><b>M11 SnapToAuthRate</b> — snap-on-overflow events ÷ observation ticks. Distinct from M3 (mispredict rate): M3 measures prediction quality, M11 measures how often <c>MaxRollbackTicks</c> is binding.</item>
+///   <item><b>M13 ServerMissedInputRate</b> — server-side missed-input events ÷ observation ticks. Counts (tick × entity) pairs where the server ticked without a fresh stamped input from the owner and fell back to repeat-stale / default. Direct signal for the input-delay tuning loop (Option C).</item>
 /// </list>
 /// </para>
 /// </summary>
@@ -50,6 +54,8 @@ public sealed class SyncMetrics
     private readonly List<int> _postRollbackConvergenceTicks = new();
 
     private int _missedInputTotal = 0;
+    private int _snapToAuthTotal = 0;
+    private int _serverMissedInputTotal = 0;
     private long _bandwidthSentBytes = 0;
     private long _bandwidthRecvBytes = 0;
     private double _bandwidthDurationSeconds = 0;
@@ -128,6 +134,26 @@ public sealed class SyncMetrics
     /// the wire chatter low — pulled once per cell.</summary>
     public void SetMissedInputTotal(int total) => _missedInputTotal = total;
 
+    /// <summary>Set the cumulative snap-to-auth count read from the client at
+    /// the end of the scenario. M11 counts snapshots that arrived too old to
+    /// resim (depth &gt; MaxRollbackTicks) and were corrected by teleport-snap
+    /// instead. Semantically distinct from M3 (rollback mispredicts): M3
+    /// measures prediction quality, M11 measures how often the cap is binding.</summary>
+    public void SetSnapToAuthTotal(int total) => _snapToAuthTotal = total;
+
+    /// <summary>Set the cumulative server-side missed-input count read from
+    /// the server at the end of the scenario. M13 counts (tick × entity)
+    /// events where the server consumed an input but no fresh
+    /// client-stamped input was queued — server fell back to repeat-stale
+    /// or default. Distinct from M9 (client-side prediction replay missed
+    /// an input in snapshot history): M9 is a replay-time event at the
+    /// client; M13 is an apply-time event at the server. Non-zero means
+    /// inputs aren't arriving at the server in time for it to apply them
+    /// at the stamped tick — usually a sign that <see cref="ClientInputManager.InputDelayTicks"/>
+    /// is too low relative to current network jitter, or the client is
+    /// not sending inputs at the server's tick rate.</summary>
+    public void SetServerMissedInputTotal(int total) => _serverMissedInputTotal = total;
+
     /// <summary>Record one bandwidth-stats sample. <paramref name="durationSeconds"/>
     /// is the elapsed time since the previous sample (used to compute the rate).
     /// Pushed by the runner at fixed intervals during the observation window.</summary>
@@ -165,6 +191,8 @@ public sealed class SyncMetrics
             M10_BandwidthKBps = _bandwidthDurationSeconds <= 0
                 ? 0f
                 : (float)((_bandwidthSentBytes + _bandwidthRecvBytes) / 1024.0 / _bandwidthDurationSeconds),
+            M11_SnapToAuthRatePct = SafeRate(_snapToAuthTotal),
+            M13_ServerMissedInputRatePct = SafeRate(_serverMissedInputTotal),
             ObservationTicks = _observationTicks,
             SampleCount = _positionErrors.Count,
         };
@@ -242,6 +270,8 @@ public sealed class SyncMetrics
         public float M7_PostRollbackConvergenceP95;
         public float M9_MissedInputRatePct;
         public float M10_BandwidthKBps;
+        public float M11_SnapToAuthRatePct;
+        public float M13_ServerMissedInputRatePct;
         public long ObservationTicks;
         public int SampleCount;
     }

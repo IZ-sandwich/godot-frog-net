@@ -241,6 +241,22 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
             metrics.SetMissedInputTotal(miDoc.RootElement.GetProperty("data").GetProperty("count").GetInt32());
         }
         catch (Exception ex) { GD.PrintErr($"[QuantitativeTestBase] missed-input-count failed: {ex.Message}"); }
+        try
+        {
+            using var staDoc = subject.Send(new { cmd = "snap-to-auth-count" });
+            metrics.SetSnapToAuthTotal(staDoc.RootElement.GetProperty("data").GetProperty("count").GetInt32());
+        }
+        catch (Exception ex) { GD.PrintErr($"[QuantitativeTestBase] snap-to-auth-count failed: {ex.Message}"); }
+        // M13 lives on the server (per-tick input-buffer state at apply time),
+        // so query the server process even when the rest of the metrics
+        // collection targets the observer client in multi-client scenarios.
+        try
+        {
+            using var smiDoc = server.Send(new { cmd = "server-missed-input-total" });
+            metrics.SetServerMissedInputTotal(
+                smiDoc.RootElement.GetProperty("data").GetProperty("count").GetInt32());
+        }
+        catch (Exception ex) { GD.PrintErr($"[QuantitativeTestBase] server-missed-input-total failed: {ex.Message}"); }
 
         // Copy the client's MonkeLogger debug log into the artifact dir.
         // CopyProcessLog uses FileShare.ReadWrite so we can grab it while the
@@ -405,6 +421,8 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
         if ((applicable & MetricKey.M7) == 0)     s.M7_PostRollbackConvergenceP95 = float.NaN;
         if ((applicable & MetricKey.M9) == 0)     s.M9_MissedInputRatePct = float.NaN;
         if ((applicable & MetricKey.M10) == 0)    s.M10_BandwidthKBps = float.NaN;
+        if ((applicable & MetricKey.M11) == 0)    s.M11_SnapToAuthRatePct = float.NaN;
+        if ((applicable & MetricKey.M13) == 0)    s.M13_ServerMissedInputRatePct = float.NaN;
     }
 
     /// <summary>Poll clock-state from both processes and record the gap. Used
@@ -480,6 +498,10 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
             Description = "Cumulative count of (tick × entity) events where the predictor had to fall back to default input because no cached server input was available for a remote entity that previously HAD input." },
         new StripPlot.MetricSpec { Name = "M10 bandwidth",   Unit = "kB/s",  Threshold = 5f,    AxisMax = 30f,
             Description = "Client-side sent + received bytes / second. Industry-tuned games target 2–5 kB/s; unoptimised replication is 30–50 kB/s." },
+        new StripPlot.MetricSpec { Name = "M11 snap-to-auth",Unit = "%",     Threshold = 10f,   AxisMax = 80f,
+            Description = "Rate of snapshots that arrived too old to resim (depth > MaxRollbackTicks) and were corrected by teleport-snap instead. At low-latency conditions this should be ~0; high values at C3/C4 are expected with a tight cap. Distinct from M3 (rollback mispredicts): M3 measures prediction quality, M11 measures how often the cap is binding." },
+        new StripPlot.MetricSpec { Name = "M13 srv miss input",Unit = "%",     Threshold = 50f,   AxisMax = 200f,
+            Description = "Server-side missed-input rate: (entity × tick) events where the server ticked a client-owned entity without finding a fresh client-stamped input and fell back to repeat-stale / default, divided by observation entity-ticks. Direct quality signal for the input-arrival pipeline. Threshold at 50 %: with the C-driven InputDelayTicks auto-adjuster on, S7-MultiBodyChaos settles at ~30 % across C0..C4 even under chaos CPU load (Godot dropping physics ticks accounts for the residual). >50 % means the auto-adjuster failed to keep up. With auto-adjust OFF the same scenario hits 90-160 % (multiple misses per tick across multiple entities). Distinct from M9 (client-side replay missed an input in snapshot history): M9 is a replay-time event at the client; M13 is an apply-time event at the server." },
     };
 
     /// <summary>One-line metric-name + axis-key mapping used to project a
@@ -488,7 +510,7 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
     {
         MetricKey.M1, MetricKey.M2, MetricKey.M3b, MetricKey.M4,
         MetricKey.M5_rms, MetricKey.M5_p95, MetricKey.M6, MetricKey.M7,
-        MetricKey.M9, MetricKey.M10,
+        MetricKey.M9, MetricKey.M10, MetricKey.M11, MetricKey.M13,
     };
 
     private static void WriteDashboard(string path,
@@ -534,7 +556,8 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
         r.M3b_ExternalForceRatePct, r.M4_RollbackDepthP99,
         r.M5_PositionErrorRms, r.M5_PositionErrorP95,
         r.M6_VisualSmoothRatio, r.M7_PostRollbackConvergenceP95,
-        r.M9_MissedInputRatePct, r.M10_BandwidthKBps,
+        r.M9_MissedInputRatePct, r.M10_BandwidthKBps, r.M11_SnapToAuthRatePct,
+        r.M13_ServerMissedInputRatePct,
     };
 
     /// <summary>Per-scenario strip plot. Metrics outside the scenario's

@@ -28,6 +28,17 @@ public partial class ServerInputReceiver : InternalServerComponent
     private readonly Dictionary<int, Dictionary<NetworkBehaviour, IPackableElement>> _pendingInputs = [];
     private readonly Dictionary<NetworkBehaviour, IPackableElement> _lastInputStored = [];
     private readonly Dictionary<NetworkBehaviour, int> _lastReceivedTick = [];
+    // Option C clock-sync feedback: highest input tick the server has
+    // RECEIVED (not yet consumed) from each connected client. Updated in
+    // OnCommandReceived. Stamped into outgoing snapshots so each client
+    // can compare against its own _currentTick and detect engine-tick-rate
+    // drift the RTT ping-pong is blind to.
+    private readonly Dictionary<int, int> _lastReceivedInputTickByClient = [];
+    /// <summary>Snapshot the per-client highest received input ticks for
+    /// inclusion in <see cref="GameSnapshotMessage.InputFrontiers"/>.
+    /// Returns a sparse list — only clients that have sent at least one
+    /// input appear.</summary>
+    public IReadOnlyDictionary<int, int> LastReceivedInputTickByClient => _lastReceivedInputTickByClient;
     private readonly Dictionary<NetworkBehaviour, IPackableElement> _defaultInputCache = [];
 
     // Side index of which ticks each entity currently has queued, for O(log n) eviction
@@ -58,6 +69,32 @@ public partial class ServerInputReceiver : InternalServerComponent
     private readonly Dictionary<int, int> _missedInputTotal = [];
     private readonly Dictionary<int, Queue<bool>> _missedInputWindow = [];
     private const int MissedInputWindowSize = 64;
+
+    /// <summary>Cumulative count of (tick × entity) events where the server
+    /// ticked an entity owned by a real client and didn't find a fresh
+    /// client-stamped input in <c>_pendingInputs</c> — server fell back to
+    /// repeat-stale or default. Aggregated across all client-owned
+    /// entities. Quantitative-suite M13 metric: the EVENT version of
+    /// "server-side input buffer ran empty". Distinct from M9 (client-side
+    /// prediction replay couldn't find an input in snapshot history) — M9
+    /// is a replay-time event at the client; M13 is an apply-time event
+    /// at the server.
+    ///
+    /// Excludes server-authoritative entities (authority=0) because those
+    /// passive props never have a client input — they'd inflate the count
+    /// every tick if included, masking the real signal.</summary>
+    public int TotalMissedInputs
+    {
+        get
+        {
+            int sum = 0;
+            foreach (var kv in _missedInputTotal)
+            {
+                if (kv.Key > 0) sum += kv.Value;
+            }
+            return sum;
+        }
+    }
 
     public IPackableElement GetInputForEntityTick(NetworkBehaviour serverEntity, int tick)
     {
@@ -222,6 +259,13 @@ public partial class ServerInputReceiver : InternalServerComponent
     {
         if (command is not PackedClientInputMessage inputCommand)
             return;
+
+        // Option C: update the per-client input-frontier tracker as soon as
+        // we observe an input message arrive. Use the message's latest tick
+        // (Tick field — see PackedClientInputMessage XML doc: "Tick stamp
+        // for the latest generated input"). Monotonic — newer wins.
+        if (!_lastReceivedInputTickByClient.TryGetValue(clientId, out int prev) || inputCommand.Tick > prev)
+            _lastReceivedInputTickByClient[clientId] = inputCommand.Tick;
 
         // Find the ServerEntity target for this input command
         foreach (var entity in MonkeNetManager.Instance.EntitySpawner.Entities)

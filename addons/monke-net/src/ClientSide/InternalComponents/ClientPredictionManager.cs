@@ -102,6 +102,15 @@ public partial class ClientPredictionManager : InternalClientComponent
     /// keep up with the client's prediction tick.</summary>
     public int MissedInputCount => _missedInputCount;
     private int _missedInputCount = 0;
+    /// <summary>Cumulative count of snapshots that arrived too old for a forward
+    /// resim (depth &gt; <see cref="MaxRollbackTicks"/>) and were corrected by
+    /// teleport-snap via <see cref="SnapToAuthOverflow"/> instead. Quantitative-
+    /// suite M11 metric — distinguishes "predictions were wrong" (M3) from
+    /// "couldn't run a resim, snapped instead". High values at C3/C4 are
+    /// expected with a tight cap; high values at C0/C1 indicate the cap is
+    /// binding more often than it should.</summary>
+    public int SnapToAuthCount => _snapOverflowCount;
+
     // Set of entity ids for which the server has reported at least one input.
     // Used by ResolveRemoteInput to gate the missed-input counter so that
     // server-owned passive props (which never have input) do not inflate the
@@ -223,7 +232,39 @@ public partial class ClientPredictionManager : InternalClientComponent
                 int curTick = ClientManager.Instance?.GetNodeOrNull<ClientNetworkClock>("ClientNetworkClock")?.GetCurrentTick() ?? -1;
                 int depth = curTick - snapshot.Tick;
                 int rawAge = rawTick - snapshot.Tick;
-                MonkeLogger.Debug($"[NET-SNAP-RX] tick={snapshot.Tick} entities={snapshot.States.Length} (last={_lastTickReceived}) | curTick={curTick} rawTick={rawTick} rawAge={rawAge} avgLat={avgLat} jitter={jitter} depth={depth}");
+                MonkeLogger.Debug($"[NET-SNAP-RX] tick={snapshot.Tick} entities={snapshot.States.Length} (last={_lastTickReceived}) | curTick={curTick} rawTick={rawTick} rawAge={rawAge} avgLat={avgLat} jitter={jitter} depth={depth} bias={avgLat - rawAge}");
+
+                // Option C: extract the server's view of this client's
+                // input-buffer depth and forward it to ClientInputManager.
+                // The signal is bufferDepth = LastInputTick − snapshot.Tick
+                // = how many ticks of input the server has queued AHEAD of
+                // the tick it just simulated. Big bufferDepth means lots
+                // of safety against jitter (and lots of input lag); small
+                // means the server is close to starving on our inputs.
+                //
+                // The right actuator for this signal in a physics-sync
+                // system is the per-client input delay (the GGPO/Quantum-
+                // style InputOffset), NOT the local simulation clock — the
+                // simulation clock controls "how far the client predicts
+                // ahead" and stretching it produces visible judder on every
+                // predicted entity. See ClientInputManager.OnServerInputBufferReport
+                // for the adjustment logic and the rationale for why
+                // InputDelayTicks is the correct knob.
+                if (snapshot.InputFrontiers != null && snapshot.InputFrontiers.Length > 0)
+                {
+                    int myId = ClientManager.Instance?.GetNetworkId() ?? -1;
+                    foreach (var frontier in snapshot.InputFrontiers)
+                    {
+                        if (frontier.ClientNetworkId != myId) continue;
+                        if (frontier.LastInputTick > 0)
+                        {
+                            int bufferDepth = frontier.LastInputTick - snapshot.Tick;
+                            var inputMgr = ClientManager.Instance?.GetNodeOrNull<ClientInputManager>("ClientInputManager");
+                            inputMgr?.OnServerInputBufferReport(bufferDepth, jitter);
+                        }
+                        break;
+                    }
+                }
                 for (int i = 0; i < snapshot.States.Length; i++)
                     MonkeLogger.Debug($"[NET-SNAP-RX]   state[{i}]={snapshot.States[i]}");
                 _lastTickReceived = snapshot.Tick;
@@ -503,14 +544,18 @@ public partial class ClientPredictionManager : InternalClientComponent
             int oldestKeptTick = _predictedStates.Count > 0
                 ? _predictedStates[0].Tick
                 : int.MaxValue;
+            int newestKeptTick = _predictedStates.Count > 0
+                ? _predictedStates[_predictedStates.Count - 1].Tick
+                : int.MinValue;
             if (receivedSnapshot.Tick < oldestKeptTick)
             {
+                MonkeLogger.Debug($"[PRED-SNAP-DECISION] tick={receivedSnapshot.Tick} bufSize={_predictedStates.Count} oldest={oldestKeptTick} newest={newestKeptTick} -> SNAP-OVERFLOW");
                 SnapToAuthOverflow(receivedSnapshot);
                 return;
             }
 
             _missedLocalState++;
-            MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} MISSED-LOCAL-STATE (no matching predicted entry; total missed={_missedLocalState})");
+            MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} MISSED-LOCAL-STATE (no matching predicted entry; total missed={_missedLocalState}) bufSize={_predictedStates.Count} oldest={oldestKeptTick} newest={newestKeptTick}");
             return;
         }
 

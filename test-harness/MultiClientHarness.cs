@@ -476,6 +476,8 @@ public partial class MultiClientHarness : Node
                 "mispredict-classification-counts" => MispredictClassificationCounts(),
                 "rollback-depth-sample" => RollbackDepthSample(),
                 "missed-input-count" => MissedInputCount(),
+                "snap-to-auth-count" => SnapToAuthCount(),
+                "server-missed-input-total" => ServerMissedInputTotal(),
                 "bandwidth-stats" => BandwidthStats(),
                 "server-peer-count" => ServerPeerCount(),
                 "pending-reclaim-for" => PendingReclaimFor(doc.RootElement),
@@ -1092,6 +1094,31 @@ public partial class MultiClientHarness : Node
         if (cm == null) return Ok(new { count = 0 });
         var pm = FindChildOfType<ClientPredictionManager>(cm);
         return Ok(new { count = pm?.MissedInputCount ?? 0 });
+    }
+
+    // Cumulative count of snapshots that arrived too old to resim (depth >
+    // MaxRollbackTicks) and were corrected by teleport-snap instead.
+    // Quantitative-suite M11 metric.
+    private string SnapToAuthCount()
+    {
+        if (_role != "client") return Err("snap-to-auth-count is client-only");
+        var cm = ClientManager.Instance;
+        if (cm == null) return Ok(new { count = 0 });
+        var pm = FindChildOfType<ClientPredictionManager>(cm);
+        return Ok(new { count = pm?.SnapToAuthCount ?? 0 });
+    }
+
+    // Aggregate count of server-side missed-input events. Each event is one
+    // (tick × entity) where the server consumed an input but no
+    // fresh client-stamped input was in _pendingInputs — server fell back
+    // to repeat-stale or default. Quantitative-suite M13 metric.
+    private string ServerMissedInputTotal()
+    {
+        if (_role != "server") return Err("server-missed-input-total is server-only");
+        var sm = ServerManager.Instance;
+        if (sm == null) return Ok(new { count = 0 });
+        var receiver = FindChildOfType<ServerInputReceiver>(sm);
+        return Ok(new { count = receiver?.TotalMissedInputs ?? 0 });
     }
 
     // Cumulative bandwidth counters (sent and received bytes/packets) since

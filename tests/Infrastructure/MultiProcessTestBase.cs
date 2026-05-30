@@ -157,10 +157,15 @@ public abstract class MultiProcessTestBase
             observerVideo = System.IO.Path.Combine(paths.Directory, label + ".observer.mp4");
         }
 
+        // Defer recorder construction until after clock-sync so the captured
+        // MP4 doesn't include the cold-start convergence window — mirrors the
+        // pattern used by QuantitativeTestBase.RunOneCell.
         var client   = Orch.Spawn("client", enetPort: port, label: "c1",
-            recordVideoPath: clientVideo, scenePath: scenePath);
+            recordVideoPath: clientVideo, scenePath: scenePath,
+            deferVideoStart: clientVideo != null);
         var observer = Orch.Spawn("client", enetPort: port, label: "observer",
-            recordVideoPath: observerVideo, scenePath: scenePath);
+            recordVideoPath: observerVideo, scenePath: scenePath,
+            deferVideoStart: observerVideo != null);
         client.WaitReady(networkReady: true, timeoutMs: 30_000);
         observer.WaitReady(networkReady: true, timeoutMs: 30_000);
 
@@ -168,8 +173,13 @@ public abstract class MultiProcessTestBase
         ClientLogPath = client.RemoteLogPath;
         ObserverLogPath = observer.RemoteLogPath;
 
-        WaitForClockSync(server, client,   maxGapTicks: 5, timeoutMs: 5_000);
-        WaitForClockSync(server, observer, maxGapTicks: 5, timeoutMs: 5_000);
+        WaitForClockSync(server, client);
+        WaitForClockSync(server, observer);
+
+        // Clocks are converged — start recording now so the MP4 begins just
+        // before the scenario's first entity spawn instead of during warm-up.
+        StartDeferredRecording(client, clientVideo);
+        StartDeferredRecording(observer, observerVideo);
 
         int clientNetId = client.NetworkId;
         AssertThat(clientNetId).OverrideFailureMessage("client must have a non-zero ENet peer id").IsNotEqual(0);
@@ -219,7 +229,11 @@ public abstract class MultiProcessTestBase
             videoPath = paths.Mp4;
         }
 
-        var client = Orch.Spawn("client", enetPort: port, label: "c1", recordVideoPath: videoPath);
+        // Defer recorder construction until after clock-sync so the captured
+        // MP4 doesn't include the cold-start convergence window — mirrors the
+        // pattern used by QuantitativeTestBase.RunOneCell.
+        var client = Orch.Spawn("client", enetPort: port, label: "c1",
+            recordVideoPath: videoPath, deferVideoStart: videoPath != null);
         client.WaitReady(networkReady: true, timeoutMs: 30_000);
 
         ServerLogPath = server.RemoteLogPath;
@@ -232,7 +246,11 @@ public abstract class MultiProcessTestBase
         // averaged clock-sync window and the client renders entities at stale
         // tick offsets, inflating measured misprediction counts for reasons
         // unrelated to physics.
-        WaitForClockSync(server, client, maxGapTicks: 5, timeoutMs: 5_000);
+        WaitForClockSync(server, client);
+
+        // Clocks are converged — start recording now so the MP4 begins just
+        // before the scenario's first entity spawn instead of during warm-up.
+        StartDeferredRecording(client, videoPath);
 
         int clientNetId = client.NetworkId;
         AssertThat(clientNetId).OverrideFailureMessage("client must have a non-zero ENet peer id").IsNotEqual(0);
@@ -255,12 +273,41 @@ public abstract class MultiProcessTestBase
         catch { /* harness too old for this cmd; ignore */ }
     }
 
+    /// <summary>Kick the deferred video recorder on a client that was spawned
+    /// with <c>deferVideoStart=true</c>. Called immediately after
+    /// <see cref="WaitForClockSync"/> so the MP4 starts just before the
+    /// scenario's first entity spawn instead of during clock-sync warm-up.
+    /// No-op when <paramref name="videoPath"/> is null (the client wasn't
+    /// recording) or when the harness is too old to know the command.</summary>
+    protected static void StartDeferredRecording(TestProcess proc, string videoPath)
+    {
+        if (string.IsNullOrEmpty(videoPath)) return;
+        try { using var _ = proc.Send(new { cmd = "start-recording" }); }
+        catch (Exception ex)
+        {
+            Godot.GD.PrintErr($"[MultiProcessTestBase] start-recording failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Default <c>WaitForClockSync</c> max gap, matching the
+    /// quantitative-suite's canonical C0 baseline tolerance.</summary>
+    public const int DefaultClockSyncMaxGapTicks = 5;
+    /// <summary>Default <c>WaitForClockSync</c> timeout, matching
+    /// <c>NetworkCondition.C0_Baseline.ClockSyncTimeoutMs</c> — the per-condition
+    /// budget sized at ~p99 × 1.5 of cold-start convergence under zero latency /
+    /// jitter / loss. Tests running over a UDP relay with conditions injected
+    /// should pass the matching condition's <c>ClockSyncTimeoutMs</c> explicitly
+    /// instead of using this default.</summary>
+    public const int DefaultClockSyncTimeoutMs = 750;
+
     /// <summary>Polls both processes' clock-state until the absolute gap
     /// (clientSyncedTick − serverTick − latency) is within budget. Establishes
     /// a synced clock before the test starts spawning entities so the trace
-    /// measures physics misprediction, not "client clock catching up to server".</summary>
+    /// measures physics misprediction, not "client clock catching up to server".
+    /// Defaults match the quantitative-suite C0 baseline cell.</summary>
     protected static void WaitForClockSync(TestProcess server, TestProcess client,
-        int maxGapTicks, int timeoutMs)
+        int maxGapTicks = DefaultClockSyncMaxGapTicks,
+        int timeoutMs   = DefaultClockSyncTimeoutMs)
     {
         var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
         int lastGap = int.MinValue;

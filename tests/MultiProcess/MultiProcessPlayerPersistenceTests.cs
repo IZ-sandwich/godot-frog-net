@@ -229,16 +229,22 @@ public class MultiProcessPlayerPersistenceTests : MultiProcessTestBase
         steps.Log($"server ready, pid={server.RemotePid}");
 
         steps.Log("spawning clientA + clientB (windowed, recording video)");
-        var clientA = Orch.Spawn("client", enetPort: port, label: "cA", recordVideoPath: videoA);
-        var clientB = Orch.Spawn("client", enetPort: port, label: "cB", recordVideoPath: videoB);
+        var clientA = Orch.Spawn("client", enetPort: port, label: "cA",
+            recordVideoPath: videoA, deferVideoStart: true);
+        var clientB = Orch.Spawn("client", enetPort: port, label: "cB",
+            recordVideoPath: videoB, deferVideoStart: true);
         clientA.WaitReady(networkReady: true, timeoutMs: 30_000);
         clientB.WaitReady(networkReady: true, timeoutMs: 30_000);
         steps.Log($"clientA ready, netId={clientA.NetworkId}, pid={clientA.RemotePid}");
         steps.Log($"clientB ready, netId={clientB.NetworkId}, pid={clientB.RemotePid}");
 
-        WaitForClockSync(server, clientA, maxGapTicks: 5, timeoutMs: 5_000);
-        WaitForClockSync(server, clientB, maxGapTicks: 5, timeoutMs: 5_000);
+        WaitForClockSync(server, clientA);
+        WaitForClockSync(server, clientB);
         steps.Log("both client clocks converged to within ±5 ticks of server");
+
+        // Clocks converged — start recording now so the MP4 skips the warm-up.
+        StartDeferredRecording(clientA, videoA);
+        StartDeferredRecording(clientB, videoB);
 
         server.WaitForTicks(SnapshotArmTicks);
 
@@ -401,8 +407,8 @@ public class MultiProcessPlayerPersistenceTests : MultiProcessTestBase
 
         clientA.WaitReady(networkReady: true, timeoutMs: 30_000);
         clientB.WaitReady(networkReady: true, timeoutMs: 30_000);
-        WaitForClockSync(server, clientA, maxGapTicks: 5, timeoutMs: 5_000);
-        WaitForClockSync(server, clientB, maxGapTicks: 5, timeoutMs: 5_000);
+        WaitForClockSync(server, clientA);
+        WaitForClockSync(server, clientB);
         server.WaitForTicks(ReconnectSettleTicks);
         steps.Log("reconnect handshake complete, clocks resynced");
 

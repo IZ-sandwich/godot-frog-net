@@ -157,6 +157,14 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
             scenario.SetObserver(observer);
         }
 
+        // T1 per-prop tier icons. Bypasses SpawnTriad's default-on path
+        // because RunOneCell hand-rolls the spawn lifecycle for per-cell
+        // recorder + relay handling. Recorded MP4s for prop-heavy scenarios
+        // (S4, S7) show R/I glyphs so a reader can correlate misprediction
+        // events with contact-upgrade timing without grepping logs.
+        EnableTierIcons(client);
+        if (observer != null) EnableTierIcons(observer);
+
         var metrics = new SyncMetrics();
 
         // Sample clock-sync convergence aggressively for ~5 seconds — but only

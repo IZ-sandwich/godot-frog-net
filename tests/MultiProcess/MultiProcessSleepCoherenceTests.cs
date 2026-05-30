@@ -75,7 +75,13 @@ public class MultiProcessSleepCoherenceTests : MultiProcessTestBase
         // bounces once or twice, and comes to rest. Default cube friction/damping
         // — we explicitly want to test the standard sleep behaviour, NOT an
         // ice-puck override.
-        int cubeEid = SpawnEntity(server, EntityTypeCube, authority: 0, 0f, 1.0f, 0f);
+        // "resim-only" metadata forces LocalRigidPropPrediction into
+        // AlwaysPredict policy → BaseTier=Resim, body stays dynamic instead
+        // of becoming kinematic. This test reads RigidBody3D.Sleeping on the
+        // client, and Jolt's auto-sleep only runs on dynamic bodies — a
+        // kinematic (Interpolate-tier) body never reports Sleeping=true
+        // because there's no simulation-side sleep to be in.
+        int cubeEid = SpawnEntity(server, EntityTypeCube, authority: 0, 0f, 1.0f, 0f, metadata: "resim-only");
         WaitForClientEntity(client, cubeEid, timeoutMs: 5_000);
 
         Godot.GD.Print("[MP-SLEEP-COHERENCE] sleep config: " +
@@ -188,7 +194,10 @@ public class MultiProcessSleepCoherenceTests : MultiProcessTestBase
         for (int i = 0; i < TowerCubeCount; i++)
         {
             float y = TowerBaseY + i * CubeSpacingY;
-            int eid = SpawnEntity(server, EntityTypeCube, authority: 0, 0f, y, 0f);
+            // See sibling test for the "resim-only" metadata rationale —
+            // forces the cubes to dynamic (non-kinematic) so Jolt's
+            // auto-sleep drives RigidBody3D.Sleeping the way the test reads it.
+            int eid = SpawnEntity(server, EntityTypeCube, authority: 0, 0f, y, 0f, metadata: "resim-only");
             cubeEids.Add(eid);
             WaitForClientEntity(client, eid, timeoutMs: 5_000);
         }

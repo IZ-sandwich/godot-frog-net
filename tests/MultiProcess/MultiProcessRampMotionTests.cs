@@ -148,18 +148,22 @@ public class MultiProcessRampMotionTests : MultiProcessTestBase
         string observerVideoPath = System.IO.Path.Combine(paths.Directory, label + ".observer.mp4");
         steps.Log("spawning client A (actor, records video)");
         var clientA = Orch.Spawn("client", enetPort: port, label: "cA",
-            recordVideoPath: paths.Mp4, scenePath: TestArenaScene);
+            recordVideoPath: paths.Mp4, scenePath: TestArenaScene, deferVideoStart: true);
         steps.Log("spawning client B (observer, records video)");
         var clientB = Orch.Spawn("client", enetPort: port, label: "cB",
-            recordVideoPath: observerVideoPath, scenePath: TestArenaScene);
+            recordVideoPath: observerVideoPath, scenePath: TestArenaScene, deferVideoStart: true);
         clientA.WaitReady(networkReady: true, timeoutMs: 30_000);
         clientB.WaitReady(networkReady: true, timeoutMs: 30_000);
         ClientLogPath = clientA.RemoteLogPath;
         steps.Log($"clients ready: A.netId={clientA.NetworkId} B.netId={clientB.NetworkId}");
 
-        WaitForClockSync(server, clientA, maxGapTicks: 5, timeoutMs: 5_000);
-        WaitForClockSync(server, clientB, maxGapTicks: 5, timeoutMs: 5_000);
+        WaitForClockSync(server, clientA);
+        WaitForClockSync(server, clientB);
         steps.Log("clocks synced");
+
+        // Clocks converged — start recording now so the MP4 skips the warm-up.
+        StartDeferredRecording(clientA, paths.Mp4);
+        StartDeferredRecording(clientB, observerVideoPath);
 
         server.WaitForTicks(SnapshotArmTicks);
 

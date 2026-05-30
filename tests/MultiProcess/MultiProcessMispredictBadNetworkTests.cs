@@ -114,10 +114,12 @@ public class MultiProcessMispredictBadNetworkTests : MultiProcessTestBase
         // budget is bumped because conditioned-up RTTs (300 ms + jitter + a few
         // dropped retries) can blow past the 30 s default before the ENet
         // handshake completes. 60 s matches QuantitativeTestBase.RunOneCell.
+        // Defer recorder construction so the MP4 doesn't capture the ~15 s
+        // bad-network clock-sync window — mirrors QuantitativeTestBase.
         var client   = Orch.Spawn("client", enetPort: relay.ListenPort, label: "c1",
-            recordVideoPath: clientVideo);
+            recordVideoPath: clientVideo, deferVideoStart: true);
         var observer = Orch.Spawn("client", enetPort: relay.ListenPort, label: "observer",
-            recordVideoPath: observerVideo);
+            recordVideoPath: observerVideo, deferVideoStart: true);
         client.WaitReady(networkReady: true, timeoutMs: 60_000);
         observer.WaitReady(networkReady: true, timeoutMs: 60_000);
 
@@ -125,14 +127,16 @@ public class MultiProcessMispredictBadNetworkTests : MultiProcessTestBase
         ClientLogPath = client.RemoteLogPath;
         ObserverLogPath = observer.RemoteLogPath;
 
-        // Larger clock-sync tolerance under bad network: jitter alone makes
-        // the steady-state gap noisier than the baseline ±5 ticks the in-LAN
-        // SpawnTriad uses. ±12 ticks (200 ms at 60 Hz) accommodates the
-        // condition's nominal latency + jitter without false-failing the
-        // sync wait. Timeout extended to 15 s so the 11-sample averaging
-        // window has time to populate under loss.
-        WaitForClockSync(server, client,   maxGapTicks: 12, timeoutMs: 15_000);
-        WaitForClockSync(server, observer, maxGapTicks: 12, timeoutMs: 15_000);
+        // Match QuantitativeTestBase: canonical ±5-tick gap, with the
+        // per-condition timeout (sized to ~p99 × 1.5 of cold-start convergence
+        // for this latency / jitter / loss profile).
+        WaitForClockSync(server, client,   timeoutMs: condition.ClockSyncTimeoutMs);
+        WaitForClockSync(server, observer, timeoutMs: condition.ClockSyncTimeoutMs);
+
+        // Clocks converged — start recording now so the MP4 begins at the
+        // scenario action instead of the bad-network warm-up.
+        StartDeferredRecording(client, clientVideo);
+        StartDeferredRecording(observer, observerVideo);
 
         int clientNetId = client.NetworkId;
         AssertThat(clientNetId).OverrideFailureMessage("client must have a non-zero ENet peer id").IsNotEqual(0);

@@ -164,7 +164,7 @@ public class MultiProcessServerLifecycleTests : MultiProcessTestBase
         var client1 = Orch.Spawn("client", enetPort: port, label: "c1");
         client1.WaitReady(networkReady: true, timeoutMs: 30_000);
         ClientLogPath = client1.RemoteLogPath;
-        WaitForClockSync(server1, client1, maxGapTicks: 5, timeoutMs: 5_000);
+        WaitForClockSync(server1, client1);
         steps.Log($"phase 1: server1 + client1 ready; client1.netId={client1.NetworkId}");
 
         int cubeEid = SpawnEntity(server1, EntityTypeCube, authority: 0, 0f, 3f, 0f);
@@ -203,7 +203,7 @@ public class MultiProcessServerLifecycleTests : MultiProcessTestBase
         steps.Log("phase 3: spawning client2");
         var client2 = Orch.Spawn("client", enetPort: port, label: "c2");
         client2.WaitReady(networkReady: true, timeoutMs: 30_000);
-        WaitForClockSync(server2, client2, maxGapTicks: 5, timeoutMs: 5_000);
+        WaitForClockSync(server2, client2);
         steps.Log($"phase 3: server2 + client2 ready; client2.netId={client2.NetworkId}");
 
         int server2EntitiesAfter = QueryAllEntities(server2).Count;

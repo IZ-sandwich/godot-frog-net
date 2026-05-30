@@ -185,19 +185,23 @@ public class VehiclePushCubesTests : MultiProcessTestBase
 
         steps.Log("spawning pusher client (records video)");
         var pusher = Orch.Spawn("client", enetPort: port, label: "pusher",
-            recordVideoPath: pusherVideoPath, scenePath: TestArenaScene);
+            recordVideoPath: pusherVideoPath, scenePath: TestArenaScene, deferVideoStart: true);
         steps.Log("spawning observer client (records video)");
         var observer = Orch.Spawn("client", enetPort: port, label: "observer",
-            recordVideoPath: observerVideoPath, scenePath: TestArenaScene);
+            recordVideoPath: observerVideoPath, scenePath: TestArenaScene, deferVideoStart: true);
         pusher.WaitReady(networkReady: true, timeoutMs: 30_000);
         observer.WaitReady(networkReady: true, timeoutMs: 30_000);
         ClientLogPath = pusher.RemoteLogPath;
         string observerLogPath = observer.RemoteLogPath;
         steps.Log($"clients ready: pusher.netId={pusher.NetworkId} observer.netId={observer.NetworkId}");
 
-        WaitForClockSync(server, pusher,   maxGapTicks: 5, timeoutMs: 5_000);
-        WaitForClockSync(server, observer, maxGapTicks: 5, timeoutMs: 5_000);
+        WaitForClockSync(server, pusher);
+        WaitForClockSync(server, observer);
         steps.Log("clocks synced on both clients");
+
+        // Clocks converged — start recording now so the MP4 skips the warm-up.
+        StartDeferredRecording(pusher, pusherVideoPath);
+        StartDeferredRecording(observer, observerVideoPath);
 
         // Vehicle tests bypass SpawnTriad and manually wire spawn/wait/clock-
         // sync, so they don't pick up the SpawnTriad EnableTierIcons defaults.

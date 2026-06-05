@@ -151,21 +151,96 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
     [TestCase]
     public void MultiProcess_RigidPlayer_RunsIntoTowerWhileJumping_MispredictionsStayUnderBudget()
     {
+        RunTowerScenario(label: "tower_run", cubeMetadata: "",
+            mispredictBudget: MispredictBudget, recordVideo: true);
+    }
+
+    // ── Policy-comparison tests ────────────────────────────────────────────────
+    // Same scenario re-run under each of the three configurable client-side
+    // prediction policies. The point is NOT to assert a specific mispredict
+    // count — different policies will reach a different equilibrium count;
+    // BlendedVelocity in particular never falls below the threshold (every
+    // sub-snap drift increments the counter) so its number is inherently
+    // larger. Each test uses a generous per-policy budget so the assertions
+    // catch genuine regressions while leaving room for the policy's expected
+    // characteristic. The interesting comparison is the SVG/CSV trace:
+    // body deviation, visual jump magnitude, and the time-series of
+    // misprediction events are visually distinguishable across the three
+    // policies.
+
+    // Hysteresis (default, T2-style): cubes start in Interpolate tier, upgrade
+    // to Resim for 15 ticks on player contact, full rollback on misprediction
+    // during the upgrade window. Same as the unparameterised test above but
+    // tagged via metadata so the run is comparable to the other policy traces.
+    [TestCase]
+    public void MultiProcess_PolicyHysteresis_RunsIntoTower_TraceComparison()
+    {
+        RunTowerScenario(label: "policy_hysteresis", cubeMetadata: "policy=hysteresis",
+            mispredictBudget: MispredictBudget, recordVideo: false);
+    }
+
+    // AlwaysPredict (Netick / "always predict everything" pattern): cubes are
+    // permanently Resim and every snapshot drift past threshold triggers a
+    // full rollback. Expected to mispredict MORE than Hysteresis because
+    // there's no kinematic-interp absorb path for idle cubes — the per-test
+    // budget is sized to that.
+    [TestCase]
+    public void MultiProcess_PolicyAlwaysPredict_RunsIntoTower_TraceComparison()
+    {
+        RunTowerScenario(label: "policy_always_predict", cubeMetadata: "policy=always-predict",
+            mispredictBudget: MispredictBudget * 3, recordVideo: false);
+    }
+
+    // AuthorityTransfer (Photon Fusion 2 style): cubes default to Interpolate;
+    // on player contact the client requests ownership and the server flips
+    // Authority via AuthorityChangedMessage. While owned the body is locally
+    // simulated and the local sim IS authoritative — reconciliation against
+    // own state trivially passes. On contact-loss hysteresis expiry the
+    // client releases authority back to the server.
+    [TestCase]
+    public void MultiProcess_PolicyAuthorityTransfer_RunsIntoTower_TraceComparison()
+    {
+        RunTowerScenario(label: "policy_authority_transfer", cubeMetadata: "policy=authority-transfer",
+            mispredictBudget: MispredictBudget, recordVideo: false);
+    }
+
+    // BlendedVelocity (UE5 PredictiveInterpolation style): cubes permanently
+    // Resim; misprediction triggers a per-entity velocity blend + positional
+    // correction instead of a full-scene rollback. Expected to mispredict
+    // MORE than Hysteresis (every threshold-crossing increments the counter,
+    // and there's no upgrade-then-converge path) but visual jumps are smaller
+    // because no pose is ever teleported. Budget reflects the higher count.
+    [TestCase]
+    public void MultiProcess_PolicyBlendedVelocity_RunsIntoTower_TraceComparison()
+    {
+        RunTowerScenario(label: "policy_blended_velocity", cubeMetadata: "policy=blended-velocity",
+            mispredictBudget: MispredictBudget * 4, recordVideo: false);
+    }
+
+    /// <summary>Shared body for the four MP-MISPREDICT tests. Spawns a cube tower
+    /// (each cube tagged with <paramref name="cubeMetadata"/> so LocalRigidPropPrediction
+    /// can vary its policy), spawns the rigid player owned by the client, drives the
+    /// scripted "3 forward+back passes while jumping" input schedule, captures samples,
+    /// emits CSV+SVG plots under TestResults/MispredictPlots/<paramref name="label"/>.*
+    /// and asserts the mispredict count stays under <paramref name="mispredictBudget"/>.</summary>
+    private void RunTowerScenario(string label, string cubeMetadata, int mispredictBudget, bool recordVideo)
+    {
         if (Orch == null) return;
 
-        var (server, client, observer) = SpawnTriad("tower_run", recordVideo: true);
+        var (server, client, observer) = SpawnTriad(label, recordVideo: recordVideo);
 
         // Brief warmup so clock-sync stabilises before any entities exist.
         server.WaitForTicks(SnapshotArmTicks);
 
         // Pre-spawn the cube tower (auth=0 → DummyCube on the client, interpolated
         // from server snapshots). Cubes are spawned with vertical gaps so each
-        // free-falls onto the stack.
+        // free-falls onto the stack. Per-cube metadata threads the policy
+        // selector into LocalRigidPropPrediction's _Ready override.
         var cubeEids = new List<int>();
         for (int i = 0; i < TowerCubeCount; i++)
         {
             float y = TowerBaseY + i * CubeSpacingY;
-            cubeEids.Add(SpawnEntity(server, EntityTypeCube, authority: 0, 0f, y, TowerZ));
+            cubeEids.Add(SpawnEntity(server, EntityTypeCube, authority: 0, 0f, y, TowerZ, metadata: cubeMetadata));
         }
         server.WaitForTicks(TowerSettleTicks);
 
@@ -237,32 +312,32 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
         int mispredictsThisRun = finalMispredicts - baselineMispredictsAfterFall;
         int observerMispredictsThisRun = ReadMispredictCount(observer) - observerBaselineMispredicts;
 
-        var paths = ArtifactsFor("tower_run");
+        var paths = ArtifactsFor(label);
         WriteTowerPlot(paths, clientSamples, playerEid, cubeEids, baselineMispredictsAfterFall);
         // Additional comprehensive divergence plot: body+visual position
         // deviation + rotation deviation per cube AND per player, with
         // mispredict markers. Replaces the old StackDeterminism test by
         // surfacing the same data inside the gameplay-relevant scenario.
         WriteDivergencePlot(paths, clientSamples, serverSamples, playerEid, cubeEids, baselineMispredictsAfterFall);
-        Godot.GD.Print($"[MP-MISPREDICT] wrote {paths.Csv}, {paths.Svg} ({clientSamples.Count} samples)");
+        Godot.GD.Print($"[MP-MISPREDICT] policy={cubeMetadata} wrote {paths.Csv}, {paths.Svg} ({clientSamples.Count} samples, {mispredictsThisRun} mispredicts vs budget {mispredictBudget})");
         CopyProcessLogs(paths);
-        CopyObserverLog(paths, "tower_run");
+        CopyObserverLog(paths, label);
 
         AssertThat(mispredictsThisRun)
             .OverrideFailureMessage(
                 $"client mispredicted {mispredictsThisRun} times in {RunTicks} ticks while charging the tower " +
-                $"(budget {MispredictBudget}). Trace + video at TestResults/MispredictPlots/tower_run.{{csv,svg,mp4}}")
-            .IsLessEqual(MispredictBudget);
+                $"(policy='{cubeMetadata}', budget {mispredictBudget}). Trace at TestResults/MispredictPlots/{label}.{{csv,svg,mp4}}")
+            .IsLessEqual(mispredictBudget);
         // Observer is parked idle and shouldn't accrue more reconciles than
         // the active driver — same budget as the driver. If the observer
         // exceeds this, it indicates a snapshot/input-forwarding gap where
         // observers can't reproduce the server's authoritative motion.
         AssertThat(observerMispredictsThisRun)
             .OverrideFailureMessage(
-                $"observer mispredicted {observerMispredictsThisRun} times in {RunTicks} ticks (budget {MispredictBudget}). " +
+                $"observer mispredicted {observerMispredictsThisRun} times in {RunTicks} ticks (policy='{cubeMetadata}', budget {mispredictBudget}). " +
                 $"Likely cause: server isn't forwarding the driver's input to observers via GameSnapshotMessage.Inputs, " +
                 $"so the observer's prediction diverges every tick the driver is moving.")
-            .IsLessEqual(MispredictBudget);
+            .IsLessEqual(mispredictBudget);
     }
 
     // Writes tower_run.csv (long-form, one row per (tick, entity) — player +

@@ -66,7 +66,10 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
     {
         base.OnEntitySpawned();
 
-        _knightRig = GetParent()?.GetNodeOrNull<Node3D>("KnightRig");
+        // KnightRig sits under the SmoothedAttach wrapper so the camera (also
+        // under SmoothedAttach) inherits the smoother's position offset — see
+        // PredictionVisualSmoothing3D.Visual on this scene.
+        _knightRig = GetParent()?.GetNodeOrNull<Node3D>("SmoothedAttach/KnightRig");
 
         // Leave SceneTreeFTI on (Inherit → project default = ON). The rider
         // body's transform is rewritten every physics tick by AnchorBodyToVehicle
@@ -131,19 +134,20 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
         }
         _hasLastAdvanceResult = false;
 
-        // T1 contact-upgrade. Runs on BOTH the locally-owned player AND any
-        // observer-side player simulations. The driver's upgrade is the
-        // obvious case (we touch a cube → flip it to Resim so our contact
-        // stays crisp). The observer's upgrade matters too: the observer is
-        // locally simulating the remote player's contacts, and if a touched
-        // cube stays in Interpolate the always-blend path yanks it toward
-        // server pose every snapshot, perturbing the observer's player-vs-
-        // cube contact resolution and tripping player rollbacks. Running the
-        // upgrade on both sides keeps cubes synchronised with whichever
-        // process is locally simulating contact. The observer's player will
-        // mispredict more (it always does — stale-input prediction), but the
-        // CUBE side stays stable instead of being a spurious source of
-        // additional rollbacks.
+        // T2 contact-upgrade — locally-owned player only. T1 also ran this
+        // on observer-side simulations because the always-blend path was
+        // continuously perturbing cube poses every snapshot, which destabilised
+        // the observer's local player-vs-cube contact resolution, so cubes
+        // needed to flip to Resim to escape the always-blend. With T2's
+        // kinematic interpolation the cubes ARE the snapshot pose (no
+        // per-tick body writes, no perturbation), so the observer-side rationale
+        // disappears. Upgrading on observers now actively HARMS sync — it
+        // takes a cube that was tracking server pose perfectly via snapshot
+        // interpolation and starts simulating it locally with stale input,
+        // producing rollback events as the observer's local sim diverges
+        // from server. Skip on observers; they see cubes at snapshot pose with
+        // a slight "kinematic wall" feel on the remote player's pushes, which
+        // is the documented trade-off (Fusion 2 / UE5 ship with this).
         //
         // Same contact-query plumbing the diagnostic LogPostPhysics uses; for
         // each body we touch, walk up the scene tree to the owning
@@ -154,6 +158,7 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
         // semantics — required so the player doesn't briefly push through a
         // body still blending toward its snapshot pose.
         if (body == null) return;
+        if (Authority != ClientManager.Instance?.GetNetworkId()) return;
         var contactBodies = RigidPlayerPhysics.QueryContactBodies(body);
         if (contactBodies.Count == 0) return;
         foreach (var cb in contactBodies)
@@ -235,6 +240,66 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
             }
             _lastAdvanceResult = RigidPlayerPhysics.AdvancePhysics(_predictionRb, cmd, phase: "live");
             _hasLastAdvanceResult = true;
+
+            // T2: pre-step proactive contact upgrade. The post-step contact
+            // detection in OnPostPhysicsTick catches contacts AFTER this
+            // tick's SpaceStep has already run with the touched prop still
+            // in kinematic-interp mode — meaning the player bounced off an
+            // immovable wall instead of pushing the prop. QueryNearbyBodies
+            // sweeps the shape forward by velocity × margin (0.3 m here,
+            // ~3 ticks at sprint speed) so props the player is ABOUT to
+            // hit on this step flip to Resim BEFORE the step runs and
+            // contact response applies to a simulated (not kinematic) prop.
+            //
+            // OBSERVER GUARD: same rationale as OnPostPhysicsTick's
+            // `Authority != GetNetworkId() return` — when this player is
+            // remote (the observer's locally-simulated copy of the driver's
+            // player), upgrading props that THIS player contacts harms sync.
+            // It takes a prop that was tracking server pose perfectly via
+            // snapshot interpolation and starts simulating it locally with
+            // stale-by-1-tick input, producing 100s of corrections per cube
+            // during a charge (the bulk of the observer's BlendedVelocity
+            // mispredict count came from this path). The trade-off is the
+            // documented "kinematic wall feel" — the observer's locally-
+            // simulated remote player bounces off the kinematic cube
+            // instead of pushing through — which Fusion 2 and UE5 ship
+            // with as the canonical observer-side behaviour. Visual still
+            // tracks the server pose via the snapshot stream.
+            if (!ownedByMe) return;
+            var body = _predictionRb?.Body;
+            if (body != null)
+            {
+                // Two-pronged pre-step query.
+                //   (a) Velocity-direction shift catches head-on approaches —
+                //       a player charging straight at a cube along ground.
+                //   (b) Omnidirectional proximity sphere catches lateral
+                //       contacts and the jump-then-land case (velocity is
+                //       mostly +Y at the jump apex, so a velocity-only sweep
+                //       moves UP and never reaches the cube directly below).
+                //       Observed before the proximity addition: observer's
+                //       locally-simulated player would jump over the tower,
+                //       land on the kinematic top cube at tick ~665, freeze
+                //       on the kinematic wall, and only upgrade the tower
+                //       3 ticks later via the post-step query — by which
+                //       point the player had already lost forward momentum.
+                //   Proximity radius 1.5 m covers the player capsule + ~1 m
+                //   of any-direction motion-or-fall lookahead. Cost is a
+                //   few extra RequestResimUpgrade calls per tick on cubes
+                //   that don't actually get touched — each is cheap
+                //   (counter bump, no body write).
+                var preStepContacts = RigidPlayerPhysics.QueryNearbyBodies(body, marginAlongVelocity: 0.3f);
+                foreach (var cb in preStepContacts)
+                {
+                    var cpe = FindOwningPredictedEntity(cb);
+                    if (cpe != null && cpe != this) cpe.RequestResimUpgrade();
+                }
+                var proximityBodies = RigidPlayerPhysics.QueryProximityBodies(body, proximityRadius: 1.5f);
+                foreach (var cb in proximityBodies)
+                {
+                    var cpe = FindOwningPredictedEntity(cb);
+                    if (cpe != null && cpe != this) cpe.RequestResimUpgrade();
+                }
+            }
             return;
         }
 

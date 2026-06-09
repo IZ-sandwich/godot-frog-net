@@ -81,10 +81,7 @@ public class MultiProcessSleepCoherenceTests : MultiProcessTestBase
         // client, and Jolt's auto-sleep only runs on dynamic bodies — a
         // kinematic (Interpolate-tier) body never reports Sleeping=true
         // because there's no simulation-side sleep to be in.
-        // TODO: restore `metadata: "resim-only"` once the SpawnEntity helper accepts it again
-        // (parameter was dropped post-67c1179; without it the cube uses default Interpolate policy
-        // and Jolt won't drive RigidBody3D.Sleeping for this test to assert on).
-        int cubeEid = SpawnEntity(server, EntityTypeCube, authority: 0, 0f, 1.0f, 0f);
+        int cubeEid = SpawnEntity(server, EntityTypeCube, authority: 0, 0f, 1.0f, 0f, metadata: "resim-only");
         WaitForClientEntity(client, cubeEid, timeoutMs: 5_000);
 
         Godot.GD.Print("[MP-SLEEP-COHERENCE] sleep config: " +
@@ -200,9 +197,7 @@ public class MultiProcessSleepCoherenceTests : MultiProcessTestBase
             // See sibling test for the "resim-only" metadata rationale —
             // forces the cubes to dynamic (non-kinematic) so Jolt's
             // auto-sleep drives RigidBody3D.Sleeping the way the test reads it.
-            // TODO: restore `metadata: "resim-only"` once the SpawnEntity helper accepts it again
-            // (parameter was dropped post-67c1179; see sibling test for rationale).
-            int eid = SpawnEntity(server, EntityTypeCube, authority: 0, 0f, y, 0f);
+            int eid = SpawnEntity(server, EntityTypeCube, authority: 0, 0f, y, 0f, metadata: "resim-only");
             cubeEids.Add(eid);
             WaitForClientEntity(client, eid, timeoutMs: 5_000);
         }

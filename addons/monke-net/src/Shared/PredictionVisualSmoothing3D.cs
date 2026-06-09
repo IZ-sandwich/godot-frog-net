@@ -79,6 +79,34 @@ public partial class PredictionVisualSmoothing3D : Node3D
     /// rotation is fully derived from the body.</summary>
     [Export] public bool SmoothRotation { get; set; } = true;
 
+    /// <summary>
+    /// When true, the smoother stops capturing offsets and forces both
+    /// position and rotation offsets to zero each tick. Used for entities
+    /// whose body is the local truth and is never reconciled (e.g.
+    /// AuthorityTransfer-owned cubes the local client is currently driving):
+    /// the smoother's only contribution would be FALSE-positive
+    /// CaptureUnexplainedJump events from Jolt's contact-time position
+    /// corrections, which accumulate as a growing visual lag during
+    /// sustained contact. Toggle via <see cref="SetMuted"/> from game-side
+    /// code that knows when a body is locally authoritative.
+    /// </summary>
+    public bool Muted { get; private set; } = false;
+
+    /// <summary>Toggle mute state and clear any residual offset on entry.</summary>
+    public void SetMuted(bool muted)
+    {
+        if (muted != Muted)
+        {
+            MonkeLogger.Debug($"[SMOOTH-MUTE] body={Body?.Name} muted={muted} (was={Muted})");
+            if (muted)
+            {
+                _posOffset = Vector3.Zero;
+                _rotOffset = Quaternion.Identity;
+            }
+        }
+        Muted = muted;
+    }
+
     // World-space position offset between visual and body. Decays toward zero.
     private Vector3 _posOffset;
     // World-space rotation offset: Visual.Quaternion = _rotOffset * Body.Quaternion.
@@ -214,6 +242,26 @@ public partial class PredictionVisualSmoothing3D : Node3D
         Vector3 linVel = Body is RigidBody3D rb1 ? rb1.LinearVelocity : Vector3.Zero;
         Vector3 angVel = Body is RigidBody3D rb2 ? rb2.AngularVelocity : Vector3.Zero;
         float dt = (float)delta;
+
+        // Muted: clamp offsets to zero, skip the jump-capture path. Pin both
+        // lerp targets to the body's current pose so the past-interpolation
+        // renderer draws Visual exactly at the body. Used for AT-owned cubes
+        // where the local sim is the truth (see SetMuted docstring).
+        if (Muted)
+        {
+            _posOffset = Vector3.Zero;
+            _rotOffset = Quaternion.Identity;
+            _visTargetPrev = bodyPos;
+            _visTargetRotPrev = bodyRot;
+            _visTargetCurr = bodyPos;
+            _visTargetRotCurr = bodyRot;
+            _prevBodyPos = bodyPos;
+            _prevBodyRot = bodyRot;
+            _prevLinVel = linVel;
+            _prevAngVel = angVel;
+            _hasPrev = true;
+            return;
+        }
 
         if (_hasPrev && dt > 0f)
         {
@@ -459,8 +507,23 @@ public partial class PredictionVisualSmoothing3D : Node3D
     // _PhysicsProcess saw) gives a clean "how much of this motion would I
     // have predicted from the inputs the engine had?" baseline. Residual
     // accumulates only when the engine applied a real impulse / teleport.
+    //
+    // T2: skip kinematic bodies entirely. When Body.Freeze=true,
+    // LocalRigidPropPrediction.OnPostPhysicsTick writes the body's transform
+    // every tick to track the snapshot-interp pose. Pre-step velocity is 0
+    // (kinematic bodies don't accumulate velocity), so each per-tick
+    // transform write would count as an "unexplained jump" and accumulate
+    // into _posOffset (observed pre-fix: multi-metre visual offsets after
+    // a few dozen kinematic ticks). For a kinematic body the visual mesh
+    // is a child of the body anyway, so it follows the body's transform
+    // write naturally — no smoother offset needed. Explicit
+    // AbsorbBodyTeleport calls from Reconcile still register because they
+    // baseline _prevBodyPos to the post-teleport pose, so the next
+    // _PhysicsProcess sees zero residual delta.
     private void CaptureUnexplainedJump(Vector3 bodyPos, Quaternion bodyRot, float dt)
     {
+        if (Body is RigidBody3D rbFreeze && rbFreeze.Freeze) return;
+
         Vector3 expectedPosDelta = _prevLinVel * dt;
         Vector3 jumpPos = (bodyPos - _prevBodyPos) - expectedPosDelta;
         if (jumpPos.LengthSquared() > PositionJumpEpsilon * PositionJumpEpsilon)

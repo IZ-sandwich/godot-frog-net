@@ -227,7 +227,74 @@ public static class RigidPlayerPhysics
     /// without exposing the contact-list internals to demo gameplay code that
     /// shouldn't reach into the player's physics.
     /// </summary>
-    internal static System.Collections.Generic.List<RigidBody3D> QueryContactBodies(RigidBody3D body)
+    internal static System.Collections.Generic.List<RigidBody3D> QueryContactBodies(RigidBody3D body) =>
+        QueryContactBodiesImpl(body, marginAlongVelocity: 0f);
+
+    /// <summary>
+    /// Same as <see cref="QueryContactBodies"/> but reports bodies the player
+    /// is ABOUT to contact this step, by inflating the query along the body's
+    /// current velocity by <paramref name="marginAlongVelocity"/> metres.
+    /// Used by the T2 kinematic-interp upgrade path: a kinematic prop a few
+    /// cm in front of a fast-moving player must flip to Resim BEFORE the
+    /// upcoming SpaceStep, otherwise the player's contact response is
+    /// computed against a still-kinematic (immovable) prop and the player
+    /// bounces in a way the server (whose prop was already simulating)
+    /// doesn't.
+    /// </summary>
+    internal static System.Collections.Generic.List<RigidBody3D> QueryNearbyBodies(RigidBody3D body, float marginAlongVelocity) =>
+        QueryContactBodiesImpl(body, marginAlongVelocity);
+
+    /// <summary>
+    /// Omnidirectional proximity query — reports every rigid body within
+    /// <paramref name="proximityRadius"/> metres of the body's centre,
+    /// regardless of velocity direction. Used for the T2 pre-step contact
+    /// upgrade when the velocity-direction sweep doesn't suffice: a jumping
+    /// player has velocity mostly along +Y but is about to land on a cube
+    /// directly below it, so a velocity-shifted sweep doesn't reach the
+    /// cube. Inflating omnidirectionally catches the cube the player will
+    /// land on, the cube the player will brush against laterally, AND the
+    /// cube the player will run into head-on, all without per-axis special
+    /// casing.
+    /// </summary>
+    internal static System.Collections.Generic.List<RigidBody3D> QueryProximityBodies(RigidBody3D body, float proximityRadius) =>
+        QueryProximityBodiesImpl(body, proximityRadius);
+
+    private static System.Collections.Generic.List<RigidBody3D> QueryProximityBodiesImpl(RigidBody3D body, float proximityRadius)
+    {
+        var hits = new System.Collections.Generic.List<RigidBody3D>();
+        if (body == null || proximityRadius <= 0f) return hits;
+        var space = body.GetWorld3D()?.DirectSpaceState;
+        if (space == null) return hits;
+
+        // Use a sphere shape sized to proximityRadius for an omnidirectional
+        // check — simpler than inflating the body's actual collision shape
+        // (which would need per-shape-type math for capsules vs. boxes vs.
+        // spheres), and the false-positive cost is tiny (a few extra
+        // RequestResimUpgrade calls on already-Resim or trivially-Resim
+        // neighbours).
+        var sphere = new SphereShape3D { Radius = proximityRadius };
+        var xform = new Transform3D(Basis.Identity, body.GlobalPosition);
+
+        var query = new PhysicsShapeQueryParameters3D
+        {
+            Shape = sphere,
+            Transform = xform,
+            CollisionMask = body.CollisionMask,
+            CollideWithBodies = true,
+            CollideWithAreas = false,
+            Exclude = new Godot.Collections.Array<Rid> { body.GetRid() },
+        };
+
+        var results = space.IntersectShape(query, maxResults: 16);
+        foreach (var hit in results)
+        {
+            if (hit.TryGetValue("collider", out var cv) && cv.AsGodotObject() is RigidBody3D rb)
+                hits.Add(rb);
+        }
+        return hits;
+    }
+
+    private static System.Collections.Generic.List<RigidBody3D> QueryContactBodiesImpl(RigidBody3D body, float marginAlongVelocity)
     {
         var hits = new System.Collections.Generic.List<RigidBody3D>();
         if (body == null) return hits;
@@ -245,10 +312,24 @@ public static class RigidPlayerPhysics
         }
         if (collisionShapeNode is not CollisionShape3D shapeNode) return hits;
 
+        Transform3D xform = shapeNode.GlobalTransform;
+        if (marginAlongVelocity > 0f)
+        {
+            // Shift the query shape forward along the body's velocity so
+            // bodies inside the swept volume up to marginAlongVelocity
+            // metres ahead are reported. Doesn't widen the shape sideways
+            // — that would catch unrelated nearby cubes the player isn't
+            // about to hit.
+            Vector3 vel = body.LinearVelocity;
+            float speed = vel.Length();
+            if (speed > 0.01f)
+                xform.Origin += vel / speed * marginAlongVelocity;
+        }
+
         var query = new PhysicsShapeQueryParameters3D
         {
             Shape = shapeNode.Shape,
-            Transform = shapeNode.GlobalTransform,
+            Transform = xform,
             CollisionMask = body.CollisionMask,
             CollideWithBodies = true,
             CollideWithAreas = false,

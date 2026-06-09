@@ -416,9 +416,13 @@ public abstract class MultiProcessTestBase
         Godot.GD.PrintErr($"[MultiProcessTestBase] client entity {eid} did not appear within {timeoutMs}ms");
     }
 
-    /// <summary>Spawn a server-side entity. Returns the entity id.</summary>
+    /// <summary>Spawn a server-side entity. Returns the entity id.
+    /// Optional <paramref name="metadata"/> threads a free-form string into the
+    /// EntityEventMessage that demo entities can read in _Ready /
+    /// OnEntitySpawned to vary their setup per test (e.g. "resim-only" forces
+    /// LocalRigidPropPrediction's AlwaysPredict policy).</summary>
     protected static int SpawnEntity(TestProcess server, byte entityType, int authority,
-        float x, float y, float z)
+        float x, float y, float z, string metadata = "")
     {
         using var r = server.Send(new
         {
@@ -426,6 +430,7 @@ public abstract class MultiProcessTestBase
             entity_type = (int)entityType,
             authority,
             position = new[] { (double)x, y, z },
+            metadata,
         });
         return r.RootElement.GetProperty("data").GetProperty("entityId").GetInt32();
     }

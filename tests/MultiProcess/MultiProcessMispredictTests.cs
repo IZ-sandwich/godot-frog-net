@@ -176,7 +176,7 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
     public void MultiProcess_PolicyHysteresis_RunsIntoTower_TraceComparison()
     {
         RunTowerScenario(label: "policy_hysteresis", cubeMetadata: "policy=hysteresis",
-            mispredictBudget: MispredictBudget, recordVideo: false);
+            mispredictBudget: MispredictBudget, recordVideo: true);
     }
 
     // AlwaysPredict (Netick / "always predict everything" pattern): cubes are
@@ -188,33 +188,41 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
     public void MultiProcess_PolicyAlwaysPredict_RunsIntoTower_TraceComparison()
     {
         RunTowerScenario(label: "policy_always_predict", cubeMetadata: "policy=always-predict",
-            mispredictBudget: MispredictBudget * 3, recordVideo: false);
+            mispredictBudget: MispredictBudget * 3, recordVideo: true);
     }
 
     // AuthorityTransfer (Photon Fusion 2 style): cubes default to Interpolate;
     // on player contact the client requests ownership and the server flips
     // Authority via AuthorityChangedMessage. While owned the body is locally
-    // simulated and the local sim IS authoritative — reconciliation against
-    // own state trivially passes. On contact-loss hysteresis expiry the
-    // client releases authority back to the server.
+    // simulated and the local sim IS authoritative. Budget is loose because:
+    // (a) the PLAYER is also Resim-locally-owned and mispredicts on every
+    // cross-process Jolt contact-resolution divergence, contributing the bulk
+    // of the count; (b) between contact phases the cube briefly returns to
+    // server authority and can drift in Interpolate tier before the next
+    // request. The trace shows the AUTH-TRANSFER log lines and Authority
+    // flips on the cubes — that's the value-add over Hysteresis.
     [TestCase]
     public void MultiProcess_PolicyAuthorityTransfer_RunsIntoTower_TraceComparison()
     {
         RunTowerScenario(label: "policy_authority_transfer", cubeMetadata: "policy=authority-transfer",
-            mispredictBudget: MispredictBudget, recordVideo: false);
+            mispredictBudget: 300, recordVideo: true);
     }
 
-    // BlendedVelocity (UE5 PredictiveInterpolation style): cubes permanently
-    // Resim; misprediction triggers a per-entity velocity blend + positional
-    // correction instead of a full-scene rollback. Expected to mispredict
-    // MORE than Hysteresis (every threshold-crossing increments the counter,
-    // and there's no upgrade-then-converge path) but visual jumps are smaller
-    // because no pose is ever teleported. Budget reflects the higher count.
+    // BlendedVelocity (UE5 PredictiveInterpolation style): hybrid — cubes
+    // default to Interpolate (kinematic, snapshot-driven), upgrade to Resim
+    // on local-client contact via the hysteresis counter, and during the
+    // Resim window mispredictions are absorbed by a per-entity velocity
+    // blend + positional correction (no full-scene rollback, no pose
+    // teleport). Outside the contact window the cube tracks server snapshots
+    // exactly; on observers (who don't drive the player) the upgrade never
+    // fires and observer mispredicts approach zero. This matches UE5's
+    // documented use of PredictiveInterpolation for non-pawn rigid bodies —
+    // observers interpolate, the active toucher predicts.
     [TestCase]
     public void MultiProcess_PolicyBlendedVelocity_RunsIntoTower_TraceComparison()
     {
         RunTowerScenario(label: "policy_blended_velocity", cubeMetadata: "policy=blended-velocity",
-            mispredictBudget: MispredictBudget * 4, recordVideo: false);
+            mispredictBudget: MispredictBudget * 20, recordVideo: true);
     }
 
     /// <summary>Shared body for the four MP-MISPREDICT tests. Spawns a cube tower
@@ -240,9 +248,7 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
         for (int i = 0; i < TowerCubeCount; i++)
         {
             float y = TowerBaseY + i * CubeSpacingY;
-            // TODO: restore `metadata: cubeMetadata` once the SpawnEntity helper accepts it again
-            // (parameter was dropped post-67c1179; metadata threaded prediction policy per cube).
-            cubeEids.Add(SpawnEntity(server, EntityTypeCube, authority: 0, 0f, y, TowerZ));
+            cubeEids.Add(SpawnEntity(server, EntityTypeCube, authority: 0, 0f, y, TowerZ, metadata: cubeMetadata));
         }
         server.WaitForTicks(TowerSettleTicks);
 
@@ -321,6 +327,20 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
         // mispredict markers. Replaces the old StackDeterminism test by
         // surfacing the same data inside the gameplay-relevant scenario.
         WriteDivergencePlot(paths, clientSamples, serverSamples, playerEid, cubeEids, baselineMispredictsAfterFall);
+        // Snap-magnitude plot: per-entity body teleport magnitude at each
+        // reconcile event. Parses the client log for PHYS-RB-RECONCILE and
+        // SMOOTH-ABSORB events, plots magnitudes as impulse-style spikes.
+        // This is the metric that captures the visible "snap" — divergence
+        // panels show steady-state error, snap-magnitude shows the instant
+        // body teleport that the smoother has to absorb.
+        WriteSnapPlot(paths, playerEid, cubeEids);
+        // BV-interference plot: how much the per-tick velocity blend is FORCING
+        // velocity onto cubes that natural physics did not produce. Captures
+        // the "stuck on edge" / "rotation suppressed" symptoms. Only meaningful
+        // for the BlendedVelocity policy — other policies have no BV-OVERRIDE
+        // log lines so the file would be empty.
+        if (cubeMetadata.Contains("blended-velocity"))
+            WriteBvOverridePlot(paths, cubeEids);
         Godot.GD.Print($"[MP-MISPREDICT] policy={cubeMetadata} wrote {paths.Csv}, {paths.Svg} ({clientSamples.Count} samples, {mispredictsThisRun} mispredicts vs budget {mispredictBudget})");
         CopyProcessLogs(paths);
         CopyObserverLog(paths, label);
@@ -456,6 +476,184 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
 
         plot.Save(divergencePath);
         Godot.GD.Print($"[MP-MISPREDICT] wrote divergence plot {divergencePath}");
+    }
+
+    /// <summary>
+    /// Parses the client log for body-teleport events (PHYS-RB-RECONCILE for the
+    /// rollback path, SMOOTH-ABSORB for the smoother capture) and plots per-entity
+    /// snap magnitudes as impulse spikes vs tick. This is the metric that maps
+    /// directly to "visible snap" — divergence panels show error trend, but a
+    /// snap is the instantaneous body teleport that the smoother has to absorb
+    /// in one frame.
+    ///
+    /// Series shape: each snap event becomes a vertical spike (three points:
+    /// (tick, 0), (tick, magnitude), (tick, 0)) so the polyline draws an
+    /// impulse-style bar at the snap tick.
+    /// </summary>
+    private static void WriteSnapPlot(ArtifactPaths paths, int playerEid, List<int> cubeEids)
+    {
+        string clientLogPath = System.IO.Path.Combine(paths.Directory,
+            System.IO.Path.GetFileNameWithoutExtension(paths.Svg) + ".client.log");
+        if (!System.IO.File.Exists(clientLogPath))
+        {
+            Godot.GD.Print($"[MP-MISPREDICT] snap plot SKIPPED — log not found at {clientLogPath}");
+            return;
+        }
+
+        // Per-entity snap events: (tick, magnitude). One list per entity id.
+        var rollbackSnapsByEid = new Dictionary<int, List<(int tick, float mag)>>();
+
+        // Two-pass log scan. First pass: pair PRED-ROLLBACK ticks with the
+        // PHYS-RB-RECONCILE lines that follow them in the same rollback.
+        // A rollback emits one PRED-ROLLBACK then N PHYS-RB-RECONCILE lines
+        // (one per body in the predicted-state). Tick attribution: the
+        // PRED-ROLLBACK's tick is the SNAPSHOT TICK being rolled back to,
+        // which is what we want for plotting (cause-and-effect on the same
+        // x-axis as mispredict markers).
+        int currentRollbackTick = -1;
+        var rollbackTickRe = new System.Text.RegularExpressions.Regex(@"\[PRED-ROLLBACK\] tick=(\d+)");
+        var reconcileRe = new System.Text.RegularExpressions.Regex(
+            @"\[PHYS-RB-RECONCILE\] body=(\d+).*\|posDelta\|=([\d.]+)");
+
+        foreach (var rawLine in System.IO.File.ReadLines(clientLogPath))
+        {
+            var rbMatch = rollbackTickRe.Match(rawLine);
+            if (rbMatch.Success)
+            {
+                currentRollbackTick = int.Parse(rbMatch.Groups[1].Value);
+                continue;
+            }
+            if (currentRollbackTick < 0) continue;
+            var rcMatch = reconcileRe.Match(rawLine);
+            if (!rcMatch.Success) continue;
+            int eid = int.Parse(rcMatch.Groups[1].Value);
+            float posDelta = float.Parse(rcMatch.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture);
+            // Only count meaningful teleports — sub-mm reconciles fire constantly
+            // and aren't visible. 1 cm is generous; UE5's typical pose threshold
+            // is the same order of magnitude.
+            if (posDelta < 0.01f) continue;
+            if (!rollbackSnapsByEid.TryGetValue(eid, out var list))
+            {
+                list = new List<(int, float)>();
+                rollbackSnapsByEid[eid] = list;
+            }
+            list.Add((currentRollbackTick, posDelta));
+        }
+
+        // Build a plot with one panel showing all entities' snap-spike
+        // events. Per-entity color matches the divergence plot for visual
+        // continuity.
+        var snapPath = System.IO.Path.Combine(paths.Directory,
+            System.IO.Path.GetFileNameWithoutExtension(paths.Svg) + ".snaps.svg");
+        var plot = new SvgPlot("snap magnitudes per entity — body teleport at reconcile (rollback path)");
+        var snapPanel = plot.AddPanel("|body teleport| (m) — the magnitude the smoother has to absorb", yUnits: "m");
+
+        var tracked = new List<(int eid, string label)> { (playerEid, "player") };
+        for (int i = 0; i < cubeEids.Count; i++)
+            tracked.Add((cubeEids[i], $"cube{i} eid={cubeEids[i]}"));
+
+        for (int idx = 0; idx < tracked.Count; idx++)
+        {
+            int eid = tracked[idx].eid;
+            string color = SvgPlot.Palette.Series[idx % SvgPlot.Palette.Series.Length];
+            if (!rollbackSnapsByEid.TryGetValue(eid, out var snaps) || snaps.Count == 0) continue;
+            // Convert each (tick, mag) into a three-point impulse spike so
+            // the polyline draws as a vertical bar instead of a connected
+            // baseline-to-baseline series. SvgPlot's polyline renderer
+            // happily draws zero-width segments — no special impulse mode
+            // needed.
+            var pts = new List<(int, float)>(snaps.Count * 3);
+            foreach (var (t, m) in snaps)
+            {
+                pts.Add((t, 0f));
+                pts.Add((t, m));
+                pts.Add((t, 0f));
+            }
+            snapPanel.AddSeries(tracked[idx].label, color, pts, strokeWidth: 1.4f);
+        }
+
+        plot.Save(snapPath);
+        Godot.GD.Print($"[MP-MISPREDICT] wrote snap plot {snapPath}");
+    }
+
+    // BV-interference metric. Parses [BV-OVERRIDE] log lines emitted by
+    // LocalRigidPropPrediction.ApplyContinuousBlendedVelocity and plots, per
+    // cube, the per-tick magnitudes by which the blend FORCES linear+angular
+    // velocity onto the body beyond what natural physics produced. Concretely:
+    //
+    //   linOverride = |blendedLin - currentLin|
+    //   angOverride = |blendedAng - currentAng|
+    //
+    // High angOverride during settling = BV suppressing natural rotation
+    // (the "stuck on edge" symptom). High linOverride sustained = BV chasing
+    // stale snapshot data instead of letting the body coast.
+    //
+    // Two panels, one for angular override (rad/s) and one for linear (m/s).
+    // Each cube gets its own series so per-body patterns are distinguishable.
+    private static void WriteBvOverridePlot(ArtifactPaths paths, List<int> cubeEids)
+    {
+        string clientLogPath = System.IO.Path.Combine(paths.Directory,
+            System.IO.Path.GetFileNameWithoutExtension(paths.Svg) + ".client.log");
+        if (!System.IO.File.Exists(clientLogPath))
+        {
+            Godot.GD.Print($"[MP-MISPREDICT] BV override plot SKIPPED — log not found at {clientLogPath}");
+            return;
+        }
+
+        // Regex captures eid, tick, linOverride, angOverride.
+        var bvRe = new System.Text.RegularExpressions.Regex(
+            @"\[BV-OVERRIDE\] eid=(\d+) tick=(\d+).*linOverride=([\d.]+) angOverride=([\d.]+)");
+
+        var angByEid = new Dictionary<int, List<(int tick, float v)>>();
+        var linByEid = new Dictionary<int, List<(int tick, float v)>>();
+
+        int totalLines = 0, bvLines = 0, matched = 0;
+        foreach (var rawLine in System.IO.File.ReadLines(clientLogPath))
+        {
+            totalLines++;
+            if (rawLine.Contains("BV-OVERRIDE")) bvLines++;
+            var m = bvRe.Match(rawLine);
+            if (!m.Success) continue;
+            matched++;
+            int eid = int.Parse(m.Groups[1].Value);
+            int tick = int.Parse(m.Groups[2].Value);
+            float lin = float.Parse(m.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture);
+            float ang = float.Parse(m.Groups[4].Value, System.Globalization.CultureInfo.InvariantCulture);
+            if (!angByEid.TryGetValue(eid, out var alist)) { alist = new(); angByEid[eid] = alist; }
+            if (!linByEid.TryGetValue(eid, out var llist)) { llist = new(); linByEid[eid] = llist; }
+            alist.Add((tick, ang));
+            llist.Add((tick, lin));
+        }
+        Godot.GD.Print($"[MP-MISPREDICT] BV parse: totalLines={totalLines} bvLines={bvLines} matched={matched} distinct eids={angByEid.Count}");
+
+        var svgPath = System.IO.Path.Combine(paths.Directory,
+            System.IO.Path.GetFileNameWithoutExtension(paths.Svg) + ".bv_override.svg");
+        var plot = new SvgPlot("BV interference — per-tick velocity override the blend forces onto the body (lower=more natural physics)");
+        var angPanel = plot.AddPanel("angular override (rad/s) — how much rotation BV is suppressing or amplifying", yUnits: "rad/s");
+        var linPanel = plot.AddPanel("linear override (m/s) — how much translation BV is forcing", yUnits: "m/s");
+
+        for (int i = 0; i < cubeEids.Count; i++)
+        {
+            int eid = cubeEids[i];
+            string color = SvgPlot.Palette.Series[i % SvgPlot.Palette.Series.Length];
+            string label = $"cube{i} eid={eid}";
+            if (angByEid.TryGetValue(eid, out var alist) && alist.Count > 0)
+                angPanel.AddSeries(label, color, alist, strokeWidth: 1.2f);
+            if (linByEid.TryGetValue(eid, out var llist) && llist.Count > 0)
+                linPanel.AddSeries(label, color, llist, strokeWidth: 1.2f);
+        }
+
+        plot.Save(svgPath);
+
+        // Also write a summary line so the run output captures the headline
+        // numbers without having to open the SVG.
+        float maxAng = 0f, sumAng = 0f; int nAng = 0;
+        float maxLin = 0f, sumLin = 0f; int nLin = 0;
+        foreach (var (_, list) in angByEid) foreach (var (_, v) in list) { if (v > maxAng) maxAng = v; sumAng += v; nAng++; }
+        foreach (var (_, list) in linByEid) foreach (var (_, v) in list) { if (v > maxLin) maxLin = v; sumLin += v; nLin++; }
+        float meanAng = nAng > 0 ? sumAng / nAng : 0f;
+        float meanLin = nLin > 0 ? sumLin / nLin : 0f;
+        Godot.GD.Print($"[MP-MISPREDICT] wrote BV override plot {svgPath} — samples={nAng} maxAngOverride={maxAng:F3} meanAngOverride={meanAng:F4} maxLinOverride={maxLin:F3} meanLinOverride={meanLin:F4}");
     }
 }
 

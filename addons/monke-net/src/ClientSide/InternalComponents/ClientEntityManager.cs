@@ -90,7 +90,18 @@ public partial class ClientEntityManager : InternalClientComponent
                 return;
             }
             int oldAuth = entity.Authority;
+            // Sample the predicted-entity's EffectiveTier BEFORE we mutate
+            // Authority — for AuthorityTransfer-policy entities the tier
+            // depends on whether Authority == localNetworkId, so we need the
+            // pre-write tier to detect a transition. Pass it to
+            // NotifyAuthorityChanged so the entity can fire
+            // OnEffectiveTierChanged on the synthesised diff and the on-body
+            // tier icon / kinematic-frozen state updates the same tick the
+            // Authority write lands.
+            var cpe = entity.GetComponent<ClientPredictedEntity>();
+            var prevTier = cpe?.EffectiveTier ?? PredictionTier.Resim;
             entity.Authority = authChanged.NewAuthority;
+            cpe?.NotifyAuthorityChanged(prevTier);
             MonkeLogger.Info($"[NET-AUTH-RX] eid={authChanged.EntityId} authority {oldAuth} -> {authChanged.NewAuthority}");
             return;
         }

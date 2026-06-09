@@ -32,4 +32,36 @@ public partial class OwnershipPolicy : Resource
     /// to make ownership sticky (server must explicitly reclaim).
     /// </summary>
     [Export] public bool AllowOwnerRelease { get; set; } = true;
+
+    /// <summary>
+    /// When true, the server treats the entity's RigidBody3D as a kinematic relay
+    /// while a client holds authority: the server stops simulating it and instead
+    /// mirrors the owner-reported pose+velocity (via <c>EntityStateRelayMessage</c>).
+    /// On release the body unfreezes and the server resumes natural physics from the
+    /// last relayed state. Eliminates the on-release pose snap that arose when the
+    /// server's parallel sim diverged from the owner's. Only meaningful for entities
+    /// whose root is a <c>RigidBody3D</c> and whose client-side policy is
+    /// <c>InterpolationPolicy.AuthorityTransfer</c>.
+    /// </summary>
+    [Export] public bool UseAuthorityTransferRelay { get; set; } = false;
+
+    /// <summary>
+    /// Bitmask of collision-layer bits to clear from the entity's RigidBody3D
+    /// (BOTH <c>CollisionLayer</c> and <c>CollisionMask</c>) while frozen as a
+    /// relay. On release, the original layer/mask values are restored.
+    ///
+    /// Use case: the server's own player physics still simulates against owned
+    /// (kinematic-frozen) cubes — and treats them as immovable walls because
+    /// kinematic bodies don't yield to contact impulses. The server's player
+    /// then decelerates dramatically on every cube hit, and each subsequent
+    /// snapshot's HasMisspredicted check pulls the owner client's velocity
+    /// down to match. Clearing the relevant layer/mask bits while frozen
+    /// removes the cube from the server's physics graph (relative to the
+    /// chosen bits) so the server's player passes through it. Visuals on
+    /// other clients are unaffected — they read pose from the snapshot
+    /// (relay-driven, = owner's view).
+    ///
+    /// Default 0 = collision unchanged (no relay-time mask edit).
+    /// </summary>
+    [Export(PropertyHint.Layers3DPhysics)] public uint RelayDisableCollisionAgainst { get; set; } = 0;
 }

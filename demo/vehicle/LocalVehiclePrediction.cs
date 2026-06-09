@@ -41,6 +41,44 @@ public partial class LocalVehiclePrediction : ClientPredictedEntity
         // process Jolt drift.
         if (input is CharacterInputMessage cmd)
             VehiclePhysics.AdvancePhysics(_predictionRb, cmd);
+
+        // T2: pre-step proactive contact upgrade. Mirrors the
+        // LocalRigidPlayerPrediction two-pronged query:
+        //   (a) Velocity-direction shift catches head-on charges along the
+        //       vehicle's heading.
+        //   (b) Omnidirectional proximity sphere catches lateral approaches
+        //       and the high-speed ram case where velocity-shifted sweep
+        //       alone doesn't reach the cube before contact.
+        //
+        // Observed before adding (b): VehicleRamsFiveTowerBackAndForth tick
+        // 603 vehicle at z=-5.6 with vel.Z=-11.2 m/s, cube edge at z=-7.5
+        // (2 m away). 0.5 m velocity-direction sweep reached z=-6.1, still
+        // 1.4 m short of the cube. Vehicle reached the cube at tick 604,
+        // bounced off the still-kinematic wall (vel.Z flipped to +2.3 m/s),
+        // and cubes only upgraded at tick 606 — 2 ticks too late.
+        //
+        // Proximity radius 2.5 m covers vehicle half-length + 1-2 m of any-
+        // direction lookahead. Vehicles are ~2 m long and travel up to ~12
+        // m/s in this demo, so 2.5 m reaches into the cube before contact
+        // even at peak ram speed. Cost: a few extra RequestResimUpgrade
+        // calls per tick on cubes near (but not yet touched by) the vehicle
+        // — each is a counter bump, no body write.
+        var body = _predictionRb?.Body;
+        if (body != null)
+        {
+            var nearby = RigidPlayerPhysics.QueryNearbyBodies(body, marginAlongVelocity: 0.5f);
+            foreach (var cb in nearby)
+            {
+                var cpe = LocalRigidPlayerPrediction.FindOwningPredictedEntity(cb);
+                if (cpe != null && cpe != this) cpe.RequestResimUpgrade();
+            }
+            var proximity = RigidPlayerPhysics.QueryProximityBodies(body, proximityRadius: 2.5f);
+            foreach (var cb in proximity)
+            {
+                var cpe = LocalRigidPlayerPrediction.FindOwningPredictedEntity(cb);
+                if (cpe != null && cpe != this) cpe.RequestResimUpgrade();
+            }
+        }
     }
 
     public override Vector3 GetPosition() => _predictionRb.Body.GlobalPosition;
@@ -93,9 +131,18 @@ public partial class LocalVehiclePrediction : ClientPredictedEntity
 
     public override void OnPostPhysicsTick(int tick, IPackableElement input)
     {
-        // T1 contact-upgrade for vehicle-vs-prop interactions. The driver's
-        // process upgrades cubes its vehicle touches so the contact response
-        // stays crisp; an observer process ALSO runs this for the same reason
+        // T2 contact-upgrade for vehicle-vs-prop — driver only. T1 ran on
+        // observers too because the always-blend path was perturbing cubes
+        // every snapshot, and the observer's locally-simulated copy of the
+        // (remote-driven) vehicle needed the cube to flip to Resim to escape
+        // that perturbation. T2 holds non-contacted cubes at snapshot pose
+        // via kinematic interpolation, so observer-side upgrades stop being
+        // a sync win and become a rollback source — the observer's local
+        // vehicle sim diverges from server (input lag) and any cube it
+        // upgrades inherits that divergence.
+        //
+        // Original T1 comment retained below for context:
+        // (T1 — only kept for context, the rationale no longer applies)
         // — its locally-simulated copy of the (remote-driven) vehicle is
         // predicting the same contact, and if the contacted cube stays in
         // Interpolate tier the always-blend path tugs the cube toward server
@@ -108,6 +155,22 @@ public partial class LocalVehiclePrediction : ClientPredictedEntity
         // server's, and contact-upgraded cubes will sometimes rollback —
         // that's the correct cost, far less disruptive than per-snapshot
         // cube body writes mid-contact.
+        // NOTE: no observer guard here, unlike LocalRigidPlayerPrediction.
+        // Empirical T2 result: removing the observer guard on the player
+        // helped (rollback count dropped) because player-vs-cube divergence
+        // from "cube acts as kinematic wall" stays small (player capsule is
+        // light, low contact force, slides off). For VEHICLES the same
+        // guard HURTS — a heavy vehicle hitting a kinematic-wall cube
+        // diverges much faster than the player does (the vehicle can't
+        // physically push through, so its sim cannot follow the server's
+        // sim that DID push through). The observer's vehicle then trips
+        // its 20 cm threshold on every ram of the back-and-forth pattern
+        // (VehicleRamsFiveTowerBackAndForth budget is 20 mispredicts; with
+        // the guard it climbs to 25). Letting the observer upgrade the
+        // touched cube to Resim keeps the cube-vs-vehicle contact
+        // resolution coherent on both sides. Trade-off accepted: a few
+        // extra observer-side cube mispredicts during a ram are cheaper
+        // than re-rolling the whole observer-vehicle prediction state.
         var body = _predictionRb?.Body;
         if (body == null) return;
         var contactBodies = RigidPlayerPhysics.QueryContactBodies(body);

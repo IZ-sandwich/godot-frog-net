@@ -353,6 +353,22 @@ public partial class PredictionRigidbody3D : Node
             // body; for a velocity-only zero-out the existing interpolated frame is
             // already correct.
             _body.ResetPhysicsInterpolation();
+
+            // Hand the (pre, post) pair to the visual smoother so the visual mesh
+            // holds at the pre-SnapToRest pose and decays toward the new body
+            // pose over DecayTime instead of jumping with the body. Mirrors
+            // what Reconcile does. Without this, the per-snapshot SnapToRest
+            // path (which fires whenever client+server agree a body is at rest
+            // but the client's pose differs from auth by > 1 mm) produces a
+            // one-frame visual teleport: the body's transform write propagates
+            // to the Visual child via inheritance for one render frame before
+            // the smoother's _PhysicsProcess catches up and re-applies the
+            // offset. Observed in tower_run at tick 1171 as a ~7 cm visible
+            // jump on two resting cubes that were "tier=Resim, |posDiff|=0.07m,
+            // OK" (sub-threshold for rollback) but for which SnapToRest still
+            // wrote the transform to match server pose.
+            if (_smoothing != null && _smoothing.Visual != null)
+                _smoothing.AbsorbBodyTeleport(curPos, curRot, position, rotation);
         }
         if (velNeedsZero)
         {

@@ -595,11 +595,17 @@ public partial class MultiClientHarness : Node
         byte entityType = (byte)req.GetProperty("entity_type").GetInt32();
         int authority = req.GetProperty("authority").GetInt32();
         var pos = ReadVec3(req.GetProperty("position"));
+        // Optional metadata blob threaded through to the spawn event. Demo entities
+        // can read EntityEventMessage.Metadata in _Ready / OnEntitySpawned to vary
+        // their setup per test — e.g. the sleep-coherence tests pass "resim-only"
+        // to force LocalRigidPropPrediction into AlwaysPredict policy so the
+        // client-side body stays dynamic and Jolt's auto-sleep can run.
+        string metadata = req.TryGetProperty("metadata", out var meta) ? meta.GetString() ?? "" : "";
         // Thread position straight through SpawnEntity so the entity-event
         // broadcast carries the final position. The framework applies it after
         // OnEntitySpawned but before the broadcast, so the client never spawns
         // its dummy at a stale default (eliminating the one-frame teleport).
-        ServerManager.Instance.SpawnEntity<Node3D>(entityType: entityType, authority: authority, position: pos);
+        ServerManager.Instance.SpawnEntity<Node3D>(entityType: entityType, authority: authority, position: pos, metadata: metadata);
         var lastEntity = EntitySpawner.Instance.Entities[EntitySpawner.Instance.Entities.Count - 1];
         return Ok(new { entityId = lastEntity.EntityId });
     }

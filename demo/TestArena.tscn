@@ -51,11 +51,23 @@ ClientScene = ExtResource("15_lrp")
 ServerScene = ExtResource("16_srp")
 metadata/_custom_type_script = "uid://1rpyl54svogx"
 
+[sub_resource type="Resource" id="Resource_cube_policy"]
+script = ExtResource("11_ownpol")
+; Cubes accept client-initiated authority claims so the AuthorityTransfer
+; prediction policy (Photon Fusion 2 style) can flip ownership on contact.
+; See MainScene.tscn for the full rationale.
+RequireUnowned = true
+MaxRequesterDistance = 4.0
+AllowOwnerRelease = true
+UseAuthorityTransferRelay = true
+metadata/_custom_type_script = "uid://cq1cu8wwxm0td"
+
 [sub_resource type="Resource" id="Resource_cube"]
 script = ExtResource("6_p5x2j")
 EntityType = 4
 ClientScene = ExtResource("18_lcube")
 ServerScene = ExtResource("19_scube")
+OwnershipPolicy = SubResource("Resource_cube_policy")
 metadata/_custom_type_script = "uid://1rpyl54svogx"
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_lcinv"]

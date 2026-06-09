@@ -52,14 +52,49 @@ public enum InterpolationPolicy
     /// cost of more rollback work.
     /// </summary>
     AlwaysPredict,
+    /// <summary>
+    /// Photon Fusion 2 style. Default to Interpolate (server-driven kinematic),
+    /// but on contact the client REQUESTS state authority via
+    /// <see cref="MonkeNet.NetworkMessages.OwnershipChangeRequestMessage"/>.
+    /// On server approval the entity's Authority flips to the requesting
+    /// client; <see cref="ClientPredictedEntity.EffectiveTier"/> then reports
+    /// Resim for the local owner (the local sim IS the truth, not a prediction
+    /// against a remote server). On release (hysteresis expiry after contact
+    /// loss) the client sends
+    /// <see cref="MonkeNet.NetworkMessages.ReleaseAuthorityMessage"/> and the
+    /// entity reverts to server authority + Interpolate tier.
+    ///
+    /// Requires the server-side <c>EntitySpawnConfiguration.OwnershipPolicy</c>
+    /// to permit client claims for the entity type, and (optionally) an
+    /// <c>OwnershipApprover</c> on the server. Best for props that need crisp
+    /// local feel during interaction AND don't conflict with simultaneous
+    /// claims from multiple peers — Fusion 2's design assumes only one peer
+    /// can hold authority at a time.
+    /// </summary>
+    AuthorityTransfer,
+    /// <summary>
+    /// UE5 PredictiveInterpolation style. <see cref="ClientPredictedEntity.EffectiveTier"/>
+    /// is always Resim — the client simulates the body locally — but
+    /// misprediction is handled by a convex VELOCITY BLEND between the
+    /// client's local velocity and the server's authoritative velocity
+    /// rather than a teleport-and-rollback. Over a few ticks the body drifts
+    /// toward the server pose without ever snapping; position never
+    /// discontinuously moves. Trades a little visible "rubber-band" pull
+    /// during heavy divergence for the elimination of snap-and-decay visual
+    /// artifacts on every reconcile.
+    ///
+    /// No full-scene rollback runs in this mode — the misprediction count
+    /// still increments (so the metric remains comparable across policies),
+    /// but the engine cost is per-entity-velocity-blend only, not
+    /// SpaceStep × resimTicks. Matches UE5's two-velocity blend described
+    /// in PhysicsPredictionSettings and used by default for non-pawn
+    /// rigid bodies in shipping UE5 projects.
+    /// </summary>
+    BlendedVelocity,
     // Future:
     // SnapshotGated   — hold Resim until next in-tolerance server snapshot
     //                   (UE5 post_resim_wait_for_update pattern). Replaces
     //                   the arbitrary tick window with evidence-of-convergence.
-    // AuthorityTransfer — local client takes state authority on contact and
-    //                   releases on explicit signal (Fusion 2 / coherence
-    //                   model). Different semantics — local sim IS the truth
-    //                   while held, not a prediction.
 }
 
 [GlobalClass, Icon("res://addons/monke-net/resources/circle_nodes_solid.png")]
@@ -106,9 +141,36 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     public PredictionTier EffectiveTier => Policy switch
     {
         InterpolationPolicy.AlwaysPredict => PredictionTier.Resim,
-        InterpolationPolicy.Hysteresis    => _resimUpgradeTicksRemaining > 0 ? PredictionTier.Resim : BaseTier,
-        _                                 => BaseTier,
+        // BlendedVelocity uses the SAME contact-driven hysteresis as Hysteresis
+        // — Resim while a local contact upgrade is fresh, Interpolate otherwise.
+        // The only difference from Hysteresis is what happens DURING the Resim
+        // window on misprediction: BlendedVelocity does a soft velocity-blend
+        // correction (ApplyBlendedVelocity) while Hysteresis does a full-scene
+        // rollback. Without this gating the observer's locally-simulated cube
+        // races a 1-tick-lagged input stream during contact and accumulates
+        // hundreds of corrections per cube; under Interpolate it tracks the
+        // snapshot stream and only flips to Resim when the LOCAL client's
+        // player actually touches the cube.
+        InterpolationPolicy.BlendedVelocity => _resimUpgradeTicksRemaining > 0 ? PredictionTier.Resim : BaseTier,
+        InterpolationPolicy.Hysteresis      => _resimUpgradeTicksRemaining > 0 ? PredictionTier.Resim : BaseTier,
+        // AuthorityTransfer flips to Resim when the local client owns the
+        // entity (Authority == local network id). Ownership transfer is
+        // requested in RequestResimUpgrade and granted asynchronously by
+        // the server's AuthorityChangedMessage broadcast — until then the
+        // body stays on its BaseTier (typically Interpolate). The hysteresis
+        // counter is reused to track "client wants ownership for the next
+        // N ticks"; on counter expiry the client sends ReleaseAuthority.
+        InterpolationPolicy.AuthorityTransfer =>
+            IsLocallyOwned() ? PredictionTier.Resim : BaseTier,
+        _ => BaseTier,
     };
+
+    private bool IsLocallyOwned()
+    {
+        var clientMgr = ClientManager.Instance;
+        if (clientMgr == null) return false;
+        return Authority == clientMgr.GetNetworkId();
+    }
 
     /// <summary>
     /// Called by the locally-owned player when its body comes into contact with this
@@ -127,9 +189,28 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     /// Interpolate.</param>
     public void RequestResimUpgrade(int ticks = 15)
     {
-        if (Policy != InterpolationPolicy.Hysteresis) return;
+        // BlendedVelocity and AuthorityTransfer also use the hysteresis
+        // counter, both as a "contact freshness" window. For BlendedVelocity
+        // it gates Interpolate→Resim so the body doesn't simulate locally
+        // until contact actually happens (see EffectiveTier comment). For
+        // AuthorityTransfer it additionally drives the ownership request on
+        // the edge transition and the ownership release on counter expiry.
+        if (Policy != InterpolationPolicy.Hysteresis &&
+            Policy != InterpolationPolicy.AuthorityTransfer &&
+            Policy != InterpolationPolicy.BlendedVelocity) return;
         var prev = EffectiveTier;
+        bool wasFresh = _resimUpgradeTicksRemaining > 0;
         if (ticks > _resimUpgradeTicksRemaining) _resimUpgradeTicksRemaining = ticks;
+        if (Policy == InterpolationPolicy.AuthorityTransfer && !wasFresh && !IsLocallyOwned())
+        {
+            // Edge transition: contact just started AND we don't already own
+            // the entity. Send the request; server's response will flip
+            // Authority via AuthorityChangedMessage and the next read of
+            // EffectiveTier will report Resim. Local state isn't touched
+            // until the server confirms.
+            ClientManager.Instance?.RequestAuthority(EntityId);
+            MonkeLogger.Debug($"[AUTH-TRANSFER] eid={EntityId} requesting authority on contact");
+        }
         var now = EffectiveTier;
         if (now != prev) OnEffectiveTierChanged(prev, now);
     }
@@ -144,15 +225,92 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     /// No-op under <see cref="InterpolationPolicy.AlwaysPredict"/> — there's
     /// nothing to decrement; the entity is permanently Resim.
     /// </summary>
+    /// <summary>
+    /// Called by <see cref="MonkeNet.Client.ClientEntityManager"/> AFTER
+    /// the Authority field is written from an AuthorityChangedMessage. For
+    /// policies whose <see cref="EffectiveTier"/> depends on Authority
+    /// (AuthorityTransfer), this is the only signal that the tier may have
+    /// flipped without any local-tick state change. Without it, the icon
+    /// label (and any other tier-derived UI) would only update on the next
+    /// TickTierHysteresis call AFTER the next contact upgrade — by which
+    /// point Authority may have been released already.
+    ///
+    /// Synthesises an EffectiveTier diff using <paramref name="previousTier"/>
+    /// (sampled by the caller BEFORE the Authority write) and the now-current
+    /// EffectiveTier. Fires <see cref="OnEffectiveTierChanged"/> on a flip,
+    /// which subclasses use to repaint the on-body tier glyph and run any
+    /// other tier-transition logic (kinematic/dynamic flip, contact cascade, etc.).
+    /// </summary>
+    public void NotifyAuthorityChanged(PredictionTier previousTier)
+    {
+        var now = EffectiveTier;
+        if (now != previousTier) OnEffectiveTierChanged(previousTier, now);
+    }
+
     public void TickTierHysteresis()
     {
-        if (Policy != InterpolationPolicy.Hysteresis) return;
+        if (Policy != InterpolationPolicy.Hysteresis &&
+            Policy != InterpolationPolicy.AuthorityTransfer &&
+            Policy != InterpolationPolicy.BlendedVelocity) return;
         if (_resimUpgradeTicksRemaining <= 0) return;
         var prev = EffectiveTier;
-        _resimUpgradeTicksRemaining--;
+        // T2 hold-while-moving: if the body still has meaningful velocity,
+        // skip the decrement. Demoting a mid-flight body hands its motion
+        // over to the snapshot interpolation stream — which is InterpDelay
+        // ticks BEHIND real time, so the body's current trajectory is ahead
+        // of the snap target and the body visually stops / lurches backwards
+        // to land on the delayed pose. Holding Resim until the body actually
+        // settles keeps the visible motion continuous; only when the body is
+        // both client-at-rest AND the snapshot stream shows it at rest does
+        // the demote fire (via ShouldAutoDemote).
+        if (ShouldHoldResimWhileMoving())
+        {
+            // Don't decrement and don't fire transitions — counter stays at
+            // its current value. Next tick we re-evaluate.
+            return;
+        }
+        // T2 auto-demote: fast-forward to Interpolate when the entity's body
+        // has settled BEFORE the full hysteresis window has elapsed. A still
+        // body sitting through 15 ticks of unnecessary local sim costs more
+        // than just letting it go back to the cheap kinematic-interp path
+        // early. Default ShouldAutoDemote is false — only entities that opt
+        // in (typically rigid props) demote early.
+        if (ShouldAutoDemote()) _resimUpgradeTicksRemaining = 0;
+        else _resimUpgradeTicksRemaining--;
         var now = EffectiveTier;
         if (now != prev) OnEffectiveTierChanged(prev, now);
+        // AuthorityTransfer: when the hysteresis window just expired AND we
+        // currently own this entity, ask the server to take authority back.
+        // The body returns to BaseTier (typically Interpolate) once the
+        // server's AuthorityChangedMessage propagates. Without the release
+        // the client would hold ownership indefinitely — defeating the
+        // "interpolate by default" contract on the next idle-cube test.
+        if (Policy == InterpolationPolicy.AuthorityTransfer
+            && _resimUpgradeTicksRemaining == 0
+            && IsLocallyOwned())
+        {
+            ClientManager.Instance?.ReleaseAuthority(EntityId);
+            MonkeLogger.Debug($"[AUTH-TRANSFER] eid={EntityId} releasing authority (contact window expired)");
+        }
     }
+
+    /// <summary>
+    /// Per-tick predicate evaluated by <see cref="TickTierHysteresis"/>. Return
+    /// true while the body has enough velocity that demoting now would visibly
+    /// stop / lurch the motion. Default false preserves the count-down for
+    /// entities that don't opt in. Rigid props override this with a velocity
+    /// threshold.
+    /// </summary>
+    protected virtual bool ShouldHoldResimWhileMoving() { return false; }
+
+    /// <summary>
+    /// Per-tick predicate evaluated by <see cref="TickTierHysteresis"/>. Return
+    /// true when both client and server agree the entity has settled and the
+    /// remaining hysteresis ticks should be skipped. Default false preserves
+    /// the original tick-counted behaviour for entities that don't opt in.
+    /// Override on rigid props to query the wrapped body's velocity.
+    /// </summary>
+    protected virtual bool ShouldAutoDemote() { return false; }
 
     /// <summary>
     /// Fires exactly once each time <see cref="EffectiveTier"/> flips. Default
@@ -223,16 +381,32 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     public virtual void ResimulateTick(IPackableElement input) { }
 
     /// <summary>
-    /// Called by <see cref="ClientPredictionManager"/> when this entity is in
-    /// <see cref="PredictionTier.Interpolate"/> tier and its snapshot
-    /// reconciliation indicates a miss. Default behaviour delegates to
-    /// <see cref="HandleReconciliation"/> — a hard snap to authoritative pose —
-    /// so an entity that simply opts into Interpolate without overriding still
-    /// gets the no-rollback property (the snap happens in the per-entity
-    /// reconcile path, no full-scene resim is fired). Entities that want a
-    /// smoother visual — e.g. <c>LocalRigidPropPrediction</c> — override this
-    /// to lerp body pose/vel toward the snapshot over several ticks instead
-    /// of teleporting.
+    /// UE5-style velocity blend used when <see cref="Policy"/> is
+    /// <see cref="InterpolationPolicy.BlendedVelocity"/>. Instead of teleporting
+    /// the body to the authoritative pose on misprediction, the prediction
+    /// manager calls this method so the entity can write a convex blend of its
+    /// CURRENT velocity with the SERVER'S velocity into the underlying body.
+    /// Over the next several ticks the body's pose drifts toward server pose
+    /// without ever discontinuously snapping — the cost of a single mispredict
+    /// is one velocity write, not a SpaceStep × resimTicks rollback.
+    ///
+    /// <paramref name="blendAlpha"/> is the convex weight of the SERVER's
+    /// velocity: 0 = keep local, 1 = full server velocity. Typical values
+    /// 0.3–0.6 — high enough to converge in a few ticks, low enough to keep
+    /// local input feel. Default no-op; override on each entity type that
+    /// supports velocity blending (typically anything with a wrapped
+    /// PredictionRigidbody3D).
+    /// </summary>
+    public virtual void ApplyBlendedVelocity(IEntityStateData receivedState, float blendAlpha) { }
+
+    /// <summary>
+    /// Deprecated in T2. Was called by the prediction manager when an
+    /// Interpolate-tier entity mispredicted; now Interpolate-tier bodies are
+    /// kinematic and driven directly from the snapshot-history buffer, so the
+    /// manager no longer routes mispredict events through this method. Kept
+    /// virtual so existing entity subclasses that override it still compile,
+    /// but the default body simply delegates to <see cref="HandleReconciliation"/>
+    /// for any caller that still invokes it directly.
     /// </summary>
     public virtual void HandleInterpolateReconciliation(IEntityStateData receivedState)
     {

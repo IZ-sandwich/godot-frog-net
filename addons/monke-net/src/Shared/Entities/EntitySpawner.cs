@@ -169,6 +169,20 @@ public partial class EntitySpawner : Node
         // would unfreeze a body that has fallen a different distance based on
         // when its local clock processed the spawn event, defeating the
         // synchronisation we're trying to establish.
+        //
+        // FreezeMode=Static (not Kinematic): both modes halt simulation, but
+        // they take different transform-sync paths in Jolt. Kinematic-mode
+        // transform writes are stored in JoltBody3D::kinematic_transform
+        // without touching the underlying Jolt body's mPosition; the next
+        // physics step then synthesises mLinearVelocity = (kinematic_target −
+        // mPosition) / dt via MoveKinematic (Jolt MotionProperties.inl:17),
+        // and a caller-applied GlobalPosition override that races after this
+        // freeze produces a (target/dt) ghost velocity in the first snapshot
+        // — observed in OffsetPushPlots/offset_push_baseline.server.log as
+        // vel=(39, 30, −150) m/s for a cube spawned at (0.65, 0.5, −2.5).
+        // Static-frozen bodies don't run the kinematic-motion path at all,
+        // so the same transform write goes through BodyInterface::SetPositionAndRotation
+        // and snaps mPosition directly with no derived velocity.
         if (root is RigidBody3D rb)
         {
             pending.WasFrozenBefore = rb.Freeze;

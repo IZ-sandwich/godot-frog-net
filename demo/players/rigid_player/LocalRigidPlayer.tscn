@@ -64,9 +64,11 @@ lock_rotation = true
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0)
 shape = SubResource("CapsuleShape3D_rplyr")
 
-[node name="KnightRig" parent="." unique_id=1602080710 instance=ExtResource("5_knight")]
+[node name="SmoothedAttach" type="Node3D" parent="." unique_id=1602080750]
 
-[node name="Skeleton3D" parent="KnightRig/Rig" parent_id_path=PackedInt32Array(1602080710, 214440352) index="0" unique_id=1446148158]
+[node name="KnightRig" parent="SmoothedAttach" unique_id=1602080710 instance=ExtResource("5_knight")]
+
+[node name="Skeleton3D" parent="SmoothedAttach/KnightRig/Rig" parent_id_path=PackedInt32Array(1602080750, 1602080710, 214440352) index="0" unique_id=1446148158]
 bones/1/position = Vector3(0, 0.389343, 0)
 bones/1/rotation = Quaternion(-1.11122625e-10, 0.043157753, 2.5724098e-09, 0.9990683)
 bones/2/rotation = Quaternion(-6.938893e-18, 7.1054274e-15, 4.93038e-32, 1)
@@ -116,42 +118,42 @@ bones/48/rotation = Quaternion(-0.7071068, -7.279511e-08, -7.279509e-08, 0.70710
 bones/49/position = Vector3(-0.5108437, 0.78177464, 0.05973692)
 bones/49/rotation = Quaternion(-0.7582528, -1.527369e-07, 0.65196073, -1.1175871e-08)
 
-[node name="1H_Sword_Offhand" parent="KnightRig/Rig/Skeleton3D" index="0" unique_id=702586942]
+[node name="1H_Sword_Offhand" parent="SmoothedAttach/KnightRig/Rig/Skeleton3D" index="0" unique_id=702586942]
 transform = Transform3D(2.0778929e-05, 0.26291952, 0.96481705, 0.9999632, -0.008165886, 0.0022040892, 0.008458383, 0.96478266, -0.2629102, 0.51212454, 0.6296494, -0.0027970895)
 visible = false
 
-[node name="Badge_Shield" parent="KnightRig/Rig/Skeleton3D" index="1" unique_id=437754441]
+[node name="Badge_Shield" parent="SmoothedAttach/KnightRig/Rig/Skeleton3D" index="1" unique_id=437754441]
 transform = Transform3D(2.0801497e-05, 0.2629193, 0.9648171, 0.9999632, -0.008168421, 0.0022047549, 0.008461004, 0.9647827, -0.26290998, 0.66252536, 0.6299931, -0.043780934)
 visible = false
 
-[node name="Rectangle_Shield" parent="KnightRig/Rig/Skeleton3D" index="2" unique_id=2006447081]
+[node name="Rectangle_Shield" parent="SmoothedAttach/KnightRig/Rig/Skeleton3D" index="2" unique_id=2006447081]
 transform = Transform3D(2.0801497e-05, 0.2629193, 0.9648171, 0.9999632, -0.008168421, 0.0022047549, 0.008461004, 0.9647827, -0.26290998, 0.66252536, 0.6299931, -0.043780934)
 visible = false
 
-[node name="Round_Shield" parent="KnightRig/Rig/Skeleton3D" index="3" unique_id=1642568327]
+[node name="Round_Shield" parent="SmoothedAttach/KnightRig/Rig/Skeleton3D" index="3" unique_id=1642568327]
 transform = Transform3D(2.0801497e-05, 0.2629193, 0.9648171, 0.9999632, -0.008168421, 0.0022047549, 0.008461004, 0.9647827, -0.26290998, 0.66252536, 0.6299931, -0.043780934)
 
-[node name="Spike_Shield" parent="KnightRig/Rig/Skeleton3D" index="4" unique_id=1700585556]
+[node name="Spike_Shield" parent="SmoothedAttach/KnightRig/Rig/Skeleton3D" index="4" unique_id=1700585556]
 transform = Transform3D(2.0801497e-05, 0.2629193, 0.9648171, 0.9999632, -0.008168421, 0.0022047549, 0.008461004, 0.9647827, -0.26290998, 0.66252536, 0.6299931, -0.043780934)
 visible = false
 
-[node name="1H_Sword" parent="KnightRig/Rig/Skeleton3D" index="5" unique_id=1805368644]
+[node name="1H_Sword" parent="SmoothedAttach/KnightRig/Rig/Skeleton3D" index="5" unique_id=1805368644]
 transform = Transform3D(-0.0010302744, -0.15439679, 0.9880078, 0.99998975, -0.0043359767, 0.0003650612, 0.0042279908, 0.98799884, 0.15440004, -0.4962108, 0.6338519, 0.13882436)
 
-[node name="2H_Sword" parent="KnightRig/Rig/Skeleton3D" index="6" unique_id=635319864]
+[node name="2H_Sword" parent="SmoothedAttach/KnightRig/Rig/Skeleton3D" index="6" unique_id=635319864]
 transform = Transform3D(-0.0010302903, -0.15439679, 0.9880078, 0.99998975, -0.0043359916, 0.00036507487, 0.0042280033, 0.98799884, 0.15440004, -0.4962108, 0.6338519, 0.13882436)
 visible = false
 
-[node name="Knight_Helmet" parent="KnightRig/Rig/Skeleton3D" index="7" unique_id=285606774]
+[node name="Knight_Helmet" parent="SmoothedAttach/KnightRig/Rig/Skeleton3D" index="7" unique_id=285606774]
 transform = Transform3D(0.9997204, -1.4014349e-09, 0.023646597, 1.3934147e-09, 0.99999994, 3.5568634e-10, -0.023646597, -3.226374e-10, 0.9997204, 4.6986912e-07, 1.1995708, -1.197793e-07)
 
-[node name="Knight_Cape" parent="KnightRig/Rig/Skeleton3D" index="8" unique_id=1851400103]
+[node name="Knight_Cape" parent="SmoothedAttach/KnightRig/Rig/Skeleton3D" index="8" unique_id=1851400103]
 transform = Transform3D(0.9962748, -5.1496167e-09, 0.08623532, 5.1304343e-09, 0.99999994, 4.4407705e-10, -0.08623532, 1.8800716e-15, 0.9962748, -1.6302259e-08, 1.1995709, -1.4013642e-07)
 
 [node name="AnimationTree" type="AnimationTree" parent="." unique_id=1602080711]
-root_node = NodePath("../KnightRig")
+root_node = NodePath("../SmoothedAttach/KnightRig")
 tree_root = SubResource("AnimationNodeStateMachine_rplyr")
-anim_player = NodePath("../KnightRig/AnimationPlayer")
+anim_player = NodePath("../SmoothedAttach/KnightRig/AnimationPlayer")
 parameters/conditions/idle = true
 parameters/conditions/jump = false
 parameters/conditions/run = false
@@ -165,7 +167,7 @@ metadata/_custom_type_script = "uid://232c1ulw1sk3"
 [node name="PredictionVisualSmoothing" type="Node3D" parent="." unique_id=1602080720 node_paths=PackedStringArray("Body", "Visual")]
 script = ExtResource("2_smooth")
 Body = NodePath("..")
-Visual = NodePath("../KnightRig")
+Visual = NodePath("../SmoothedAttach")
 DecayTime = 0.3
 SmoothRotation = false
 metadata/_custom_type_script = "uid://rp5ifdkt35gg"
@@ -181,11 +183,11 @@ script = ExtResource("1_lrpp")
 _predictionRb = NodePath("../PredictionRigidbody")
 metadata/_custom_type_script = "uid://2rptuj0wp7kx"
 
-[node name="RotationHelperY" type="Node3D" parent="." unique_id=1602080704]
+[node name="RotationHelperY" type="Node3D" parent="SmoothedAttach" unique_id=1602080704]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.8, 0)
 metadata/_edit_lock_ = true
 
-[node name="Camera" type="Camera3D" parent="RotationHelperY" unique_id=1602080705]
+[node name="Camera" type="Camera3D" parent="SmoothedAttach/RotationHelperY" unique_id=1602080705]
 cull_mask = 1048573
 current = true
 fov = 90.0
@@ -193,6 +195,6 @@ script = ExtResource("3_camera")
 
 [node name="PlayerInputProducer" type="Node" parent="." unique_id=1602080706 node_paths=PackedStringArray("_cameraController")]
 script = ExtResource("4_input")
-_cameraController = NodePath("../RotationHelperY/Camera")
+_cameraController = NodePath("../SmoothedAttach/RotationHelperY/Camera")
 
-[editable path="KnightRig"]
+[editable path="SmoothedAttach/KnightRig"]

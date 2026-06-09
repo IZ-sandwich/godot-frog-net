@@ -35,6 +35,31 @@ public partial class ClientPredictionManager : InternalClientComponent
 
 
 
+    // T2 kinematic-interp: per-entity snapshot history buffer for Interpolate-tier bodies.
+    // Keyed by EntityId; each entry is a sorted deque of recent (tick, state) pairs.
+    // TryGetInterpolatedSnapshot lerps between the two snapshots that bracket the
+    // current interpolation time (currentTick - InterpDelayTicks). Replaces the T1
+    // always-blend Reconcile path: Interpolate bodies become frozen-kinematic and sit
+    // at the lerped snapshot pose each render frame, so we never write to their bodies
+    // via Reconcile — eliminating ~40K Reconcile writes per cell that previously
+    // perturbed Jolt contact manifolds and destabilised Resim-tier neighbours.
+    private readonly Dictionary<int, SortedDictionary<int, IEntityStateData>> _snapshotHistoryByEid = new();
+    // ~400 ms of history at 20 Hz snapshot rate, well above any practical interp delay.
+    // 8 entries × ~3-tick period = ~24 ticks; the targetTick we read for is only
+    // InterpDelayTicks (6) behind current, so we always have several headroom snapshots.
+    private const int SnapshotHistoryCapPerEntity = 8;
+
+    /// <summary>
+    /// Singleton access for Interpolate-tier kinematic bodies that need to query
+    /// the snapshot interpolation accessor every physics tick. The manager is a
+    /// child node of <see cref="ClientManager"/>, so a scene-tree lookup works
+    /// — but it would walk the children list on every prop every tick, which at
+    /// 60 Hz × N props is enough overhead to show up in a profile. A static
+    /// reference self-registered in <see cref="_Ready"/> avoids that cost
+    /// without changing the autoload setup.
+    /// </summary>
+    public static ClientPredictionManager Instance { get; private set; }
+
     private readonly List<PredictedState> _predictedStates = [];
     // Per-entity per-tick input cache populated from GameSnapshotMessage.Inputs
     // on every snapshot. Each snapshot carries the last N inputs the server
@@ -67,6 +92,10 @@ public partial class ClientPredictionManager : InternalClientComponent
     // catches the body up to the current client tick) but suppress the count.
     private readonly HashSet<int> _initializedEntityIds = [];
     private int _lastTickReceived = 0;
+    /// <summary>Tick of the most recent snapshot received from the server.
+    /// Exposed for per-entity gates that need to wait for the next snapshot
+    /// after a tier transition (UE5 PostResimWaitForUpdate equivalent).</summary>
+    public int LastReceivedTick => _lastTickReceived;
     private int _misspredictionsCount = 0;
     private int _mispredictsExternalForce = 0;
     private int _mispredictsPhysicsNondeterminism = 0;
@@ -79,11 +108,22 @@ public partial class ClientPredictionManager : InternalClientComponent
     /// </summary>
     public int MispredictionsCount => _misspredictionsCount;
     /// <summary>
-    /// Count of mispredictions absorbed by the per-entity Interpolate-tier blend path
-    /// (see <see cref="ClientPredictedEntity.HandleInterpolateReconciliation"/>). These
-    /// are NOT full-scene rollbacks — the body is gently nudged toward the snapshot pose
-    /// over a few ticks. Surfaced for the T1 two-tier test to verify drift on idle props
-    /// is being absorbed by blends rather than the rollback path.
+    /// Per-tick BlendedVelocity correction events — entities under the
+    /// InterpolationPolicy.BlendedVelocity policy that tripped HasMisspredicted
+    /// and got a velocity-blend correction instead of a rollback. Excluded from
+    /// <see cref="MispredictionsCount"/> because the policy is smooth-converge
+    /// by design: a tripped threshold is one step of continuous convergence,
+    /// not a discrete "this body went wrong" event. Surfaced separately so the
+    /// metric is still observable for diagnostics.
+    /// </summary>
+    public int BlendedVelocityCorrectionsCount => _blendedVelocityCorrectionsCount;
+    private int _blendedVelocityCorrectionsCount = 0;
+    /// <summary>
+    /// Deprecated — kept for harness compatibility, no longer increments.
+    /// In T1 this counted blend writes from the always-blend Interpolate path.
+    /// In T2 Interpolate-tier bodies are kinematic and driven directly from
+    /// the snapshot-history buffer, so there is no per-snapshot blend write
+    /// to count. Always returns 0.
     /// </summary>
     public int InterpolateReconcileCount => _interpolateReconcileCount;
     private int _interpolateReconcileCount = 0;
@@ -132,6 +172,21 @@ public partial class ClientPredictionManager : InternalClientComponent
     // server-owned passive props (which never have input) do not inflate the
     // M9 metric — see ResolveRemoteInput for the rationale.
     private readonly HashSet<int> _entitiesEverHadInput = new();
+
+    // post_resim_wait_for_update — UE5 PredictiveInterpolation pattern. After
+    // we apply a correction (full rollback OR per-entity BlendedVelocity blend)
+    // for entity E at server-tick S, the server has not yet observed the
+    // corrected state — its next ~RTT-worth of snapshots will continue to
+    // reflect its own divergent sim. Comparing those snapshots against our
+    // (post-correction) predicted states produces spurious follow-up trips
+    // that fire another correction on a still-converging body, manifesting as
+    // a chain of small snaps. We suppress the HasMisspredicted check for E
+    // until we receive a snapshot whose tick is strictly greater than the
+    // local tick at which the correction was applied — by then the server has
+    // had a chance to see our acknowledged inputs and the comparison is fair
+    // again. ApplyAuthoritativeNonPoseState still runs during the suppress
+    // window so non-pose auxiliary state stays in sync.
+    private readonly Dictionary<int, int> _postResimSuppressUntilTick = new();
     private int _missedLocalState = 0;
     private int _snapOverflowCount = 0;
     private int _trimmedTotal = 0;
@@ -166,6 +221,7 @@ public partial class ClientPredictionManager : InternalClientComponent
     public override void _Ready()
     {
         base._Ready();
+        Instance = this;
         // Subscribe to EntityDestroyed so we can drop stale entries from _predictedStates.
         // Without this, an authority transfer (which destroys+recreates the local entity on
         // the previous owner) leaves the prediction loop iterating freed Godot objects.
@@ -183,6 +239,7 @@ public partial class ClientPredictionManager : InternalClientComponent
 
     public override void _ExitTree()
     {
+        if (Instance == this) Instance = null;
         if (_subscribedSpawner != null && IsInstanceValid(_subscribedSpawner))
             _subscribedSpawner.EntityDestroyed -= OnEntityDestroyed;
         _subscribedSpawner = null;
@@ -230,6 +287,8 @@ public partial class ClientPredictionManager : InternalClientComponent
         _remoteEntitiesAwaitingInput.Remove(entityId);
         _entitiesEverHadInput.Remove(entityId);
         _lastReportedTierByEid.Remove(entityId);
+        _snapshotHistoryByEid.Remove(entityId);
+        _postResimSuppressUntilTick.Remove(entityId);
     }
 
     protected override void OnCommandReceived(IPackableMessage command)
@@ -286,6 +345,7 @@ public partial class ClientPredictionManager : InternalClientComponent
                     MonkeLogger.Debug($"[NET-SNAP-RX]   state[{i}]={snapshot.States[i]}");
                 _lastTickReceived = snapshot.Tick;
                 CacheInputsFromSnapshot(snapshot);
+                CacheSnapshotsFromMessage(snapshot);
                 ProcessServerState(snapshot);
             }
             else
@@ -333,6 +393,127 @@ public partial class ClientPredictionManager : InternalClientComponent
             // not passive server-authoritative props).
             _entitiesEverHadInput.Add(entry.EntityId);
         }
+    }
+
+    // T2: cache the full per-entity pose history from each incoming snapshot so
+    // Interpolate-tier kinematic bodies can lerp between bracketing snapshots in
+    // OnPostPhysicsTick. Costs one dictionary write + a single trim per (entity,
+    // snapshot) pair; a 20-entity scene at 20 Hz is ~400 ops/s, negligible.
+    private void CacheSnapshotsFromMessage(GameSnapshotMessage snapshot)
+    {
+        if (snapshot.States == null) return;
+        foreach (var state in snapshot.States)
+        {
+            if (state == null) continue;
+            int eid = state.EntityId;
+            if (!_snapshotHistoryByEid.TryGetValue(eid, out var hist))
+            {
+                hist = new SortedDictionary<int, IEntityStateData>();
+                _snapshotHistoryByEid[eid] = hist;
+            }
+            hist[snapshot.Tick] = state;
+            while (hist.Count > SnapshotHistoryCapPerEntity)
+                hist.Remove(hist.Keys.First());
+        }
+    }
+
+    /// <summary>
+    /// Render delay (in ticks) applied to the snapshot-interpolation target by
+    /// <see cref="TryGetInterpolatedSnapshot"/>. Set to one snapshot period
+    /// (~3 ticks at 20 Hz over 60 Hz physics) so the kinematic body is
+    /// rendered just behind the latest known snapshot but inside the
+    /// next-snapshot envelope when it arrives — minimising the position
+    /// gap a Resim upgrade has to live with while still buffering enough
+    /// jitter that snapshot dropouts don't immediately extrapolate.
+    ///
+    /// Source's classic 2 × snapshot_period (6 ticks) is right for purely
+    /// visual interpolation where you NEVER simulate the body locally; it
+    /// gives wide jitter tolerance at the cost of visible "delay" between
+    /// server truth and the rendered body. For our case the body needs to
+    /// transition smoothly into local simulation on contact, and the
+    /// position gap at upgrade time is exactly (InterpDelayTicks × dt)
+    /// metres along the snapshot velocity — bigger delay = bigger gap =
+    /// more mispredicts on the post-upgrade tick.
+    /// </summary>
+    public int InterpDelayTicks => 3;
+
+    /// <summary>
+    /// Returns the newest snapshot the manager has cached for the given
+    /// entity, regardless of <see cref="InterpDelayTicks"/>. Used when an
+    /// Interpolate-tier body upgrades to Resim on contact: the freshest
+    /// velocity available is more representative of the server's current
+    /// motion than the interpolated (delayed) one — when the server-side
+    /// counterpart was hit a few ticks ago its latest snapshot already
+    /// reflects the post-hit velocity. Using the delayed sample seeds from
+    /// the pre-hit at-rest state and produces a one-tick velocity gap on
+    /// the very first simulated step after upgrade.
+    /// </summary>
+    public IEntityStateData TryGetLatestSnapshot(int eid)
+    {
+        if (!_snapshotHistoryByEid.TryGetValue(eid, out var hist) || hist.Count == 0) return null;
+        return hist[hist.Last().Key];
+    }
+
+    /// <summary>
+    /// Returns the two snapshots that bracket <c>currentTick - <see cref="InterpDelayTicks"/></c>
+    /// for the given entity, plus the lerp alpha between them. Caller uses its own
+    /// <c>ExtractAuthoritative*</c> overrides to read pos/rot/vel from the
+    /// snapshot's <see cref="IEntityStateData"/> — keeps the library layer-clean
+    /// (no demo-message types referenced from monke-net code).
+    ///
+    /// Output semantics:
+    ///   - history empty           → returns false; caller should freeze body in place.
+    ///   - targetTick &lt; oldest  → s0 = oldest, s1 = null, alpha = 0 (render at oldest).
+    ///   - targetTick &gt; newest  → s0 = newest, s1 = null, alpha = (targetTick - newestTick)
+    ///                               so caller can extrapolate as <c>newestPos + newestVel × alpha × dt</c>.
+    ///                               <paramref name="extrapolate"/> is true in this case.
+    ///   - inside the buffer       → s0, s1 = bracketing entries, alpha ∈ [0, 1].
+    /// </summary>
+    internal bool TryGetInterpolatedSnapshot(
+        int eid,
+        int currentTick,
+        out IEntityStateData s0,
+        out IEntityStateData s1,
+        out float alpha,
+        out bool extrapolate)
+    {
+        s0 = null; s1 = null; alpha = 0f; extrapolate = false;
+        if (!_snapshotHistoryByEid.TryGetValue(eid, out var hist) || hist.Count == 0) return false;
+
+        int targetTick = currentTick - InterpDelayTicks;
+        int t0 = int.MinValue, t1 = int.MinValue;
+        foreach (var k in hist.Keys)
+        {
+            if (k <= targetTick) t0 = k;
+            else { t1 = k; break; }
+        }
+
+        if (t0 == int.MinValue)
+        {
+            // Target time precedes oldest snapshot — entity is freshly spawned
+            // or just came into observable range. Render at the oldest known
+            // pose; the next snapshot will populate the buffer further back.
+            var first = hist.First();
+            s0 = first.Value;
+            alpha = 0f;
+            return true;
+        }
+        if (t1 == int.MinValue)
+        {
+            // Target time exceeds newest snapshot — snapshot dropout or the
+            // client clock just advanced past the latest snapshot. Caller
+            // should extrapolate along the newest snapshot's velocity; alpha
+            // carries the tick distance for the caller to multiply by dt.
+            s0 = hist[hist.Last().Key];
+            alpha = (float)(targetTick - hist.Last().Key);
+            extrapolate = true;
+            return true;
+        }
+
+        s0 = hist[t0];
+        s1 = hist[t1];
+        alpha = Mathf.Clamp((targetTick - t0) / (float)(t1 - t0), 0f, 1f);
+        return true;
     }
 
     /// <summary>
@@ -640,6 +821,13 @@ public partial class ClientPredictionManager : InternalClientComponent
             return;
         }
 
+        // Local network id, used below by the AuthorityTransfer short-circuit.
+        int myId = ClientManager.Instance?.GetNetworkId() ?? 0;
+        // Current local tick — recorded into _postResimSuppressUntilTick when
+        // we fire a correction so subsequent snapshots up to this tick skip
+        // the mispredict check. See _postResimSuppressUntilTick declaration.
+        int currentLocalTick = ClientManager.Instance?.GetNodeOrNull<ClientNetworkClock>("ClientNetworkClock")?.GetCurrentTick() ?? receivedSnapshot.Tick;
+
         // Iterate all entities saved for the tick
         foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
         {
@@ -665,38 +853,58 @@ public partial class ClientPredictionManager : InternalClientComponent
             if (predCheckHasDrift)
                 MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} predPos=({predictedState.Position.X:F3},{predictedState.Position.Y:F3},{predictedState.Position.Z:F3}) authPos=({authPos.X:F3},{authPos.Y:F3},{authPos.Z:F3}) |posDiff|={posDiffMag:F4}m predVel=({predictedState.LinearVelocity.X:F3},{predictedState.LinearVelocity.Y:F3},{predictedState.LinearVelocity.Z:F3})");
 
-            // Interpolate tier: blend toward the snapshot pose on EVERY snapshot,
-            // regardless of drift magnitude. The HasMisspredicted threshold gate
-            // is a Resim-tier optimisation (skip expensive rollback for tiny
-            // drift); it does NOT apply here because the blend is cheap and
-            // gating it produces a visible bug — sub-threshold drift (under 0.2 m)
-            // is left uncorrected, the local Jolt keeps integrating, and by the
-            // time a cube comes to rest its pose can be 10–20 cm off the
-            // authoritative pose. The subsequent SnapToRest then yanks the body
-            // to server pose without smoother compensation, producing a visible
-            // snap. Always-blend keeps the body within blend-lag (≤ snapshot
-            // interval) of authoritative at all times, so SnapToRest is a no-op
-            // when the cube finally settles. Contact-upgraded props flip to
-            // Resim and skip this branch — the player still gets crisp local
-            // physics on the bodies they're actually touching.
-            //
-            // _interpolateReconcileCount keeps its existing semantics — count
-            // of blend writes — but it now scales with snapshot rate × prop
-            // count, not with drift events. Tests that asserted "> 0" still
-            // pass; tests that asserted a tight budget would need adjustment
-            // (none currently exist).
+            // T2 kinematic-interp: Interpolate-tier bodies are server-driven
+            // kinematic. Their pose is lerped from the per-entity snapshot
+            // history buffer in OnPostPhysicsTick (see
+            // TryGetInterpolatedSnapshot). The body never simulates locally
+            // while in this tier, so there is nothing to reconcile here —
+            // dropping the always-blend Reconcile path eliminates ~40K
+            // per-cell body writes that previously perturbed Jolt contact
+            // manifolds and destabilised Resim-tier neighbours. We still call
+            // ApplyAuthoritativeNonPoseState so any non-pose auxiliary state
+            // (e.g. custom flags carried alongside the snapshot) can update
+            // for the next contact tick.
             if (predictableEntity.EffectiveTier == PredictionTier.Interpolate)
             {
-                _interpolateReconcileCount++;
-                MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} -> blend-reconcile (tier=Interpolate, |posDiff|={posDiff.Length():F4}m)");
-                predictableEntity.HandleInterpolateReconciliation(authoritativeState);
-                // ApplyAuthoritativeNonPoseState still runs so SyncSleepState
-                // can mirror the server's sleep flag — but with the body
-                // already at authoritative pose from the blend, SnapToRest
-                // hits its sub-mm noop path and doesn't write the transform.
+                MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} -> kinematic-interp (tier=Interpolate, |posDiff|={posDiff.Length():F4}m)");
                 predictableEntity.ApplyAuthoritativeNonPoseState(authoritativeState);
                 continue;
             }
+
+            // AuthorityTransfer + locally-owned: short-circuit the reconcile
+            // path entirely. The local client currently holds State Authority
+            // for this entity (server flipped Authority via AuthorityChangedMessage
+            // on the OwnershipChangeRequest we sent on contact). The local sim
+            // IS the truth while held — the server's snapshot for an owned
+            // entity is just the server's own independent Jolt sim, which
+            // drifts cross-process and will never quite match. Reconciling to
+            // it here would (a) drag the locally-controlled body back toward
+            // the server's stale state, breaking the "local sim is authoritative"
+            // semantic of Fusion 2-style authority transfer, and (b) accumulate
+            // visual offsets in the PredictionVisualSmoothing3D each tick —
+            // visible at ticks 670–1170 of policy_authority_transfer.client.log
+            // as ~50 cm visLocal divergence on the cubes the player was pushing.
+            if (predictableEntity.Policy == InterpolationPolicy.AuthorityTransfer
+                && predictableEntity.Authority == myId)
+            {
+                MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} -> auth-transfer-owned skip");
+                predictableEntity.ApplyAuthoritativeNonPoseState(authoritativeState);
+                continue;
+            }
+
+            // post_resim_wait_for_update — within the suppress window we still
+            // sync auxiliary state but do NOT compare poses; the body is
+            // assumed to be converging from the recent correction.
+            if (_postResimSuppressUntilTick.TryGetValue(predictableEntity.EntityId, out int suppressUntil)
+                && receivedSnapshot.Tick <= suppressUntil)
+            {
+                MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} -> post-resim suppress (until={suppressUntil})");
+                predictableEntity.ApplyAuthoritativeNonPoseState(authoritativeState);
+                continue;
+            }
+            // Suppress window has elapsed (or never armed) — clear so we don't
+            // accumulate stale entries for entities that never mispredict again.
+            _postResimSuppressUntilTick.Remove(predictableEntity.EntityId);
 
             // Resim tier: threshold-gated full-scene rollback. The 0.2 m / 1 m/s
             // gate exists because rollback re-simulates every body in the
@@ -705,7 +913,18 @@ public partial class ClientPredictionManager : InternalClientComponent
             // by PredictionVisualSmoothing3D on the visual mesh.
             if (predictableEntity.HasMisspredicted(receivedSnapshot.Tick, authoritativeState, predictedState))
             {
-                _misspredictionsCount++;
+                // BlendedVelocity entities are excluded from the user-visible
+                // MispredictionsCount: their policy is "smoothly converge via
+                // velocity blend, never snap", so each tripped threshold is a
+                // step in continuous convergence rather than a discrete
+                // misprediction event. The per-class diagnostic counters
+                // (external-force / physics-nondeterminism / degraded-network)
+                // and BlendedVelocityCorrectionsCount still increment so the
+                // metric is recoverable for analysis; the HUD overlay just
+                // doesn't count them toward the headline "mispredictions" total.
+                bool isBlendedVelocity = predictableEntity.Policy == InterpolationPolicy.BlendedVelocity;
+                if (!isBlendedVelocity) _misspredictionsCount++;
+                else _blendedVelocityCorrectionsCount++;
                 Vector3 authVel = predictableEntity.ExtractAuthoritativeVelocity(authoritativeState);
                 Vector3 velDiff = authVel - predictedState.LinearVelocity;
                 string cause = ClassifyMisprediction(velDiff, predictedState.LinearVelocity, networkDegraded);
@@ -716,7 +935,36 @@ public partial class ClientPredictionManager : InternalClientComponent
                     case "degraded-network":        _mispredictsDegradedNetwork++; break;
                 }
                 LogMispredictionThrottled(predictableEntity, predictedState, authoritativeState, receivedSnapshot.Tick, networkDegraded);
+
+                // UE5 PredictiveInterpolation branch — bypass the full-scene
+                // rollback and use a per-entity velocity blend instead. Body
+                // pose is never teleported; the body drifts toward authoritative
+                // over the next few ticks via the blended velocity.
+                if (isBlendedVelocity)
+                {
+                    // 0.5 = 50/50 convex blend. Tunable per entity type via
+                    // ApplyBlendedVelocity override if a different convergence
+                    // rate is desired.
+                    const float BlendAlpha = 0.5f;
+                    MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} MISPREDICTED -> velocity-blend (policy=BlendedVelocity, alpha={BlendAlpha}, class={cause})");
+                    predictableEntity.ApplyBlendedVelocity(authoritativeState, BlendAlpha);
+                    predictableEntity.ApplyAuthoritativeNonPoseState(authoritativeState);
+                    // Arm post-resim suppression: ignore further mispredict checks
+                    // for this entity until a snapshot arrives that reflects the
+                    // server having seen our correction (snapshot.Tick > currentLocalTick).
+                    _postResimSuppressUntilTick[predictableEntity.EntityId] = currentLocalTick;
+                    MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} post-resim suppress armed until tick={currentLocalTick}");
+                    continue;
+                }
+
                 MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} MISPREDICTED -> rollback (tier=Resim, class={cause})");
+                // Arm post-resim suppression for EVERY entity touched by the
+                // rollback (the whole scene gets resim'd, so every Resim-tier
+                // body's predicted history has been rewritten). Set BEFORE the
+                // call since RollbackAndResimulate may return early in
+                // listen-server mode.
+                foreach (var e in predictedStateData.Entities.Keys)
+                    _postResimSuppressUntilTick[e.EntityId] = currentLocalTick;
                 RollbackAndResimulate(receivedSnapshot.States, predictedStateData);
                 return;
             }
@@ -946,8 +1194,57 @@ public partial class ClientPredictionManager : InternalClientComponent
         // model where every client predicts every entity (including server-owned ones) —
         // reconcile is the only way the client's locally-simulated body learns the
         // server's authoritative state.
+        //
+        // Exception: AuthorityTransfer entities the local client currently
+        // owns. The local sim IS the truth for those — reconciling to the
+        // server's parallel sim would (a) corrupt the locally-controlled
+        // body's state, (b) misalign the visual mesh from the body (the
+        // smoother captures the teleport as a decaying offset; the body
+        // jumps but the mesh lags, breaking the "if I'm the authority, my
+        // visual tracks my body" invariant), and (c) is exactly what
+        // ProcessServerState's per-entity auth-transfer-owned skip is
+        // designed to prevent. The rollback gets here from a DIFFERENT
+        // entity's misprediction — typically the locally-owned player
+        // (eid=7) which is NOT under AuthorityTransfer — and unless we
+        // also skip owned entities here, the player rollback drags every
+        // owned cube along with it.
+        // Skip reconcile for owned AuthorityTransfer entities. Their state
+        // is the local truth — reconciling to the server's parallel sim
+        // would teleport the body and the smoother would absorb the jump
+        // as a decaying visual offset, breaking the "owner's visual tracks
+        // owner's body" invariant. The resim's SpaceStep loop will still
+        // advance the owned body N more ticks (same as everyone else),
+        // which is actually fine: the resim integrates with the same input
+        // / contact set the live tick used, so the post-resim pose is
+        // approximately what the body would have been at anyway. Freezing
+        // the body during the resim was tried — verified empirically that
+        // it produced 2.3 m visLocal offsets because Jolt's freeze+thaw
+        // dance interacts badly with the smoother's CaptureUnexplainedJump
+        // path. The skip-only approach is simpler and gives the smallest
+        // offsets in measurement.
+        int myIdRollback = ClientManager.Instance?.GetNetworkId() ?? 0;
         foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
         {
+            if (predictableEntity.Policy == InterpolationPolicy.AuthorityTransfer
+                && predictableEntity.Authority == myIdRollback)
+            {
+                MonkeLogger.Debug($"[PRED-RECONCILE] tick={predictedStateData.Tick} eid={predictableEntity.EntityId} SKIPPED (auth-transfer-owned)");
+                continue;
+            }
+            // UE5 PredictiveInterpolation strict semantic: BlendedVelocity bodies
+            // are never teleported, ever. They converge via the per-tick velocity
+            // blend in LocalRigidPropPrediction.ApplyContinuousBlendedVelocity,
+            // not via reconcile writes. Skipping HandleReconciliation here means
+            // the body keeps its pre-rollback transform; the resim's whole-space
+            // SpaceStep still advances it by N ticks of natural motion, and the
+            // BV per-tick correction continues closing the gap on subsequent
+            // live ticks. Without this skip the body teleported every time the
+            // PLAYER mispredicted, defeating the purpose of the BV policy.
+            if (predictableEntity.Policy == InterpolationPolicy.BlendedVelocity)
+            {
+                MonkeLogger.Debug($"[PRED-RECONCILE] tick={predictedStateData.Tick} eid={predictableEntity.EntityId} SKIPPED (blended-velocity)");
+                continue;
+            }
             var authoritativeState = FindStateForEntityId(predictableEntity.EntityId, authoritativeStates);
             // Snapshot the body's pre-reconcile pose/velocity so the merged log
             // captures the delta the hard-reset is about to apply. Previously this

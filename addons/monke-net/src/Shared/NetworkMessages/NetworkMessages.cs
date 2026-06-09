@@ -105,6 +105,42 @@ public struct EntityEventMessage : IPackableMessage
 
 }
 
+/// <summary>
+/// Owner-side state relay for AuthorityTransfer entities. When a client holds
+/// State Authority for a physics entity (cube under InterpolationPolicy.AuthorityTransfer),
+/// the server stops simulating its own copy and instead acts as a relay: it
+/// frozen-kinematically holds the body at the pose reported by the owner each
+/// tick, and broadcasts that pose to non-owner clients via the normal snapshot
+/// stream. Sent unreliably (latest-wins; missing packets are OK because the
+/// next tick overwrites them anyway).
+/// </summary>
+public struct EntityStateRelayMessage : IPackableMessage
+{
+    public int EntityId { get; set; }
+    public Vector3 Position { get; set; }
+    public Quaternion Rotation { get; set; }
+    public Vector3 LinearVelocity { get; set; }
+    public Vector3 AngularVelocity { get; set; }
+
+    public void ReadBytes(MessageReader reader)
+    {
+        EntityId = reader.ReadInt32();
+        Position = reader.ReadVector3();
+        Rotation = reader.ReadQuaternion();
+        LinearVelocity = reader.ReadVector3();
+        AngularVelocity = reader.ReadVector3();
+    }
+
+    public readonly void WriteBytes(MessageWriter writer)
+    {
+        writer.Write(EntityId);
+        writer.Write(Position);
+        writer.Write(Rotation);
+        writer.Write(LinearVelocity);
+        writer.Write(AngularVelocity);
+    }
+}
+
 public struct GameSnapshotMessage : IPackableMessage
 {
     public required int Tick { get; set; }

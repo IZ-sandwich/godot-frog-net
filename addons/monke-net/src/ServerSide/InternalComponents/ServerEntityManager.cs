@@ -26,6 +26,7 @@ public partial class ServerEntityManager : InternalServerComponent
     /// </summary>
     [Export] public int InputHistoryPerSnapshot { get; set; } = 5;
 
+
     /// <summary>
     /// Number of ticks to delay a newly-spawned entity's physics activation
     /// after the spawn event is broadcast. The server holds the body
@@ -100,6 +101,37 @@ public partial class ServerEntityManager : InternalServerComponent
         {
             HandleReleaseRequest(clientId, releaseReq.EntityId);
         }
+
+        // Owner-relay path for AuthorityTransfer entities. The owning client
+        // sends its body's current pose+velocity each tick; the server writes
+        // that state onto its (kinematic-frozen) body so the next snapshot
+        // broadcast reflects the owner's view, NOT an independently-simulated
+        // server copy. This eliminates the on-release snap the owner used to
+        // see when the server's parallel Jolt sim diverged from the owner's.
+        if (command is EntityStateRelayMessage relay)
+        {
+            HandleStateRelay(clientId, relay);
+        }
+    }
+
+    private void HandleStateRelay(int senderId, EntityStateRelayMessage relay)
+    {
+        var entity = _entitySpawner.Entities.Find(e => e.EntityId == relay.EntityId);
+        if (entity == null) return;
+        // Authority check: only the current owner can drive state. Drops late
+        // packets from a previous owner whose release crossed in flight.
+        if (entity.Authority != senderId) return;
+        var root = _entitySpawner.GetEntityRoot(entity);
+        if (root is not RigidBody3D body) return;
+        // Body stays DYNAMIC during relay. Each tick we overwrite its state
+        // with what the owner just reported; between relays the server's
+        // natural physics simulates one tick (proper contact response for
+        // the server's player). The transform write invalidates Jolt's
+        // contact manifolds for this body each tick — small per-tick cost
+        // for keeping the server's view aligned with the owner's.
+        body.GlobalTransform = new Transform3D(new Basis(relay.Rotation.Normalized()), relay.Position);
+        body.LinearVelocity = relay.LinearVelocity;
+        body.AngularVelocity = relay.AngularVelocity;
     }
 
     /// <summary>Look up a server-side entity by id, or null if it doesn't
@@ -222,6 +254,34 @@ public partial class ServerEntityManager : InternalServerComponent
         if (oldAuthority == newAuthority) return;
 
         entity.Authority = newAuthority;
+
+        // AuthorityTransfer relay: freeze the body when a client takes ownership
+        // (server stops simulating it; pose comes from owner via
+        // EntityStateRelayMessage). Unfreeze on release so the server resumes
+        // natural physics from the last-relayed pose+velocity. Only applies if
+        // the entity has a RigidBody3D root — players / non-physics entities
+        // are unaffected. The freeze is checked against the actual policy
+        // (only AuthorityTransfer cubes get relay semantics, not vehicles
+        // which carry input and aren't physics-relayed).
+        var config = MonkeNetConfig.Instance?.GetSpawnConfigurationForEntityType(entity.EntityType);
+        var policy = config?.OwnershipPolicy;
+        bool isRelayPolicy = policy?.UseAuthorityTransferRelay ?? false;
+        if (isRelayPolicy)
+        {
+            // Relay policy: server keeps the body DYNAMIC. Each
+            // EntityStateRelayMessage rewrites transform + velocity to the
+            // owner's reported values; between relays the server's natural
+            // physics runs for one tick with normal contact resolution. This
+            // gives the server's player proper push-back on the cube (cube
+            // yields the same way owner's local cube yields, so server-side
+            // player velocity tracks owner's), while keeping the cube
+            // spatially present so it can still support stacks / be stood on.
+            // Earlier kinematic-freeze approach caused the server's player to
+            // bounce off the cube as if it were an immovable wall; collision-
+            // mask disable caused the player to fall through. Per-tick
+            // dynamic overwrite avoids both.
+            MonkeLogger.Info($"ChangeAuthority: entity {entityId} relay {(newAuthority != 0 ? "engaged" : "released")} (dynamic + per-tick overwrite)");
+        }
 
         SendCommandToClient((int)NetworkManagerEnet.AudienceMode.Broadcast,
             new AuthorityChangedMessage { EntityId = entityId, NewAuthority = newAuthority },
@@ -378,6 +438,14 @@ public partial class ServerEntityManager : InternalServerComponent
         // carries the final position — otherwise every client's DummyEntity
         // spawns at the default for one frame before the first snapshot
         // teleports it to the real location, which is a visible jump.
+        //
+        // Safe to write GlobalPosition here even though DeactivateForPendingSpawn
+        // has already frozen the body, BECAUSE the freeze uses FreezeMode=Static
+        // (not Kinematic). Static-frozen bodies route transform writes through
+        // BodyInterface::SetPositionAndRotation which snaps Jolt's internal
+        // mPosition directly with no derived velocity — see
+        // EntitySpawner.DeactivateForPendingSpawn for the Static-vs-Kinematic
+        // rationale.
         if (position.HasValue) instancedEntity.GlobalPosition = position.Value;
         entityEvent.Position = instancedEntity.Position;
         entityEvent.Yaw = instancedEntity.Rotation.Y;

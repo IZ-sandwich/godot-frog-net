@@ -56,5 +56,6 @@ metadata/_custom_type_script = "uid://o8fwa7kmma11"
 
 [node name="ClientPredictedEntity" type="Node" parent="." unique_id=1700010005 node_paths=PackedStringArray("_predictionRb")]
 script = ExtResource("2_lcubepred")
+BaseTier = 1
 _predictionRb = NodePath("../PredictionRigidbody")
 metadata/_custom_type_script = "uid://2rptuj0wp7kx"

@@ -67,6 +67,29 @@ public partial class MultiClientHarness : Node
     private long _perfRecorderFramesAtWindowStart;
     private long _perfRecorderDroppedAtWindowStart;
 
+    // Bandwidth bucketing. The runner calls "bandwidth-reset" at the start of
+    // the scenario to drain ENet's destructive counter + arm sampling, then
+    // "bandwidth-stats" at the end to drain the trailing bucket + read the
+    // accumulated samples. While armed, every wall-second tick the harness
+    // pops the SentBytes/RecvBytes counters and appends one sample (in kB/s)
+    // to _bandwidthBuckets, so M10 becomes a distribution (P50 + P95) rather
+    // than a single average. Crucial because a single sample over a short
+    // scenario is dominated by where the spawn-burst lands in the window —
+    // observed 24× variation across back-to-back runs of the same condition.
+    // Sampling stays armed across the spawn phase too: the user explicitly
+    // wants the spawn burst represented in the distribution because it's
+    // part of the real network behaviour, just not the entire signal.
+    private readonly List<float> _bandwidthBuckets = new();
+    private long _bandwidthSamplingStartMs = 0;
+    private long _bandwidthLastSampleMs = 0;
+    private long _bandwidthCumulativeSent = 0;
+    private long _bandwidthCumulativeRecv = 0;
+    private bool _bandwidthSamplingArmed = false;
+    // Minimum sample window. Shorter bursts merge into the next bucket so a
+    // sub-cadence orchestrator-triggered Pop doesn't pollute the distribution
+    // with a near-zero-duration "infinity kB/s" bucket.
+    private const long BandwidthBucketMinMs = 500;
+
     // Stashed video-recorder parameters when --defer-video-start is passed.
     // Construction happens on the "start-recording" orch command instead of in
     // _Ready, so the captured MP4 can start at the moment of the test's choosing
@@ -375,6 +398,7 @@ public partial class MultiClientHarness : Node
 
         UpdateHud();
         MaybeLogPerfSummary();
+        SampleBandwidthBucket();
 
         // Push a freshly-rendered viewport frame to the recorder if active.
         // Non-blocking: if ffmpeg is behind, the frame is dropped rather than
@@ -482,6 +506,9 @@ public partial class MultiClientHarness : Node
                 "snap-to-auth-count" => SnapToAuthCount(),
                 "server-missed-input-total" => ServerMissedInputTotal(),
                 "bandwidth-stats" => BandwidthStats(),
+                "bandwidth-reset" => BandwidthReset(),
+                "visual-smoothness" => VisualSmoothness(),
+                "visual-smoothness-reset" => VisualSmoothnessReset(),
                 "server-peer-count" => ServerPeerCount(),
                 "pending-reclaim-for" => PendingReclaimFor(doc.RootElement),
                 "sample-state" => SampleState(),
@@ -1183,21 +1210,175 @@ public partial class MultiClientHarness : Node
         return Ok(new { count = receiver?.TotalMissedInputs ?? 0 });
     }
 
-    // Cumulative bandwidth counters (sent and received bytes/packets) since
-    // the previous call. ENet's PopStatistic is destructive — the host
-    // resets the counter on read — so each call returns the delta since the
-    // previous read on this process. Quantitative-suite M10 metric.
+    // Cumulative bandwidth counters plus the per-second sample distribution.
+    // While sampling is armed (see <see cref="BandwidthReset"/>), the harness
+    // pops the destructive byte counters once per wall-second and appends one
+    // kB/s sample to <see cref="_bandwidthBuckets"/>. This call drains any
+    // trailing partial bucket, disarms sampling, and returns the running
+    // totals + the full bucket array. The runner computes P50/P95 from the
+    // array; the raw totals are kept for backward compatibility and for
+    // cross-checks (sum of buckets × bucket-duration should equal totals).
+    //
+    // Calling without a preceding bandwidth-reset just returns the cumulative
+    // ENet counters since process start, with an empty bucket array — useful
+    // for ad-hoc inspection but not what the quantitative runner uses.
     private string BandwidthStats()
     {
         if (_role != "client") return Err("bandwidth-stats is client-only");
         var cm = ClientManager.Instance;
-        if (cm == null) return Ok(new { sentBytes = 0, recvBytes = 0, sentPackets = 0, recvPackets = 0 });
+        if (cm == null) return Ok(new { sentBytes = 0, recvBytes = 0, sentPackets = 0, recvPackets = 0, bucketsKBps = Array.Empty<float>() });
+
+        if (_bandwidthSamplingArmed)
+        {
+            // Drain the trailing partial bucket so the tail of the scenario
+            // (which may be < BandwidthBucketMinMs of wall time, e.g. the
+            // last 200 ms before the runner reads us) doesn't get lost. We
+            // accept a short final bucket here because the alternative is
+            // losing real bytes; the duration is recorded honestly so its
+            // kB/s rate is accurate, just based on less data.
+            SampleBandwidthBucket(force: true);
+            _bandwidthSamplingArmed = false;
+        }
+
+        var bucketsArr = _bandwidthBuckets.ToArray();
         return Ok(new
         {
-            sentBytes   = cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.SentBytes),
-            recvBytes   = cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.ReceivedBytes),
+            sentBytes   = (int)_bandwidthCumulativeSent,
+            recvBytes   = (int)_bandwidthCumulativeRecv,
             sentPackets = cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.SentPackets),
             recvPackets = cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.ReceivedPackets),
+            bucketsKBps = bucketsArr,
+        });
+    }
+
+    /// <summary>Begin a new bandwidth observation window. Clears the bucket
+    /// list, drains ENet's pre-window counters (so warm-up handshake traffic
+    /// from before scenario.Setup doesn't contaminate the first sample), and
+    /// arms 1 Hz sampling for subsequent ticks via
+    /// <see cref="_PhysicsProcess"/>-driven calls to
+    /// <see cref="SampleBandwidthBucket"/>. The runner calls this once
+    /// immediately before scenario.Setup so the spawn burst is captured as
+    /// real network behaviour rather than excluded by a "skip setup" carve-out.</summary>
+    private string BandwidthReset()
+    {
+        if (_role != "client") return Err("bandwidth-reset is client-only");
+        var cm = ClientManager.Instance;
+        if (cm == null) return Err("bandwidth-reset: no ClientManager");
+        // Drain any pre-window bytes — these are warm-up handshake / clock-sync
+        // traffic from before the scenario started and would distort the first
+        // bucket if left in the counter.
+        cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.SentBytes);
+        cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.ReceivedBytes);
+        cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.SentPackets);
+        cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.ReceivedPackets);
+        _bandwidthBuckets.Clear();
+        _bandwidthCumulativeSent = 0;
+        _bandwidthCumulativeRecv = 0;
+        long nowMs = (long)Time.GetTicksMsec();
+        _bandwidthSamplingStartMs = nowMs;
+        _bandwidthLastSampleMs = nowMs;
+        _bandwidthSamplingArmed = true;
+        return Ok(new { armed = true });
+    }
+
+    /// <summary>Pop the ENet byte counters and append one sample to the
+    /// bucket list. Called once per wall-second from <see cref="_Process"/>
+    /// while <see cref="_bandwidthSamplingArmed"/> is true. When
+    /// <paramref name="force"/> is true the bucket is emitted regardless of
+    /// the minimum-window guard — used by <see cref="BandwidthStats"/> to
+    /// drain the trailing partial window before returning.</summary>
+    private void SampleBandwidthBucket(bool force = false)
+    {
+        if (!_bandwidthSamplingArmed && !force) return;
+        var cm = ClientManager.Instance;
+        if (cm == null) return;
+        long nowMs = (long)Time.GetTicksMsec();
+        long elapsedMs = nowMs - _bandwidthLastSampleMs;
+        if (!force && elapsedMs < BandwidthBucketMinMs) return;
+        long sent = cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.SentBytes);
+        long recv = cm.PopNetworkStatistic(INetworkManager.NetworkStatisticEnum.ReceivedBytes);
+        _bandwidthCumulativeSent += sent;
+        _bandwidthCumulativeRecv += recv;
+        if (elapsedMs > 0)
+        {
+            float kbps = (float)((sent + recv) / 1024.0 / (elapsedMs / 1000.0));
+            _bandwidthBuckets.Add(kbps);
+        }
+        _bandwidthLastSampleMs = nowMs;
+    }
+
+    /// <summary>Walk every entity owned by this client and reset its
+    /// PredictionVisualSmoothing3D smoothness accumulator. Called by the
+    /// runner right after scenario.Setup so the spawn-fall / warm-up phase
+    /// doesn't bias the M14 measurement.</summary>
+    private string VisualSmoothnessReset()
+    {
+        if (_role != "client") return Err("visual-smoothness-reset is client-only");
+        int reset = 0;
+        if (EntitySpawner.Instance != null)
+        {
+            foreach (var entity in EntitySpawner.Instance.ClientEntities)
+            {
+                // ClientEntities stores the NetworkBehaviour COMPONENT (e.g.
+                // ClientPredictedEntity), which is a CHILD of the scene root.
+                // The PredictionVisualSmoothing3D node is a SIBLING of that
+                // component, both children of the scene root — so we walk
+                // siblings via the parent rather than children of the entity.
+                var root = entity?.GetParent();
+                if (root == null) continue;
+                foreach (var node in root.GetChildren())
+                {
+                    if (node is PredictionVisualSmoothing3D smoother)
+                    {
+                        smoother.ResetSmoothnessAccumulator();
+                        reset++;
+                    }
+                }
+            }
+        }
+        return Ok(new { reset = reset });
+    }
+
+    /// <summary>Aggregate visual-smoothness samples across every smoother
+    /// owned by this client and return the RMS of per-render-frame |Δv|
+    /// (m/s). Lower is smoother: steady-velocity motion produces Δv ≈ 0
+    /// every frame; judder / snap-overflows / stutter produce visible spikes.
+    /// Read at the end of scenario.Run as M14.</summary>
+    private string VisualSmoothness()
+    {
+        if (_role != "client") return Err("visual-smoothness is client-only");
+        var dvSquared = new List<float>();
+        int entitiesObserved = 0;
+        if (EntitySpawner.Instance != null)
+        {
+            foreach (var entity in EntitySpawner.Instance.ClientEntities)
+            {
+                // See VisualSmoothnessReset — walk siblings via GetParent()
+                // because the smoother is a SIBLING of the component stored
+                // in ClientEntities, not a child of it.
+                var root = entity?.GetParent();
+                if (root == null) continue;
+                foreach (var node in root.GetChildren())
+                {
+                    if (node is PredictionVisualSmoothing3D smoother && smoother.SmoothnessDvSquaredSamples.Count > 0)
+                    {
+                        dvSquared.AddRange(smoother.SmoothnessDvSquaredSamples);
+                        entitiesObserved++;
+                    }
+                }
+            }
+        }
+        return Ok(new
+        {
+            // Full distribution of |Δv|² samples in (m/s)². The runner
+            // streams these into SyncMetrics which computes RMS, p50 and
+            // p95 over the combined pool across every smoother on the
+            // client. Shipping the raw samples (rather than pre-computed
+            // statistics) lets the runner also write a CDF plot per
+            // scenario — see QuantitativeTestBase.WriteVisualSmoothnessCdf.
+            dvSquared = dvSquared,
+            sampleCount = dvSquared.Count,
+            entitiesObserved = entitiesObserved,
         });
     }
 

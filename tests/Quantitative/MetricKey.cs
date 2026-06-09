@@ -26,6 +26,7 @@ public enum MetricKey
     M10     = 1 << 9,   // bandwidth (kB/s)
     M11     = 1 << 10,  // snap-to-auth rate (%)
     M13     = 1 << 11,  // server-side missed-input rate (%)
+    M14     = 1 << 12,  // visual smoothness — RMS of per-render-frame |Δv| (m/s)
 
     /// <summary>Clock convergence metrics. Only S2_LinearMotion opts into these
     /// because M1/M2 are purely a function of the NetworkCondition (latency +
@@ -43,7 +44,7 @@ public enum MetricKey
     /// (server-side missed-input rate) because that metric is the direct
     /// quality signal for whether inputs are reaching the server in time
     /// under the scenario's network/CPU conditions.</summary>
-    PhysicsBasic = ClockOnly | M3b | M4 | M5_rms | M5_p95 | M6 | M9 | M11 | M13,
+    PhysicsBasic = ClockOnly | M3b | M4 | M5_rms | M5_p95 | M6 | M9 | M11 | M13 | M14,
 
     /// <summary>S2's mask: PhysicsBasic plus the clock-convergence metrics.
     /// S2 is the only scenario that runs the cold-start clock-sync sampling
@@ -52,5 +53,5 @@ public enum MetricKey
 
     /// <summary>Full set: every metric is applicable. Used by impulse-response,
     /// multi-body chaos, and multi-client shared physics.</summary>
-    All = ClockOnly | M3b | M4 | M5_rms | M5_p95 | M6 | M7 | M9 | M11 | M13,
+    All = ClockOnly | M3b | M4 | M5_rms | M5_p95 | M6 | M7 | M9 | M11 | M13 | M14,
 }

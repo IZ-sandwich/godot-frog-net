@@ -121,6 +121,14 @@ if ($AttachProfiler) {
 # run them via run-multiprocess-tests.ps1 instead. When a -Test selector is
 # provided, the user is being explicit, so honor it as-is (even if it matches
 # MultiProcess).
+#
+# Note on noise: "[MonkeNetTests] Godot /out: Failed to bind socket. Error: 3."
+# in the test output is BENIGN. Godot's network stack logs this once per
+# unused enet socket teardown during the per-test client/server lifecycle and
+# it is not the cause of any test failure -- ignore it when scanning logs.
+# Real test failures show up under "TestCase: ... Failed" and "  Failed
+# <name> [<time>]" lines; the bind-socket log line appears on successful
+# runs too.
 if ($Test) {
     $filter = "FullyQualifiedName~$Test"
 } else {
@@ -135,12 +143,12 @@ if ($Worktree) {
         -Filter $filter `
         -StdoutLog "test-output.log" `
         -StderrLog "test-error.log" `
-        -TimeoutMs 540000 `
+        -TimeoutMs 1800000 `
         -Scenario "inner"
     exit $LASTEXITCODE
 }
 
-$proc = Start-Process -FilePath "dotnet" -ArgumentList "test tests/MonkeNetTests.csproj --logger console;verbosity=normal --filter $filter" -RedirectStandardOutput "test-output.log" -RedirectStandardError "test-error.log" -NoNewWindow -PassThru
+$proc = Start-Process -FilePath "dotnet" -ArgumentList "test tests/MonkeNetTests.csproj --logger console;verbosity=normal --settings tests/gdunit4.runsettings --filter $filter" -RedirectStandardOutput "test-output.log" -RedirectStandardError "test-error.log" -NoNewWindow -PassThru
 
 if ($AttachProfiler) {
     # Same watcher as the worktree path. Auto-spawns dotnet-trace for each
@@ -149,7 +157,7 @@ if ($AttachProfiler) {
         -Process     $proc `
         -CommDir     $env:MONKENET_TEST_PROFILE_DIR `
         -TraceOutDir (Join-Path $PSScriptRoot "tests\TestResults\profile-traces") `
-        -TimeoutMs   540000
+        -TimeoutMs   1800000
     if (-not $proc.HasExited) {
         if (-not $proc.WaitForExit(5000)) { $proc.Kill($true); $exit = 1 }
         else { $exit = $proc.ExitCode }
@@ -158,7 +166,7 @@ if ($AttachProfiler) {
     exit $exit
 }
 
-if (-not $proc.WaitForExit(540000)) {
+if (-not $proc.WaitForExit(1800000)) {
     Write-Host "Timeout reached - killing test process"
     $proc.Kill($true)
     exit 1

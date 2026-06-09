@@ -165,6 +165,17 @@ public class NetworkedRigidbodyTests
         return condition();
     }
 
+    /// <summary>Wait until a freshly-spawned RigidBody3D has been activated by
+    /// EntitySpawner's spawn-activation delay window (see SpawnActivationDelayTicks
+    /// in ServerEntityManager). During the delay the body is held with
+    /// <c>Freeze=true, FreezeMode=Static</c>; any impulses, forces, or
+    /// collision setups applied to the body are silently dropped by the
+    /// physics engine. Tests that apply impulses or set velocities right
+    /// after SpawnEntity have to wait for this gate to lift, otherwise the
+    /// physics op is no-op'd and the assertion under test sees zero motion.</summary>
+    private async Task<bool> WaitUntilActivated(RigidBody3D body, int maxFrames = 120)
+        => await WaitUntil(() => !body.Freeze, maxFrames: maxFrames);
+
     private static NetworkBehaviour FindServerEntity(int entityId) =>
         EntitySpawner.Instance?.Entities.FirstOrDefault(e => e.EntityId == entityId);
 
@@ -345,6 +356,16 @@ public class NetworkedRigidbodyTests
             .OverrideFailureMessage($"Server-side RigidBody3D not found for entity {entityId}. {DumpEntities()}")
             .IsNotNull();
 
+        // Wait for the spawn-activation delay to lift before applying the
+        // impulse. While the body is frozen (SpawnActivationDelayTicks window)
+        // ApplyCentralImpulse is silently dropped by the physics engine —
+        // pre-fix the test happened to "pass" only because the body had a
+        // phantom kinematic-derived velocity from the spawn teleport; now
+        // that's cleaned up (NRB-03 fix) the impulse genuinely has to be
+        // applied to a live, unfrozen body.
+        bool activated = await WaitUntilActivated(serverBody, maxFrames: 30);
+        AssertThat(activated).IsTrue();
+
         float startServerX = serverBody.GlobalPosition.X;
         var kick = new Vector3(8f, 0f, 0f);
         serverBody.ApplyCentralImpulse(kick);
@@ -402,6 +423,16 @@ public class NetworkedRigidbodyTests
         AssertThat(bodyB)
             .OverrideFailureMessage($"RigidBody3D not found on ballB (id={ballB.EntityId}). {DumpEntities()}")
             .IsNotNull();
+
+        // Wait for the spawn-activation delay to lift on BOTH bodies before
+        // we reposition them or set initial velocities. While frozen, position
+        // writes are interpreted as kinematic moves (sometimes generating phantom
+        // velocity — see NRB-03 fix) and LinearVelocity writes are silently
+        // dropped, leaving the collision setup ineffective.
+        bool activatedA = await WaitUntilActivated(bodyA, maxFrames: 30);
+        bool activatedB = await WaitUntilActivated(bodyB, maxFrames: 30);
+        AssertThat(activatedA).IsTrue();
+        AssertThat(activatedB).IsTrue();
 
         // Position them in a head-on configuration. Override OnEntitySpawned's (0,10,0)
         // default by placing them close together on the X axis (above the floor so gravity

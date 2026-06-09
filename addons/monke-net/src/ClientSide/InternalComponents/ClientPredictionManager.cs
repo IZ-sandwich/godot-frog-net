@@ -117,11 +117,14 @@ public partial class ClientPredictionManager : InternalClientComponent
     private int _missedInputCount = 0;
     /// <summary>Cumulative count of snapshots that arrived too old for a forward
     /// resim (depth &gt; <see cref="MaxRollbackTicks"/>) and were corrected by
-    /// teleport-snap via <see cref="SnapToAuthOverflow"/> instead. Quantitative-
-    /// suite M11 metric — distinguishes "predictions were wrong" (M3) from
-    /// "couldn't run a resim, snapped instead". High values at C3/C4 are
-    /// expected with a tight cap; high values at C0/C1 indicate the cap is
-    /// binding more often than it should.</summary>
+    /// the PVB-overflow path via <see cref="BlendToAuthViaPvb"/> instead.
+    /// Quantitative-suite M11 metric — distinguishes "predictions were wrong"
+    /// (M3) from "couldn't run a resim, blended through PVB instead". High
+    /// values at C3/C4 are expected with a tight cap; high values at C0/C1
+    /// indicate the cap is binding more often than it should. The metric
+    /// name retains the legacy "snap" wording for back-compat with prior
+    /// CSV columns even though the per-entity behaviour is now a Lengyel
+    /// projective-velocity blend, not a hard snap.</summary>
     public int SnapToAuthCount => _snapOverflowCount;
 
     // Set of entity ids for which the server has reported at least one input.
@@ -540,6 +543,23 @@ public partial class ClientPredictionManager : InternalClientComponent
         bool networkDegraded = _wasRecentlyTrimmed;
         _wasRecentlyTrimmed = false;
 
+        // Snapshot the buffer's oldest tick BEFORE we trim it — the routing
+        // decision below needs to know whether the snapshot was "older than
+        // anything we ever predicted" (overflow) vs "future of what we
+        // predicted, just not present in the cache" (missed). The RemoveAll
+        // below drops every entry with Tick <= snap.Tick, which would leave
+        // _predictedStates[0] always >  snap.Tick — making the < oldestKept
+        // check trivially true and the missed-local-state branch unreachable.
+        // Reading the oldest tick from the pre-trim state gives the correct
+        // signal: if snap.Tick is less than the oldest predicted tick we ever
+        // had, it's an overflow.
+        int oldestKeptTickPreTrim = _predictedStates.Count > 0
+            ? _predictedStates[0].Tick
+            : int.MaxValue;
+        int newestKeptTickPreTrim = _predictedStates.Count > 0
+            ? _predictedStates[_predictedStates.Count - 1].Tick
+            : int.MinValue;
+
         var predictedStateData = _predictedStates.Find(prediction => prediction.Tick == receivedSnapshot.Tick);
         _predictedStates.RemoveAll(predictedState => predictedState.Tick <= receivedSnapshot.Tick);
 
@@ -574,21 +594,15 @@ public partial class ClientPredictionManager : InternalClientComponent
             // Distinguish "trimmed by cap" (snap) from "never registered"
             // (genuine MissedLocalState, log only) by checking against the
             // oldest still-kept tick.
-            int oldestKeptTick = _predictedStates.Count > 0
-                ? _predictedStates[0].Tick
-                : int.MaxValue;
-            int newestKeptTick = _predictedStates.Count > 0
-                ? _predictedStates[_predictedStates.Count - 1].Tick
-                : int.MinValue;
-            if (receivedSnapshot.Tick < oldestKeptTick)
+            if (receivedSnapshot.Tick < oldestKeptTickPreTrim)
             {
-                MonkeLogger.Debug($"[PRED-SNAP-DECISION] tick={receivedSnapshot.Tick} bufSize={_predictedStates.Count} oldest={oldestKeptTick} newest={newestKeptTick} -> SNAP-OVERFLOW");
-                SnapToAuthOverflow(receivedSnapshot);
+                MonkeLogger.Debug($"[PRED-PVB-DECISION] tick={receivedSnapshot.Tick} bufSizePreTrim={oldestKeptTickPreTrim != int.MaxValue} oldestPreTrim={oldestKeptTickPreTrim} newestPreTrim={newestKeptTickPreTrim} -> PVB-OVERFLOW");
+                BlendToAuthViaPvb(receivedSnapshot);
                 return;
             }
 
             _missedLocalState++;
-            MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} MISSED-LOCAL-STATE (no matching predicted entry; total missed={_missedLocalState}) bufSize={_predictedStates.Count} oldest={oldestKeptTick} newest={newestKeptTick}");
+            MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} MISSED-LOCAL-STATE (no matching predicted entry; total missed={_missedLocalState}) oldestPreTrim={oldestKeptTickPreTrim} newestPreTrim={newestKeptTickPreTrim}");
             return;
         }
 
@@ -635,7 +649,21 @@ public partial class ClientPredictionManager : InternalClientComponent
 
             Vector3 authPos = predictableEntity.ExtractAuthoritativePosition(authoritativeState);
             Vector3 posDiff = authPos - predictedState.Position;
-            MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} predPos=({predictedState.Position.X:F3},{predictedState.Position.Y:F3},{predictedState.Position.Z:F3}) authPos=({authPos.X:F3},{authPos.Y:F3},{authPos.Z:F3}) |posDiff|={posDiff.Length():F4}m predVel=({predictedState.LinearVelocity.X:F3},{predictedState.LinearVelocity.Y:F3},{predictedState.LinearVelocity.Z:F3})");
+            float posDiffMag = posDiff.Length();
+            // Suppress the data line when prediction matches authority to within
+            // floating-point noise. 1e-5 m = 10 µm — well below any visible or
+            // physics-meaningful movement, so anything above this is "real"
+            // drift worth keeping in the forensic trace. The decision lines
+            // below (blend-reconcile / MISPREDICTED / OK) are gated separately
+            // so we only emit the OK confirmation when there's a non-trivial
+            // |posDiff| that justified the comparison. Resolved a periodic
+            // ~1 s logging stall: this pair fires ~entity_count × snapshot_hz
+            // ≈ 41 × 50 = 2050 lines/s; halving them via this gate is the
+            // single biggest log-volume reduction in the system.
+            const float predCheckNoOpEpsilon = 1e-5f;
+            bool predCheckHasDrift = posDiffMag > predCheckNoOpEpsilon;
+            if (predCheckHasDrift)
+                MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} predPos=({predictedState.Position.X:F3},{predictedState.Position.Y:F3},{predictedState.Position.Z:F3}) authPos=({authPos.X:F3},{authPos.Y:F3},{authPos.Z:F3}) |posDiff|={posDiffMag:F4}m predVel=({predictedState.LinearVelocity.X:F3},{predictedState.LinearVelocity.Y:F3},{predictedState.LinearVelocity.Z:F3})");
 
             // Interpolate tier: blend toward the snapshot pose on EVERY snapshot,
             // regardless of drift magnitude. The HasMisspredicted threshold gate
@@ -694,8 +722,12 @@ public partial class ClientPredictionManager : InternalClientComponent
             }
 
             // Resim, below threshold — no body teleport needed; just sync
-            // auxiliary state (sleep flag, etc.) from the snapshot.
-            MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} OK");
+            // auxiliary state (sleep flag, etc.) from the snapshot. Skip the
+            // OK confirmation when there's no measurable drift (paired with
+            // the gate above): the absence of a PRED-CHECK line for an
+            // entity at this tick implies the prediction matched authority.
+            if (predCheckHasDrift)
+                MonkeLogger.Debug($"[PRED-CHECK] tick={receivedSnapshot.Tick} eid={predictableEntity.EntityId} OK");
             predictableEntity.ApplyAuthoritativeNonPoseState(authoritativeState);
         }
     }
@@ -899,7 +931,15 @@ public partial class ClientPredictionManager : InternalClientComponent
             var smoother = FindSmootherFor(predictableEntity);
             if (smoother?.Visual == null) continue;
             preReconcileVisualPos ??= new Dictionary<ClientPredictedEntity, Vector3>();
-            preReconcileVisualPos[predictableEntity] = smoother.Visual.GlobalPosition;
+            // Use the smoother's own LastRenderedPosition — the position it
+            // wrote to Visual.GlobalPosition on its most recent _Process call
+            // — rather than reading Visual.GlobalPosition here. With the
+            // library-managed interpolation (Visual is top_level, smoother
+            // owns per-render-frame writes) Visual.GlobalPosition reflects
+            // the last render write, which IS the rendered position. Using
+            // the explicit property makes the contract obvious and survives
+            // any future refactor that might decouple them.
+            preReconcileVisualPos[predictableEntity] = smoother.LastRenderedPosition;
         }
 
         // Set all entities to authoritative state. Critical for the unified-prediction
@@ -909,7 +949,39 @@ public partial class ClientPredictionManager : InternalClientComponent
         foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
         {
             var authoritativeState = FindStateForEntityId(predictableEntity.EntityId, authoritativeStates);
-            MonkeLogger.Debug($"[PRED-RECONCILE] tick={predictedStateData.Tick} eid={predictableEntity.EntityId} -> auth={authoritativeState}");
+            // Snapshot the body's pre-reconcile pose/velocity so the merged log
+            // captures the delta the hard-reset is about to apply. Previously this
+            // came from a separate [PHYS-RB-RECONCILE] line in PredictionRigidbody3D
+            // that also fired on every Interpolate-tier blend-step lerp (~28 k
+            // lines per scenario). Merging into PRED-RECONCILE keeps the diagnostic
+            // (pre, auth, delta) only at the genuine-reconcile call sites and
+            // collapses the per-blend-step duplicates down to nothing.
+            var rb = FindRigidbodyFor(predictableEntity);
+            Vector3 prePos = rb?.Body?.GlobalPosition ?? Vector3.Zero;
+            Vector3 preVel = rb?.Body?.LinearVelocity ?? Vector3.Zero;
+            Vector3 authPos = predictableEntity.ExtractAuthoritativePosition(authoritativeState);
+            Vector3 authVel = predictableEntity.ExtractAuthoritativeVelocity(authoritativeState);
+            float posDeltaMag = (authPos - prePos).Length();
+            float velDeltaMag = (authVel - preVel).Length();
+            int pendingDropped = rb?.PendingCount ?? 0;
+            MonkeLogger.Debug($"[PRED-RECONCILE] tick={predictedStateData.Tick} eid={predictableEntity.EntityId} prePos=({prePos.X:F3},{prePos.Y:F3},{prePos.Z:F3}) -> authPos=({authPos.X:F3},{authPos.Y:F3},{authPos.Z:F3}) |posDelta|={posDeltaMag:F4} preVel=({preVel.X:F3},{preVel.Y:F3},{preVel.Z:F3}) -> authVel=({authVel.X:F3},{authVel.Y:F3},{authVel.Z:F3}) |velDelta|={velDeltaMag:F4} pendingDropped={pendingDropped} auth={authoritativeState}");
+            // Hard-reconcile every entity in the rollback frame regardless of
+            // tier. Even Interpolate-tier props need their body at the auth
+            // pose at the rollback tick so the resim loop steps physics from
+            // a consistent state (contact constraints between the rolled-back
+            // player and surrounding props depend on the props being at
+            // server-truth positions during the replay). The smoother absorbs
+            // the body teleport so the visual stays smooth.
+            //
+            // Tried tier-aware routing here that called HandleInterpolateReconciliation
+            // for non-Resim entities; reverted because the blend target was
+            // the rollback-tick auth pose (now stale by N resim ticks), so
+            // the visual lerped toward an old position while the body did
+            // physics forward — produced 2-3× larger visible offsets and
+            // doubled the M6 visual-ratio metric. Smoother + hard-snap is
+            // the right call here; the per-snapshot blend in ProcessServerState
+            // converges on the LATEST snapshot which is what Interpolate-tier
+            // entities actually need.
             predictableEntity.HandleReconciliation(authoritativeState);
         }
 
@@ -1076,12 +1148,23 @@ public partial class ClientPredictionManager : InternalClientComponent
         MonkeLogger.Debug($"[PRED-ROLLBACK] complete (offline bodies restored)");
     }
 
-    /// <summary>Snap every locally-known predicted entity to its
-    /// authoritative state from <paramref name="snapshot"/>, skipping the
-    /// resim loop entirely. Called when the snapshot tick is older than the
-    /// rollback cap allows — see the call site in
-    /// <see cref="ProcessServerState"/> for the rationale.</summary>
-    private void SnapToAuthOverflow(GameSnapshotMessage snapshot)
+    /// <summary>Route every locally-known predicted entity through a Lengyel
+    /// projective-velocity blend (PVB) toward its authoritative state from
+    /// <paramref name="snapshot"/>, skipping the resim loop entirely. Called
+    /// when the snapshot tick is older than the rollback cap allows — see
+    /// the call site in <see cref="ProcessServerState"/> for the rationale.
+    ///
+    /// <para>The body still snaps to the auth pose immediately (via
+    /// <c>HandleReconciliation</c>), but the visual mesh is handed to
+    /// <see cref="PredictionVisualSmoothing3D.StartProjectiveVelocityBlend"/>
+    /// instead of teleporting alongside the body. The blend interpolates
+    /// between the pre-snap visual trajectory (current rendered position +
+    /// pre-reconcile body velocity) and the post-snap auth trajectory
+    /// (snapped body pose + auth velocity) over a fixed window, so per-frame
+    /// |Δv| stays bounded regardless of how big the position correction was.
+    /// Prior to PVB this path was a hard snap (the name preserves the
+    /// "overflow" suffix to match the M11 metric/log convention).</para></summary>
+    private void BlendToAuthViaPvb(GameSnapshotMessage snapshot)
     {
         int snapped = 0;
         if (EntitySpawner.Instance != null)
@@ -1096,11 +1179,122 @@ public partial class ClientPredictionManager : InternalClientComponent
                 // server-truth trajectory alongside the client-side render.
                 Vector3 authPos = cpe.ExtractAuthoritativePosition(authState);
                 Vector3 authVel = cpe.ExtractAuthoritativeVelocity(authState);
-                MonkeLogger.Debug($"[PRED-SNAP-OVERFLOW-ENTITY] tick={snapshot.Tick} eid={cpe.EntityId} authPos=({authPos.X:F3},{authPos.Y:F3},{authPos.Z:F3}) authVel=({authVel.X:F3},{authVel.Y:F3},{authVel.Z:F3})");
-                // HandleReconciliation writes body pose+velocity to the auth
-                // state AND calls AbsorbBodyTeleport on the smoother, so the
-                // visual stays at its pre-snap pose and decays over DecayTime.
-                cpe.HandleReconciliation(authState);
+                var tier = cpe.EffectiveTier;
+                MonkeLogger.Debug($"[PRED-PVB-OVERFLOW-ENTITY] tick={snapshot.Tick} eid={cpe.EntityId} tier={tier} authPos=({authPos.X:F3},{authPos.Y:F3},{authPos.Z:F3}) authVel=({authVel.X:F3},{authVel.Y:F3},{authVel.Z:F3})");
+                // Plain snap, no snapshot-age extrapolation. The previous
+                // attempt extrapolated the auth pose forward by snapshotAge ×
+                // authVel to put the body at "where the snapshot would have
+                // the entity NOW", which had the side effect of leaving the
+                // visual sometimes AHEAD of the body when the per-snap
+                // residual error compounded faster than _posOffset decay.
+                // Reverted by request: snap the body straight to the
+                // (latency-delayed) auth pose and let the smoother's
+                // _posOffset decay carry the visual back from its current
+                // rendered position toward the body. Visual ends up
+                // briefly BEHIND the body — acceptable; visual ahead is not.
+                //
+                // Tier-aware routing — Resim-tier entities (player) get the
+                // hard snap (they're designed for it). Interpolate-tier
+                // entities (passive props) go through the blend path so
+                // they converge smoothly to auth without a body teleport.
+                // Mark the entity as initialized so the spawn-tick-alignment
+                // guard in ProcessServerState doesn't later fire "initial-
+                // snapshot for new predicted entity" catch-up resim against
+                // it. Without this, in high-latency conditions (C3/C4) every
+                // early snapshot for the entity goes through the snap-overflow
+                // path (never the normal path that would call
+                // _initializedEntityIds.Add), so _initializedEntityIds stays
+                // empty for the entity. Once the buffer eventually retains a
+                // tick old enough to match a snapshot, ProcessServerState
+                // sees the entity for the "first time", triggers
+                // CatchUpNewlySpawnedEntities, and forward-integrates the
+                // body by N ticks of motion the entity has already done —
+                // observed as a sudden ~2 m forward teleport mid-walk in
+                // S2-C3 around client tick 895.
+                _initializedEntityIds.Add(cpe.EntityId);
+
+                if (tier == PredictionTier.Interpolate)
+                {
+                    cpe.HandleInterpolateReconciliation(authState);
+                    cpe.ApplyAuthoritativeNonPoseState(authState);
+                }
+                else
+                {
+                    // Projective Velocity Blending (Lengyel 2011) on snap-
+                    // overflow. We snapshot the visual's pre-snap kinematic
+                    // state (current rendered position + body's pre-reconcile
+                    // velocity = the trajectory the visual was on) and the
+                    // post-snap auth state (snapped body pose + auth velocity
+                    // = the trajectory the visual needs to be on), then run
+                    // parallel constant-velocity projections from both and
+                    // linearly blend between them over PvbDurationSec inside
+                    // the smoother's _Process. Bounded per-frame Δv regardless
+                    // of how big the position correction was — vs the previous
+                    // exponential offset decay where Δv scaled linearly with
+                    // offset magnitude (8 m/s offset → 8 m/s induced visual
+                    // velocity on next physics tick under C4, dominating M14
+                    // p95). Decay produced smooth typical frames but huge
+                    // spikes per snap; PVB makes the snap path itself smooth.
+                    //
+                    // See PredictionVisualSmoothing3D.StartProjectiveVelocityBlend
+                    // and Game Engine Gems 2 ch. 22.
+                    var smoother = FindSmootherFor(cpe);
+                    Vector3 preVisualPos = smoother?.LastRenderedPosition ?? Vector3.Zero;
+                    Vector3 preBodyVel = smoother?.Body is RigidBody3D preRb
+                        ? preRb.LinearVelocity
+                        : Vector3.Zero;
+
+                    cpe.HandleReconciliation(authState);
+
+                    if (smoother?.Body != null)
+                    {
+                        Vector3 postBodyPos = smoother.Body.GlobalPosition;
+                        smoother.StartProjectiveVelocityBlend(
+                            oldPos: preVisualPos, oldVel: preBodyVel,
+                            newPos: postBodyPos, newVel: authVel,
+                            // 250 ms tuned against C4: long enough that the
+                            // blended velocity profile stays under perceptual
+                            // jerk threshold even for the largest expected
+                            // C4 corrections (~3 m), short enough to avoid
+                            // visible rubber-banding when snaps fire often.
+                            durationSec: 0.25f);
+                    }
+                }
+
+                // Drop this entity's stale predicted state from all newer
+                // PredictedState entries. The body just teleported to the
+                // (snapshot.Tick - latency) auth pose, but the entries in
+                // _predictedStates for ticks > snapshot.Tick still hold the
+                // RigidbodyState the entity was at BEFORE the snap (when it
+                // was running forward predictions that had drifted from
+                // server truth). Leaving those entries in place causes the
+                // NEXT normal-path snapshot — for the oldest still-kept
+                // tick — to run a PRED-CHECK that compares its auth pose
+                // against the now-stale predicted pose, observes a huge
+                // |posDiff|, declares a misprediction, and rolls back +
+                // resims the entity by (currentTick − snapshot.Tick) ticks.
+                // The resim integrates the body forward by that many ticks
+                // of motion the entity has already done — visible in S2-C3
+                // as a sudden ~2 m teleport spike every few seconds, then a
+                // jump back to the predicted trajectory when the next snap-
+                // overflow yanks the body to the next snapshot's auth pose.
+                //
+                // Removing this entity's key from each future PredictedState
+                // entry forces the next normal-path snapshot to take the
+                // MISSED-LOCAL-STATE branch for this entity (no comparison,
+                // no rollback). New entries will be added next tick by
+                // RegisterPrediction with the entity's current — post-snap —
+                // pose, so the buffer rebuilds correctly from this tick
+                // forward.
+                foreach (var ps in _predictedStates)
+                {
+                    if (ps.Tick > snapshot.Tick)
+                    {
+                        var staleKey = ps.Entities.Keys.FirstOrDefault(k => k != null && k.EntityId == cpe.EntityId);
+                        if (staleKey != null) ps.Entities.Remove(staleKey);
+                    }
+                }
+
                 // Pin FTI prev=curr to the new pose so the renderer doesn't
                 // interpolate backward across the snap.
                 var rb = FindRigidbodyFor(cpe);
@@ -1109,7 +1303,7 @@ public partial class ClientPredictionManager : InternalClientComponent
             }
         }
         _snapOverflowCount++;
-        MonkeLogger.Debug($"[PRED-SNAP-OVERFLOW] tick={snapshot.Tick} entities={snapped} (snapshot too old for resim; snapped to auth pose without forward resim, total snaps={_snapOverflowCount})");
+        MonkeLogger.Debug($"[PRED-PVB-OVERFLOW] tick={snapshot.Tick} entities={snapped} (snapshot too old for resim; body snapped + visual PVB-blended toward auth without forward resim, total overflows={_snapOverflowCount})");
     }
 
     private static PredictionRigidbody3D FindRigidbodyFor(ClientPredictedEntity entity)

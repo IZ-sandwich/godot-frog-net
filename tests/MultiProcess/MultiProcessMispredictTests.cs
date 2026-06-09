@@ -240,7 +240,9 @@ public class MultiProcessMispredictTests : MultiProcessTestBase
         for (int i = 0; i < TowerCubeCount; i++)
         {
             float y = TowerBaseY + i * CubeSpacingY;
-            cubeEids.Add(SpawnEntity(server, EntityTypeCube, authority: 0, 0f, y, TowerZ, metadata: cubeMetadata));
+            // TODO: restore `metadata: cubeMetadata` once the SpawnEntity helper accepts it again
+            // (parameter was dropped post-67c1179; metadata threaded prediction policy per cube).
+            cubeEids.Add(SpawnEntity(server, EntityTypeCube, authority: 0, 0f, y, TowerZ));
         }
         server.WaitForTicks(TowerSettleTicks);
 

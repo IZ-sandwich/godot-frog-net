@@ -55,13 +55,14 @@ SNAP_MISSED_RX = re.compile(
 # pre-spawn / spectator).
 SNAP_OVERFLOW_RX = re.compile(
     r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})\].*?"
-    r"\[PRED-SNAP-OVERFLOW\] tick=(\d+)"
+    r"\[PRED-(?:SNAP|PVB)-OVERFLOW\] tick=(\d+)"
 )
-# Per-entity auth pose logged inside SnapToAuthOverflow. Used to plot the
-# server-truth trajectory alongside the client-side render.
+# Per-entity auth pose logged inside BlendToAuthViaPvb. Used to plot the
+# server-truth trajectory alongside the client-side render. (Previous tag
+# was PRED-SNAP-OVERFLOW-ENTITY before the rename to PVB.)
 SNAP_OVERFLOW_AUTH_RX = re.compile(
     r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})\].*?"
-    r"\[PRED-SNAP-OVERFLOW-ENTITY\] tick=(\d+) eid=1 "
+    r"\[PRED-(?:SNAP|PVB)-OVERFLOW-ENTITY\] tick=(\d+) eid=1 "
     r"authPos=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\) "
     r"authVel=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)"
 )

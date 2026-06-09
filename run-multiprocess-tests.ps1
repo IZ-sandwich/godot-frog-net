@@ -100,6 +100,14 @@ if ($AttachProfiler) {
     Remove-Item Env:MONKENET_TEST_PROFILE_DIR -ErrorAction SilentlyContinue
 }
 
+# Note on noise: "[MonkeNetTests-<pid>] Godot /out: Failed to bind socket.
+# Error: 3." in the test output is BENIGN. Godot's network stack logs it
+# during normal enet socket teardown in the per-test client/server lifecycle
+# and is not the cause of any test failure -- ignore it when scanning logs.
+# Real test failures show up under "TestCase: ... Failed" and "  Failed
+# <name> [<time>]" lines; the bind-socket log line appears on successful
+# runs too.
+
 # Build the test filter once, regardless of worktree mode.
 if ($Test) {
     $filter = "FullyQualifiedName~MonkeNet.Tests.MultiProcess&FullyQualifiedName~$Test"
@@ -116,7 +124,7 @@ if ($Worktree) {
         -Filter $filter `
         -StdoutLog "test-output-multiprocess.log" `
         -StderrLog "test-error-multiprocess.log" `
-        -TimeoutMs 300000 `
+        -TimeoutMs 1800000 `
         -Scenario "mp"
     exit $LASTEXITCODE
 }
@@ -125,7 +133,7 @@ if ($Worktree) {
 # Original behavior preserved for single-runner workflows. Cannot be run in
 # parallel with another in-place invocation - they'll collide on the gdUnit4
 # pipe and the shared bin/ dir. Use -Worktree for parallel runs.
-$proc = Start-Process -FilePath "dotnet" -ArgumentList "test tests/MonkeNetTests.csproj --logger console;verbosity=normal --filter $filter" -RedirectStandardOutput "test-output-multiprocess.log" -RedirectStandardError "test-error-multiprocess.log" -NoNewWindow -PassThru
+$proc = Start-Process -FilePath "dotnet" -ArgumentList "test tests/MonkeNetTests.csproj --logger console;verbosity=normal --settings tests/gdunit4.runsettings --filter $filter" -RedirectStandardOutput "test-output-multiprocess.log" -RedirectStandardError "test-error-multiprocess.log" -NoNewWindow -PassThru
 
 if ($AttachProfiler) {
     # Same handshake-watcher as the worktree path.
@@ -133,7 +141,7 @@ if ($AttachProfiler) {
         -Process     $proc `
         -CommDir     $env:MONKENET_TEST_PROFILE_DIR `
         -TraceOutDir (Join-Path $PSScriptRoot "tests\TestResults\profile-traces") `
-        -TimeoutMs   300000
+        -TimeoutMs   1800000
     if (-not $proc.HasExited) {
         if (-not $proc.WaitForExit(5000)) { $proc.Kill($true); $exit = 1 }
         else { $exit = $proc.ExitCode }
@@ -142,7 +150,7 @@ if ($AttachProfiler) {
     exit $exit
 }
 
-if (-not $proc.WaitForExit(300000)) {
+if (-not $proc.WaitForExit(1800000)) {
     Write-Host "Timeout reached - killing test process"
     $proc.Kill($true)
     exit 1

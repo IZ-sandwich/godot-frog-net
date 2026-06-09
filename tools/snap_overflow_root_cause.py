@@ -18,7 +18,7 @@ Usage: python snap_overflow_root_cause.py <client.log>
 import os, re, sys
 
 # Time-ordered event types we care about
-SNAP_OVF_RX  = re.compile(r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})\].*?\[PRED-SNAP-OVERFLOW\] tick=(\d+) entities=\d+")
+SNAP_OVF_RX  = re.compile(r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})\].*?\[PRED-(?:SNAP|PVB)-OVERFLOW\] tick=(\d+) entities=\d+")
 NET_SNAP_RX  = re.compile(r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})\].*?\[NET-SNAP-RX\] tick=(\d+) entities=\d+ .*?curTick=(-?\d+) rawTick=(-?\d+) rawAge=(-?\d+) avgLat=(-?\d+) jitter=(-?\d+) depth=(-?\d+)")
 ROLLBACK_RX  = re.compile(r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})\].*?\[PRED-ROLLBACK\] tick=(\d+) entities=\d+ resimTicks=(\d+)")
 TICK_RX      = re.compile(r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})\].*?\[CLIENT-TICK\] tick=(\d+) dt=([\d.]+)")

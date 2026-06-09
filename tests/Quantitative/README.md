@@ -135,7 +135,7 @@ and feed both the dashboard heatmap and the per-scenario strip plots.
 | **M7** | `M7_PostRollbackConvergenceP95` | ticks | ≤ 7 | P95 of "ticks until body error drops below 0.1 m after a rollback". Only meaningful in S3 (single-impulse scenario). |
 | **M8** | — | — | — | "Entity-count scaling" — analysed externally by comparing M5 across scenarios with different body counts (S1: 1, S4: 6, S5: ?, S7: 40). Not a CSV column. |
 | **M9** | `M9_MissedInputRatePct` | % | ≤ 10 | Cumulative count of `(tick × remote-entity)` events where the predictor had to fall back to a stale cached input because no exact-tick server input was available. Reported as `count / observation_ticks` (so really an "events per tick" rate, not a percentage in the usual sense). |
-| **M10** | `M10_BandwidthKBps` | kB/s | ≤ 5 | Client-side `(sentBytes + recvBytes) / duration`. Industry-tuned games target 2–5 kB/s. |
+| **M10** | `M10_BandwidthP50KBps` / `M10_BandwidthP95KBps` | kB/s | P50 ≤ 5, P95 ≤ 15 | Client-side `(sentBytes + recvBytes) / second` sampled into one bucket per wall-second across the entire observation window (the spawn burst is included on purpose — it's part of the real network behaviour). Reported as **P50** (typical-tick cost) plus **P95** (burst tail). Industry-tuned games target 2–5 kB/s steady; unoptimised replication is 30–50 kB/s. Pair the two: P95 well above P50 indicates bursty replication (large spawn flood, snapshot batching) — usually fine, but a steadily-high P95 with a high P50 is a candidate for batching/throttling. The earlier single-sample form averaged total bytes over the whole scenario duration and varied 24× across back-to-back runs of the same condition because the spawn burst dominated short windows; bucketing collapses that noise to ~5 % P50 variance, ~1 % P95 variance. |
 | **M11** | `M11_SnapToAuthRatePct` | % | ≤ 10 (informational at C3/C4) | Rate of snapshots that arrived too old to resim (depth > `MaxRollbackTicks`) and were corrected by teleport-snap. Distinct from M3: M3 measures *prediction quality*, M11 measures *how often the cap is binding*. High values at C3/C4 are expected with the default cap; high values at C0/C1 indicate the cap is binding more often than it should. |
 | **M13** | `M13_ServerMissedInputRatePct` | % | ≤ 1 | **Server-side** missed-input rate: cumulative count of `(tick × entity)` events where the server ticked without finding a fresh client-stamped input in `_pendingInputs` and fell back to repeat-stale / default, divided by observation ticks. Direct quality signal for the input-arrival pipeline; the EVENT version of "server's input buffer for this client ran empty". **Distinct from M9** — M9 is a *replay-time* event at the client (the predictor couldn't find input X for tick T in snapshot history); M13 is an *apply-time* event at the server (the simulation reached tick T without a fresh stamped input). Drives the `InputDelayTicks` tuning loop (Option C in `ClientInputManager`). Non-zero typically means `InputDelayTicks` is too low relative to current network jitter, or the client isn't keeping up with the server tick rate. |
 
@@ -148,9 +148,9 @@ strip plots so the operator sees only what the scenario actually measures.
 
 | Id | What it does | Conditions | Metrics opted in | RecordVideo | CopyDebugLog |
 |---|---|---|---|---|---|
-| **S1-Idle** | One static ball, no input, no movement. Bandwidth baseline + physics-nondeterminism noise floor. | C0 only | `ClockOnly` (just M10) | no | no |
-| **S2-LinearMotion** | Rigid-body player walks forward at constant velocity on an empty floor. Reference for prediction-on-predictable-motion. **Sole scenario that samples M1/M2.** | All + CJITTER | `PhysicsBasicWithClock` (M1, M2, M3b, M4, M5, M6, M9, M10) | no | no |
-| **S3-ImpulseResponse** | Server applies one known impulse to a passive cube at a deterministic tick. Isolates the external-force class + M7. | C2 only | `All` (M3b, M4, M5, M6, M7, M9, M10) | no | no |
+| **S1-Idle** | One static ball, no input, no movement. Bandwidth baseline + physics-nondeterminism noise floor. | C0 only | `ClockOnly` (just M10 P50/P95) | no | no |
+| **S2-LinearMotion** | Rigid-body player walks forward at constant velocity on an empty floor. Reference for prediction-on-predictable-motion. **Sole scenario that samples M1/M2.** | All + CJITTER | `PhysicsBasicWithClock` (M1, M2, M3b, M4, M5, M6, M9, M10 P50/P95) | no | no |
+| **S3-ImpulseResponse** | Server applies one known impulse to a passive cube at a deterministic tick. Isolates the external-force class + M7. | C2 only | `All` (M3b, M4, M5, M6, M7, M9, M10 P50/P95) | no | no |
 | **S4-PhysicsStack** | Rigid player walks into a 6-cube tower. Physics-interaction quality across the latency sweep. | All | `PhysicsBasic` (no M7) | no | no |
 | **S5-MultiClientSharedPhysics** | Server + 2 clients; A drives a player into a shared cube, B observes. Tests non-authoritative client reconciliation. | (single condition — read source) | (read source) | no | no |
 | **S7-MultiBodyChaos** | Player walks through a pile of 20 cubes + 20 balls. Stress test for high-entity rollback cost. | C0..C4 | `All` | **yes** | **yes** |
@@ -214,7 +214,14 @@ For each `(scenario × condition)` cell `QuantitativeTestBase.RunOneCell`:
 5. **Sample M1/M2** if the scenario opts in to `ClockConvergence` — 150
    samples at 35 ms intervals (~5 s window). Otherwise just `WaitForClockSync`
    with `maxGapTicks = 5` and a per-condition timeout.
-6. **Reset bandwidth counters** (`bandwidth-stats` is destructive on read).
+6. **Arm bandwidth bucketing** via `bandwidth-reset`. Drains ENet's pre-
+   window byte counter (warm-up handshake + clock-sync traffic) so the first
+   bucket starts clean, then enables 1 Hz sampling on the harness. Each
+   render frame after this, the harness pops the destructive byte counter at
+   most once per ~1 s and pushes one kB/s value into an in-process bucket
+   list. Sampling stays armed across `scenario.Setup` so the spawn burst is
+   captured as a tall bucket in the distribution rather than excluded — that
+   was a deliberate choice (real network behaviour includes the spawn flood).
 7. **Start the recorder** if RecordVideo is on (deferred from step 3).
 8. **Optional profiler pause** — `MaybeProfilerPause` if
    `MONKENET_TEST_PROFILE=1`. Writes a handshake file with PIDs to the comm
@@ -222,7 +229,10 @@ For each `(scenario × condition)` cell `QuantitativeTestBase.RunOneCell`:
 9. **`scenario.Setup`** then **`scenario.Run`** — the scenario drives
    itself forward and calls the `SyncMetrics` recorders directly.
 10. **Snapshot end-of-window counters** — mispredict totals from the client
-    (or observer for S5), bandwidth, missed-input total.
+    (or observer for S5), missed-input total, and the bandwidth bucket array
+    (`bandwidth-stats` drains the trailing partial bucket, disarms sampling,
+    and returns `bucketsKBps[]`). `SyncMetrics.AddBandwidthBuckets` stores the
+    full array; the summary reports P50 + P95 over it.
 11. **Copy debug logs** if `CopyDebugLog` is on.
 12. **`MaskInapplicableMetrics`** sets metrics outside the scenario mask
     to NaN / -1 so the summary correctly renders N/A.
@@ -257,6 +267,17 @@ code; the deltas worth flagging are:
   manager *after* the plan and the corresponding metric followed during
   the snapback investigation. M11 is a rate metric (events / observation
   ticks) parallel to M9.
+- **M10 was split into P50/P95 post-plan.** The original plan defined M10
+  as a single `(sentBytes + recvBytes) / duration` average over the
+  observation window. In short scenarios (~14 s) this single sample was
+  dominated by the spawn-burst placement and varied 24× across back-to-back
+  runs of the same condition (0.43 → 10.18 kB/s for C0). Switched to per-
+  wall-second bucketing inside the harness with the runner consuming the
+  full array and reporting P50 (typical) + P95 (burst tail). The new
+  reading is ~140 kB/s P50 / ~175 kB/s P95 for S7-MultiBodyChaos which
+  matches the expected `entity_count × snapshot_hz × per-entity-bytes`
+  ballpark for 41 entities; the old reading was undercounting somewhere
+  in the single-sample pipeline.
 - **The matrix is sparse**, not dense. S1 runs at C0 only, S3 at C2 only,
   S8 at C5 only, and S2 also picks up CJITTER. The plan implied a denser
   matrix; the implementation prunes for runtime cost (~30 s/cell × full

@@ -80,14 +80,17 @@ public class InputTests
         var sentToServer = new List<byte[]>();
         _serverNet.PacketReceived += (_, bin) => sentToServer.Add(bin);
 
-        // GenerateAndTransmitInputs calls SendCommandToServer which goes through the bridge
+        // GenerateAndTransmitInputs calls SendCommandToServer which goes through the bridge.
+        // The input gets stamped with (currentTick + InputDelayTicks) — see
+        // ClientInputManager.InputDelayTicks. With the default value of 2,
+        // generating at client tick 1 stamps server tick 3.
         _inputManager.GenerateAndTransmitInputs(currentTick: 1);
 
         AssertThat(sentToServer.Count).IsGreaterEqual(1);
 
         var msg = MessageSerializer.Deserialize(sentToServer.Last()) as PackedClientInputMessage?;
         AssertThat(msg.HasValue).IsTrue();
-        AssertThat(msg!.Value.Tick).IsEqual(1);
+        AssertThat(msg!.Value.Tick).IsEqual(1 + _inputManager.InputDelayTicks);
     }
 
     // J-02 ─────────────────────────────────────────────────────────────────────
@@ -123,26 +126,32 @@ public class InputTests
             _inputManager.GenerateAndTransmitInputs(currentTick: t);
         }
 
-        // Deliver a snapshot for tick 3 — inputs 1,2,3 should be removed.
+        // Client inputs are stamped at (clientTick + InputDelayTicks). With the
+        // default delay of 2 the 5 inputs above were stamped at server ticks
+        // 3,4,5,6,7. Acking server tick (3 + delay) drops the 3 oldest stamped
+        // entries (3,4,5), leaving 6,7 in the buffer. The next GenerateAndTransmit
+        // call below adds the new tick stamped at (6 + delay) = 8 — so the
+        // packet should bundle 6, 7, 8 — three inputs.
+        int delay = _inputManager.InputDelayTicks;
         // Null InputProducer so _PhysicsProcess doesn't add a phantom input during AwaitIdleFrame.
         if (MonkeNet.Shared.MonkeNetConfig.Instance != null)
             MonkeNet.Shared.MonkeNetConfig.Instance.InputProducer = null;
         var snap = new GameSnapshotMessage
         {
-            Tick = 3,
+            Tick = 3 + delay,
             States = System.Array.Empty<IEntityStateData>()
         };
         _clientNet.SimulateIncomingPacket(1, MessageSerializer.Serialize(snap));
         await _clientRunner.AwaitIdleFrame();
 
-        // Send tick 6 — packet should contain inputs 4,5,6 only
+        // Send tick 6 — packet should contain stamped 6,7,8 (three inputs)
         SetupFakeProducer(new CharacterInputMessage { Keys = 6 });
         var lastPacket = (byte[])null;
         _serverNet.PacketReceived += (_, bin) => lastPacket = bin;
         _inputManager.GenerateAndTransmitInputs(currentTick: 6);
 
         var msg = (PackedClientInputMessage)MessageSerializer.Deserialize(lastPacket!);
-        AssertThat(msg.Inputs.Length).IsEqual(3); // ticks 4,5,6
+        AssertThat(msg.Inputs.Length).IsEqual(3); // stamped 6,7,8
     }
 
     // J-04 ─────────────────────────────────────────────────────────────────────
@@ -233,7 +242,21 @@ public class InputTests
         var dummyEntity = new MonkeNet.Shared.NetworkBehaviour();
         dummyEntity.Authority = 42;
 
-        // Call GetInputForEntityTick without registering any input — triggers a miss
+        // Seed _lastReceivedTick for the dummy entity directly. ServerInputReceiver
+        // gates missed-counting behind "has this entity ever received an input?",
+        // tracked via the private _lastReceivedTick dictionary, to suppress the
+        // pre-drive warm-up window (server has spawned the entity but the owner
+        // hasn't started sending yet — those aren't really "missed" inputs).
+        // SimulateIncomingPacket(authority=42, ...) wouldn't route to dummyEntity
+        // because the bridge looks up the entity owned by clientId 42 via the
+        // server's entity manager, and our dummyEntity is a stand-alone
+        // NetworkBehaviour outside that map. So reach in with reflection.
+        var lastReceivedTick = (System.Collections.IDictionary)typeof(ServerInputReceiver)
+            .GetField("_lastReceivedTick", BindingFlags.NonPublic | BindingFlags.Instance)
+            !.GetValue(receiver)!;
+        lastReceivedTick[dummyEntity] = 1;
+
+        // Now request input for a tick with nothing registered — counts as a miss
         receiver.GetInputForEntityTick(dummyEntity, tick: 1000);
         await _serverRunner.AwaitIdleFrame();
 

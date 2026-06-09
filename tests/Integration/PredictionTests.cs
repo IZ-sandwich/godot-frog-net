@@ -130,13 +130,28 @@ public class PredictionTests
     [TestCase]
     public async Task Prediction_MissedLocalState_Increments_WhenNoPredictionForTick()
     {
-        // A predicted entity must exist for ProcessServerState to count missed states —
-        // the no-entity case is the pre-spawn/spectator path and is intentionally skipped.
+        // Routing in ProcessServerState distinguishes THREE cases when the
+        // snapshot tick has no exact match in _predictedStates:
+        //   (a) buffer EMPTY → no info, routed to BlendToAuthViaPvb (overflow path)
+        //   (b) snap.Tick < oldestKeptTick → snapshot is older than the buffer
+        //       window covers → routed to BlendToAuthViaPvb (overflow path)
+        //   (c) snap.Tick > oldestKeptTick (in-window or future) but not in buffer →
+        //       counted as MissedLocalState.
+        //
+        // To exercise (c) — the case this test guards — we have to (1) register
+        // a real predicted entity AND (2) populate _predictedStates with at
+        // least one entry whose tick is below the incoming snapshot's tick.
+        // Without populating, the empty-buffer guard collapses (a) and (c) into
+        // the same routing, and the missed counter never increments.
         RegisterFakePredictedEntity();
         await _clientRunner.AwaitIdleFrame();
         ClearPredictedStates();
 
-        // Empty _predictedStates list — no prediction for tick 99
+        // Seed one prediction at tick 50 so oldestKept = 50; snap.Tick = 99
+        // then falls into the (c) "no matching predicted entry" branch rather
+        // than (a)/(b) "older than the buffer".
+        _predictionManager.RegisterPrediction(50, default(CharacterInputMessage));
+
         var snap = new GameSnapshotMessage
         {
             Tick = 99,
@@ -198,25 +213,34 @@ public class PredictionTests
 
     // I-07: snapshot for a trimmed-away tick increments missed-state counter ──
     [TestCase]
-    public void Prediction_RollbackBeyondCapTreatedAsMissedState()
+    public void Prediction_RollbackBeyondCap_RoutedThroughPvbOverflow()
     {
-        // A predicted entity must exist for ProcessServerState to count missed states —
-        // the no-entity case is the pre-spawn/spectator path and is intentionally skipped.
+        // Snapshots arriving for a tick older than the oldest entry in
+        // _predictedStates can't be resimed forward (the matching predicted
+        // entry was trimmed when the buffer hit MaxRollbackTicks). Pre-PVB
+        // these were counted as MissedLocalState; the current implementation
+        // routes them through BlendToAuthViaPvb (the "overflow" path) instead,
+        // which bumps the SnapToAuthCount metric (M11). This test guards that
+        // routing — the missed-local-state counter should NOT increment for
+        // overflowed snapshots, the snap-to-auth counter should.
         RegisterFakePredictedEntity();
         ClearPredictedStates();
         _predictionManager.MaxRollbackTicks = 5;
         int initialMissed = GetMissedLocalState();
+        int initialSnap = _predictionManager.SnapToAuthCount;
 
         // Register 10 — first 5 (ticks 1..5) get trimmed
         for (int t = 1; t <= 10; t++)
             _predictionManager.RegisterPrediction(t, default(CharacterInputMessage));
         AssertThat(GetPredictedStateCount()).IsEqual(5);
 
-        // Snapshot for a trimmed tick: predicted state is gone, count it as missed.
+        // Snapshot for a trimmed tick (2 < oldest kept = 6) — should route
+        // through the PVB-overflow path.
         var snap = new GameSnapshotMessage { Tick = 2, States = System.Array.Empty<IEntityStateData>() };
         _clientNet.SimulateIncomingPacket(1, MessageSerializer.Serialize(snap));
 
-        AssertThat(GetMissedLocalState()).IsGreater(initialMissed);
+        AssertThat(GetMissedLocalState()).IsEqual(initialMissed);
+        AssertThat(_predictionManager.SnapToAuthCount).IsGreater(initialSnap);
     }
 
     // ── reflection helpers ─────────────────────────────────────────────────────

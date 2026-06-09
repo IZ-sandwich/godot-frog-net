@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text.Json;
 using GdUnit4;
 using Godot;
@@ -54,17 +55,24 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
 
         var summary = new MetricsSummaryCsv();
         var perScenarioRows = new Dictionary<string, List<SyncMetrics.Summary>>();
+        // Stash raw |Δv|² distributions per (scenario, condition) so the per-
+        // scenario CDF writer can build a one-curve-per-condition plot without
+        // re-running the cells. Keyed by scenario id; inner dict keyed by
+        // condition id. Cells that don't exercise M14 just don't add an entry.
+        var perScenarioM14Samples = new Dictionary<string, Dictionary<string, IReadOnlyList<float>>>();
 
         foreach (var scenario in scenarios)
         {
             perScenarioRows[scenario.Id] = new List<SyncMetrics.Summary>();
+            perScenarioM14Samples[scenario.Id] = new Dictionary<string, IReadOnlyList<float>>();
             foreach (var condition in scenario.Conditions)
             {
                 GD.Print($"[QuantitativeTestBase] running {scenario.Id} × {condition.Id} ({condition.Label})");
                 SyncMetrics.Summary row;
+                IReadOnlyList<float> m14Samples = null;
                 try
                 {
-                    row = RunOneCell(scenario, condition);
+                    row = RunOneCell(scenario, condition, out m14Samples);
                 }
                 catch (Exception ex)
                 {
@@ -81,6 +89,8 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
                 }
                 summary.Add(row);
                 perScenarioRows[scenario.Id].Add(row);
+                if (m14Samples != null && m14Samples.Count > 0)
+                    perScenarioM14Samples[scenario.Id][condition.Id] = m14Samples;
             }
         }
 
@@ -107,6 +117,21 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
             WriteScenarioStripPlot(
                 System.IO.Path.Combine(artifactDir, scenarioId + ".strip.svg"),
                 scenarioId, scenario.ApplicableMetrics, rows);
+
+            // Per-scenario M14 distribution plot: log-x CDF of |Δv| per
+            // condition. The strip plot reports RMS + p50 as scalars; the
+            // CDF lets a reader see whether degradation under bad networks
+            // is "tail spikes" (a few large Δv events that drag RMS up but
+            // leave p50 untouched) vs "uniformly noisier" (the whole curve
+            // shifts right). Only written when at least one condition
+            // produced samples.
+            if (perScenarioM14Samples.TryGetValue(scenarioId, out var perCondSamples)
+                && perCondSamples.Count > 0)
+            {
+                WriteVisualSmoothnessCdf(
+                    System.IO.Path.Combine(artifactDir, scenarioId + ".m14-distribution.svg"),
+                    scenarioId, perCondSamples);
+            }
         }
     }
 
@@ -118,8 +143,10 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
     // folder.
     private string _currentRunArtifactDir = null;
 
-    private SyncMetrics.Summary RunOneCell(IScenario scenario, NetworkCondition condition)
+    private SyncMetrics.Summary RunOneCell(IScenario scenario, NetworkCondition condition,
+        out IReadOnlyList<float> m14DvSquaredSamples)
     {
+        m14DvSquaredSamples = null;
         int serverPort = NextPort();
         using var relay = new UdpRelay(serverPort);
         relay.SetConditions(condition.LatencyMs, condition.JitterMs, condition.LossRate);
@@ -195,11 +222,15 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
                 timeoutMs: condition.ClockSyncTimeoutMs);
         }
 
-        // Reset bandwidth counters before the observation window so the
-        // first sample doesn't include warm-up handshake traffic. PopStatistic
-        // is destructive, so this read implicitly zeros the counters.
-        try { client.Send(new { cmd = "bandwidth-stats" }); } catch { }
-        var bandwidthStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        // Arm 1 Hz bandwidth bucketing for the observation window. The harness
+        // drains pre-window bytes (warm-up handshake / clock-sync) inside this
+        // call so the first bucket starts clean. Sampling stays armed across
+        // scenario.Setup + scenario.Run; the spawn burst is deliberately
+        // included as part of the per-second distribution rather than excluded
+        // (it's part of the real network behaviour and is what makes a single
+        // averaged-over-the-window sample so noisy — bucketing absorbs it as
+        // one tall bar in the distribution instead of dragging the mean).
+        try { client.Send(new { cmd = "bandwidth-reset" }); } catch { }
 
         // Kick off the deferred recorder (no-op if this cell isn't recording or
         // the recorder is already running). Placed here so the MP4 starts just
@@ -219,6 +250,17 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
         MaybeProfilerPause(client, server, scenario, condition);
 
         scenario.Setup(server, client);
+
+        // Reset the visual-smoothness accumulator AFTER Setup so the metric
+        // covers only the scenario's observation window — the spawn burst,
+        // teleport-to-spawn, and first-tick clock alignment all produce Δv
+        // spikes that aren't representative of steady-state smoothness.
+        if ((scenario.ApplicableMetrics & MetricKey.M14) != 0)
+        {
+            try { using var _ = client.Send(new { cmd = "visual-smoothness-reset" }); }
+            catch (Exception ex) { GD.PrintErr($"[QuantitativeTestBase] visual-smoothness-reset failed: {ex.Message}"); }
+        }
+
         scenario.Run(server, client, metrics);
 
         // Snapshot bandwidth + missed-input at the end of the observation
@@ -236,11 +278,19 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
         }
         try
         {
+            // Drain the trailing partial bucket inside the harness, then read
+            // the array of per-second kB/s samples accumulated since
+            // bandwidth-reset. Each entry covers ~1 wall-second of network
+            // activity; the metrics struct stores the distribution and reports
+            // P50 + P95.
             using var bDoc = subject.Send(new { cmd = "bandwidth-stats" });
             var b = bDoc.RootElement.GetProperty("data");
-            int sent = b.GetProperty("sentBytes").GetInt32();
-            int recv = b.GetProperty("recvBytes").GetInt32();
-            metrics.AddBandwidthSample(sent, recv, bandwidthStopwatch.Elapsed.TotalSeconds);
+            if (b.TryGetProperty("bucketsKBps", out var bucketsEl) && bucketsEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                var buckets = new List<float>(bucketsEl.GetArrayLength());
+                foreach (var v in bucketsEl.EnumerateArray()) buckets.Add(v.GetSingle());
+                metrics.AddBandwidthBuckets(buckets);
+            }
         }
         catch (Exception ex) { GD.PrintErr($"[QuantitativeTestBase] bandwidth-stats failed: {ex.Message}"); }
         try
@@ -265,6 +315,23 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
                 smiDoc.RootElement.GetProperty("data").GetProperty("count").GetInt32());
         }
         catch (Exception ex) { GD.PrintErr($"[QuantitativeTestBase] server-missed-input-total failed: {ex.Message}"); }
+        if ((scenario.ApplicableMetrics & MetricKey.M14) != 0)
+        {
+            try
+            {
+                using var vsDoc = subject.Send(new { cmd = "visual-smoothness" });
+                var v = vsDoc.RootElement.GetProperty("data");
+                var samples = new List<float>();
+                if (v.TryGetProperty("dvSquared", out var arr) && arr.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    samples.Capacity = arr.GetArrayLength();
+                    foreach (var el in arr.EnumerateArray()) samples.Add(el.GetSingle());
+                }
+                metrics.AddVisualSmoothnessSamples(samples);
+                m14DvSquaredSamples = samples;
+            }
+            catch (Exception ex) { GD.PrintErr($"[QuantitativeTestBase] visual-smoothness failed: {ex.Message}"); }
+        }
 
         // Copy the client's MonkeLogger debug log into the artifact dir.
         // CopyProcessLog uses FileShare.ReadWrite so we can grab it while the
@@ -428,9 +495,15 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
         if ((applicable & MetricKey.M6) == 0)     s.M6_VisualSmoothRatio = float.NaN;
         if ((applicable & MetricKey.M7) == 0)     s.M7_PostRollbackConvergenceP95 = float.NaN;
         if ((applicable & MetricKey.M9) == 0)     s.M9_MissedInputRatePct = float.NaN;
-        if ((applicable & MetricKey.M10) == 0)    s.M10_BandwidthKBps = float.NaN;
+        if ((applicable & MetricKey.M10) == 0)    { s.M10_BandwidthP50KBps = float.NaN; s.M10_BandwidthP95KBps = float.NaN; }
         if ((applicable & MetricKey.M11) == 0)    s.M11_SnapToAuthRatePct = float.NaN;
         if ((applicable & MetricKey.M13) == 0)    s.M13_ServerMissedInputRatePct = float.NaN;
+        if ((applicable & MetricKey.M14) == 0)
+        {
+            s.M14_VisualSmoothnessRmsDeltaV = float.NaN;
+            s.M14_VisualSmoothnessP50DeltaV = float.NaN;
+            s.M14_VisualSmoothnessP95DeltaV = float.NaN;
+        }
     }
 
     /// <summary>Poll clock-state from both processes and record the gap. Used
@@ -504,12 +577,18 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
             Description = "Ticks to recover < 0.1 m post-rollback. Only meaningful in S3 impulse-response where exactly one external force is applied at a known tick." },
         new StripPlot.MetricSpec { Name = "M9 missed input", Unit = "evt",   Threshold = 10f,   AxisMax = 60f,
             Description = "Cumulative count of (tick × entity) events where the predictor had to fall back to default input because no cached server input was available for a remote entity that previously HAD input." },
-        new StripPlot.MetricSpec { Name = "M10 bandwidth",   Unit = "kB/s",  Threshold = 5f,    AxisMax = 30f,
-            Description = "Client-side sent + received bytes / second. Industry-tuned games target 2–5 kB/s; unoptimised replication is 30–50 kB/s." },
+        new StripPlot.MetricSpec { Name = "M10 bw P50",      Unit = "kB/s",  Threshold = 5f,    AxisMax = 30f,
+            Description = "Median per-second sent + received bytes / second across the scenario window. Industry-tuned games target 2–5 kB/s steady-state; unoptimised replication is 30–50 kB/s. P50 captures the typical-tick cost; pair with P95 for tail bursts (e.g. spawn flood)." },
+        new StripPlot.MetricSpec { Name = "M10 bw P95",      Unit = "kB/s",  Threshold = 15f,   AxisMax = 60f,
+            Description = "95th-percentile per-second bandwidth. Captures the spawn burst and any one-off snapshot floods. P95 above the threshold means the server occasionally floods the client with state — usually fine, but a steady-high P95 with a normal P50 indicates bursty replication that could be batched or throttled." },
         new StripPlot.MetricSpec { Name = "M11 snap-to-auth",Unit = "%",     Threshold = 10f,   AxisMax = 80f,
             Description = "Rate of snapshots that arrived too old to resim (depth > MaxRollbackTicks) and were corrected by teleport-snap instead. At low-latency conditions this should be ~0; high values at C3/C4 are expected with a tight cap. Distinct from M3 (rollback mispredicts): M3 measures prediction quality, M11 measures how often the cap is binding." },
         new StripPlot.MetricSpec { Name = "M13 srv miss input",Unit = "%",     Threshold = 5f,    AxisMax = 30f,
             Description = "Server-side missed-input rate: (entity × tick) events where the server ticked a client-owned entity without finding a fresh client-stamped input and fell back to repeat-stale / default, divided by observation entity-ticks. Direct quality signal for the input-arrival pipeline. The pre-drive warm-up (entity exists on the server but the client hasn't started driving yet) is excluded — only ticks AFTER the first received input from that entity count. Threshold 5 %: with the InputDelayTicks auto-adjuster on, S7-MultiBodyChaos settles at 0 % across most conditions; C2 (where jitter > InputDelayTicks's steady-state target) shows ~15 %. Distinct from M9 (client-side replay missed an input in snapshot history): M9 is a replay-time event at the client; M13 is an apply-time event at the server." },
+        new StripPlot.MetricSpec { Name = "M14 vis smoothness RMS", Unit = "m/s", Threshold = 1.0f, AxisMax = 5f,
+            Description = "Visual smoothness — RMS of per-render-frame |Δv| on the visual mesh (m/s). Δv is the change in mesh world-space velocity between consecutive render frames; constant-velocity motion reports 0, jitter / snaps / direction flips raise it. RMS over-weights tail spikes — pair with the p50 column to see the TYPICAL frame's smoothness. Directly measures the user-perceived smoothness goal that M5 / M6 do not capture (those measure auth-error, not frame-to-frame discontinuity)." },
+        new StripPlot.MetricSpec { Name = "M14 vis smoothness P50", Unit = "m/s", Threshold = 0.3f, AxisMax = 2f,
+            Description = "Median per-render-frame |Δv| (m/s). The TYPICAL-frame smoothness measure — unlike RMS, p50 is insensitive to occasional snap-overflow spikes, so a low p50 with a high RMS means motion is smooth most of the time but punctuated by visible discontinuities. Reading both together identifies whether degradation is steady jitter (p50 rises) or sparse snaps (RMS rises but p50 stays low)." },
     };
 
     /// <summary>One-line metric-name + axis-key mapping used to project a
@@ -518,7 +597,8 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
     {
         MetricKey.M1, MetricKey.M2, MetricKey.M3b, MetricKey.M4,
         MetricKey.M5_rms, MetricKey.M5_p95, MetricKey.M6, MetricKey.M7,
-        MetricKey.M9, MetricKey.M10, MetricKey.M11, MetricKey.M13,
+        MetricKey.M9, MetricKey.M10, MetricKey.M10, MetricKey.M11, MetricKey.M13,
+        MetricKey.M14, MetricKey.M14,
     };
 
     private static void WriteDashboard(string path,
@@ -564,8 +644,9 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
         r.M3b_ExternalForceRatePct, r.M4_RollbackDepthP99,
         r.M5_PositionErrorRms, r.M5_PositionErrorP95,
         r.M6_VisualSmoothRatio, r.M7_PostRollbackConvergenceP95,
-        r.M9_MissedInputRatePct, r.M10_BandwidthKBps, r.M11_SnapToAuthRatePct,
-        r.M13_ServerMissedInputRatePct,
+        r.M9_MissedInputRatePct, r.M10_BandwidthP50KBps, r.M10_BandwidthP95KBps,
+        r.M11_SnapToAuthRatePct, r.M13_ServerMissedInputRatePct,
+        r.M14_VisualSmoothnessRmsDeltaV, r.M14_VisualSmoothnessP50DeltaV,
     };
 
     /// <summary>Per-scenario strip plot. Metrics outside the scenario's
@@ -607,5 +688,152 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
             });
         }
         plot.Save(path);
+    }
+
+    /// <summary>Per-scenario CDF plot of |Δv| (m/s) for the M14 visual-
+    /// smoothness metric. One curve per condition, plotted on a log x-axis
+    /// so both the smooth tail (≈0.01 m/s) and the snap-overflow spikes
+    /// (≈10 m/s) fit on one plot without compressing the typical-frame
+    /// region to invisibility. Y axis is cumulative fraction [0,1] —
+    /// horizontal lines at 0.5 / 0.95 mark p50 / p95 read-off points,
+    /// matching the columns reported in the strip plot.
+    ///
+    /// <para>Why CDF over a histogram: percentile lines are easier to read
+    /// off a CDF, the curves overlay cleanly without binning artifacts,
+    /// and the visual answer to "is C3's right shoulder a hard tail or a
+    /// uniform shift" is obvious from the curve shape.</para></summary>
+    private static void WriteVisualSmoothnessCdf(string path, string scenarioId,
+        Dictionary<string, IReadOnlyList<float>> perConditionSamples)
+    {
+        // SVG layout — single panel, hard-coded so the writer stays self-
+        // contained and we don't have to retrofit the SvgPlot framework for
+        // log-axis support just for this one plot.
+        const int W = 1000;
+        const int H = 560;
+        const int LeftPad = 80;
+        const int RightPad = 240;
+        const int TopPad = 60;
+        const int BottomPad = 70;
+        int plotW = W - LeftPad - RightPad;
+        int plotH = H - TopPad - BottomPad;
+
+        // Log x-axis bounds: cover [0.001, 1000] m/s in decade ticks. The
+        // metric is per-render-frame |Δv| so values span ~3 decades in
+        // practice (clean steady-state ≈ 0.01, snap-overflow ≈ 10–50).
+        const double XMin = 0.001;
+        const double XMax = 1000.0;
+        double logMin = Math.Log10(XMin);
+        double logMax = Math.Log10(XMax);
+
+        double XToPx(double xValue)
+        {
+            if (xValue <= 0) xValue = XMin;
+            double clamped = Math.Max(XMin, Math.Min(XMax, xValue));
+            return LeftPad + plotW * (Math.Log10(clamped) - logMin) / (logMax - logMin);
+        }
+        double YToPx(double cdf) => TopPad + plotH * (1.0 - cdf);
+
+        var ci = CultureInfo.InvariantCulture;
+        var sb = new System.Text.StringBuilder();
+        sb.Append(ci, $"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {W} {H}' width='{W}' height='{H}' font-family='monospace' font-size='12'>");
+        sb.Append("<rect width='100%' height='100%' fill='white'/>");
+
+        // Title
+        sb.Append(ci, $"<text x='{W / 2}' y='24' text-anchor='middle' font-size='15' font-weight='bold'>{scenarioId} — M14 visual smoothness CDF</text>");
+        sb.Append(ci, $"<text x='{W / 2}' y='42' text-anchor='middle' fill='#555' font-size='11'>per-render-frame |Δv| (m/s), log x; one curve per condition</text>");
+
+        // Plot frame
+        sb.Append(ci, $"<rect x='{LeftPad}' y='{TopPad}' width='{plotW}' height='{plotH}' fill='none' stroke='#333'/>");
+
+        // X-axis decade ticks + labels
+        for (int dec = (int)logMin; dec <= (int)logMax; dec++)
+        {
+            double x = XToPx(Math.Pow(10, dec));
+            sb.Append(ci, $"<line x1='{x:0.#}' y1='{TopPad + plotH}' x2='{x:0.#}' y2='{TopPad + plotH + 5}' stroke='#333'/>");
+            sb.Append(ci, $"<line x1='{x:0.#}' y1='{TopPad}' x2='{x:0.#}' y2='{TopPad + plotH}' stroke='#eee'/>");
+            string label = dec switch { 0 => "1", 1 => "10", 2 => "100", 3 => "1k", -1 => "0.1", -2 => "0.01", -3 => "0.001", _ => $"1e{dec}" };
+            sb.Append(ci, $"<text x='{x:0.#}' y='{TopPad + plotH + 18}' text-anchor='middle'>{label}</text>");
+        }
+        sb.Append(ci, $"<text x='{LeftPad + plotW / 2}' y='{TopPad + plotH + 42}' text-anchor='middle' font-size='12'>|Δv| (m/s)</text>");
+
+        // Y-axis ticks + labels + percentile guide lines at 0.5 / 0.95
+        for (int i = 0; i <= 10; i++)
+        {
+            double cdf = i / 10.0;
+            double y = YToPx(cdf);
+            sb.Append(ci, $"<line x1='{LeftPad - 5}' y1='{y:0.#}' x2='{LeftPad}' y2='{y:0.#}' stroke='#333'/>");
+            sb.Append(ci, $"<line x1='{LeftPad}' y1='{y:0.#}' x2='{LeftPad + plotW}' y2='{y:0.#}' stroke='#eee'/>");
+            sb.Append(ci, $"<text x='{LeftPad - 8}' y='{y + 4:0.#}' text-anchor='end'>{cdf:0.0}</text>");
+        }
+        // Emphasize p50 and p95 guide lines so a reader can drop verticals
+        // down to the x-axis to read those percentiles per curve.
+        foreach (var (cdf, label) in new[] { (0.5, "p50"), (0.95, "p95") })
+        {
+            double y = YToPx(cdf);
+            sb.Append(ci, $"<line x1='{LeftPad}' y1='{y:0.#}' x2='{LeftPad + plotW}' y2='{y:0.#}' stroke='#999' stroke-dasharray='4,3'/>");
+            sb.Append(ci, $"<text x='{LeftPad + plotW + 4}' y='{y - 3:0.#}' fill='#666' font-size='10'>{label}</text>");
+        }
+        sb.Append(ci, $"<text x='{LeftPad - 50}' y='{TopPad + plotH / 2}' text-anchor='middle' font-size='12' transform='rotate(-90 {LeftPad - 50},{TopPad + plotH / 2})'>cumulative fraction</text>");
+
+        // One CDF per condition, in the canonical condition order so colours
+        // stay consistent with the strip plots even when a scenario only
+        // exercised a subset of the conditions.
+        var orderedConditionIds = new List<string>();
+        foreach (var key in new[] { "C0", "C1", "C2", "C2-GoodBroadband", "C3", "C4", "C5", "CJITTER" })
+            if (perConditionSamples.ContainsKey(key)) orderedConditionIds.Add(key);
+        foreach (var key in perConditionSamples.Keys)
+            if (!orderedConditionIds.Contains(key)) orderedConditionIds.Add(key);
+
+        int legendY = TopPad + 8;
+        foreach (var conditionId in orderedConditionIds)
+        {
+            var dvSquared = perConditionSamples[conditionId];
+            if (dvSquared.Count == 0) continue;
+            // Sort the per-frame |Δv| values (m/s) so the empirical CDF is a
+            // monotonic curve. sqrt converts the stored |Δv|² back to |Δv|
+            // for plotting on the m/s x-axis.
+            var dv = new float[dvSquared.Count];
+            for (int i = 0; i < dvSquared.Count; i++) dv[i] = (float)Math.Sqrt(Math.Max(0, dvSquared[i]));
+            Array.Sort(dv);
+            int n = dv.Length;
+            string color = ColorFor(conditionId);
+
+            // Sub-sample to at most ~400 polyline vertices — at 60 fps × 8 s
+            // ≈ 480 samples we'd otherwise emit one path point per sample,
+            // which is fine but wasteful. Keep boundary points exact so the
+            // p50/p95 readings off the plot are accurate.
+            int stride = Math.Max(1, n / 400);
+            sb.Append(ci, $"<polyline fill='none' stroke='{color}' stroke-width='1.5' points='");
+            sb.Append(ci, $"{XToPx(dv[0]):0.#},{YToPx(0):0.#} ");
+            for (int i = 0; i < n; i += stride)
+            {
+                double cdf = (i + 1) / (double)n;
+                sb.Append(ci, $"{XToPx(dv[i]):0.#},{YToPx(cdf):0.#} ");
+            }
+            sb.Append(ci, $"{XToPx(dv[n - 1]):0.#},{YToPx(1):0.#}");
+            sb.Append("'/>");
+
+            // Legend entry — include the per-condition p50 / p95 / RMS in
+            // the legend so the reader doesn't have to cross-reference the
+            // strip plot or CSV to put a number on each curve.
+            double sumSq = 0;
+            foreach (var v in dvSquared) sumSq += v;
+            double rms = Math.Sqrt(sumSq / dvSquared.Count);
+            double p50 = dv[Math.Min(n - 1, (int)Math.Ceiling(0.50 * n) - 1)];
+            double p95 = dv[Math.Min(n - 1, (int)Math.Ceiling(0.95 * n) - 1)];
+            int lx = LeftPad + plotW + 30;
+            sb.Append(ci, $"<line x1='{lx}' y1='{legendY}' x2='{lx + 18}' y2='{legendY}' stroke='{color}' stroke-width='2'/>");
+            sb.Append(ci, $"<text x='{lx + 24}' y='{legendY + 4}' font-size='11'>{conditionId}</text>");
+            sb.Append(ci, $"<text x='{lx}' y='{legendY + 18}' font-size='9' fill='#555'>p50={p50:0.###} p95={p95:0.##} RMS={rms:0.##}</text>");
+            legendY += 36;
+        }
+
+        sb.Append("</svg>");
+        try
+        {
+            System.IO.File.WriteAllText(path, sb.ToString());
+            GD.Print($"[QuantitativeTestBase] M14 CDF written → {path}");
+        }
+        catch (Exception ex) { GD.PrintErr($"[QuantitativeTestBase] M14 CDF write failed: {ex.Message}"); }
     }
 }

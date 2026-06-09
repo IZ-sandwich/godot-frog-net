@@ -38,7 +38,7 @@ PRED_CHECK_RX = re.compile(
     r"predVel=\((-?[\d.]+),(-?[\d.]+),(-?[\d.]+)\)"
 )
 ROLLBACK_RX = re.compile(r"\[PRED-ROLLBACK\] tick=(\d+) entities=\d+ resimTicks=(\d+)")
-SNAP_OVF_RX = re.compile(r"\[PRED-SNAP-OVERFLOW\] tick=(\d+)")
+SNAP_OVF_RX = re.compile(r"\[PRED-(?:SNAP|PVB)-OVERFLOW\] tick=(\d+)")
 TICK_RX     = re.compile(r"\[CLIENT-TICK\] tick=(\d+) dt=")
 
 

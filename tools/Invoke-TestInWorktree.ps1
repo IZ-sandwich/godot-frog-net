@@ -110,7 +110,7 @@ try {
     }
 
     $proc = Start-Process -FilePath "dotnet" `
-        -ArgumentList "test tests/MonkeNetTests.csproj --logger console;verbosity=normal --filter $Filter -p:AssemblyName=$asmName" `
+        -ArgumentList "test tests/MonkeNetTests.csproj --logger console;verbosity=normal --settings tests/gdunit4.runsettings --filter $Filter -p:AssemblyName=$asmName" `
         -RedirectStandardOutput $StdoutLog `
         -RedirectStandardError $StderrLog `
         -NoNewWindow -PassThru

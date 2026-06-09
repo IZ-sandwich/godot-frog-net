@@ -97,8 +97,9 @@ public sealed class MetricsSummaryCsv
                     "M3_mispredict_pct,M3a_phys_nondet_pct,M3b_ext_force_pct,M3c_degraded_pct," +
                     "M4_rb_p50,M4_rb_p95,M4_rb_p99," +
                     "M5_pos_rms_m,M5_pos_p95_m,M6_visual_ratio,M7_post_rb_p95_ticks," +
-                    "M9_missed_input_pct,M10_bandwidth_kbps,M11_snap_to_auth_pct," +
-                    "M13_server_missed_input_pct," +
+                    "M9_missed_input_pct,M10_bandwidth_p50_kBps,M10_bandwidth_p95_kBps," +
+                    "M11_snap_to_auth_pct,M13_server_missed_input_pct," +
+                    "M14_visual_smoothness_rms_dv_mps,M14_visual_smoothness_p50_dv_mps,M14_visual_smoothness_p95_dv_mps," +
                     "obs_ticks,samples");
         var ci = CultureInfo.InvariantCulture;
         foreach (var r in _rows)
@@ -120,9 +121,13 @@ public sealed class MetricsSummaryCsv
                 r.M6_VisualSmoothRatio.ToString("0.###", ci),
                 r.M7_PostRollbackConvergenceP95.ToString(ci),
                 r.M9_MissedInputRatePct.ToString("0.###", ci),
-                r.M10_BandwidthKBps.ToString("0.##", ci),
+                r.M10_BandwidthP50KBps.ToString("0.##", ci),
+                r.M10_BandwidthP95KBps.ToString("0.##", ci),
                 r.M11_SnapToAuthRatePct.ToString("0.###", ci),
                 r.M13_ServerMissedInputRatePct.ToString("0.###", ci),
+                r.M14_VisualSmoothnessRmsDeltaV.ToString("0.####", ci),
+                r.M14_VisualSmoothnessP50DeltaV.ToString("0.####", ci),
+                r.M14_VisualSmoothnessP95DeltaV.ToString("0.####", ci),
                 r.ObservationTicks.ToString(ci),
                 r.SampleCount.ToString(ci)
             ));

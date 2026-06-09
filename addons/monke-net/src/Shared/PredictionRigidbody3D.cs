@@ -217,13 +217,17 @@ public partial class PredictionRigidbody3D : Node
     {
         if (_body == null) return;
 
+        // Snapshot prePos for the smoother-handoff calls below; the per-call
+        // diagnostic line that used to live here ([PHYS-RB-RECONCILE]) was
+        // dominated by Interpolate-tier blend-step lerps (~28 k lines per
+        // scenario, ~14 % of all log volume) — the genuine-reconcile cases
+        // are now logged once with the equivalent pre/auth/delta payload at
+        // the call site in ClientPredictionManager.RollbackAndResimulate so
+        // the blend-step Reconciles emit nothing.
         Vector3 prePos = _body.GlobalPosition;
         Quaternion preRot = _body.Quaternion;
         Vector3 preVel = _body.LinearVelocity;
-        Vector3 posDelta = authoritative.Position - prePos;
-        Vector3 velDelta = authoritative.LinearVelocity - preVel;
         bool smoothingEnabled = _smoothing != null && _smoothing.Visual != null;
-        MonkeLogger.Debug($"[PHYS-RB-RECONCILE] body={_body.Name} prePos=({prePos.X:F3},{prePos.Y:F3},{prePos.Z:F3}) -> authPos=({authoritative.Position.X:F3},{authoritative.Position.Y:F3},{authoritative.Position.Z:F3}) |posDelta|={posDelta.Length():F4} preVel=({preVel.X:F3},{preVel.Y:F3},{preVel.Z:F3}) -> authVel=({authoritative.LinearVelocity.X:F3},{authoritative.LinearVelocity.Y:F3},{authoritative.LinearVelocity.Z:F3}) |velDelta|={velDelta.Length():F4} smoothing={smoothingEnabled} pendingDropped={_pending.Count}");
 
         // Atomic Transform set propagates Position + Rotation to the physics
         // server in a single update; setting them separately can leave the body

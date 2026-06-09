@@ -1,7 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <RunSettings>
+  <!-- TestSessionTimeout is a built-in VSTest RunConfiguration element (NOT a
+       gdUnit4 element). Format is INTEGER MILLISECONDS. The previous file had
+       the element nested under <GdUnit4>, which gdUnit4 ignores (the legal
+       <GdUnit4> children are only Parameters / DisplayName / CaptureStdOut /
+       CompileProcessTimeout), so the runner reverted to the 10-minute default
+       and cancelled long-running tests (RunS2AllConditions, VehicleClaimAndDrive)
+       mid-execution.
+       Sources:
+         - Microsoft Learn — "Configure unit tests with a .runsettings file"
+           (TestSessionTimeout row in RunConfiguration table, milliseconds).
+         - gdUnit4Net TestAdapter README — sample .runsettings showing
+           TestSessionTimeout under RunConfiguration. -->
+  <RunConfiguration>
+    <TestSessionTimeout>1800000</TestSessionTimeout> <!-- 30 minutes -->
+  </RunConfiguration>
   <GdUnit4>
-    <TestSessionTimeout>30</TestSessionTimeout>
     <!-- Godot's Mono compilation step on first run after adding/touching .cs files
          can take ~30s; the default 20s causes a "Godot compilation TIMEOUT" abort. -->
     <CompileProcessTimeout>60000</CompileProcessTimeout>

@@ -31,7 +31,6 @@ MonkeNet="*uid://bchfwceouveq2"
 
 window/size/viewport_width=600
 window/size/viewport_height=600
-window/vsync/vsync_mode=0
 
 [dotnet]
 

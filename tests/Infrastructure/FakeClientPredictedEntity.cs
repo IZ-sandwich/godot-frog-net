@@ -46,6 +46,17 @@ public partial class FakeClientPredictedEntity : ClientPredictedEntity
     public override RigidbodyState GetSnapshotState()
     {
         GetSnapshotStateCallCount++;
-        return default;
+        // Rotation defaults to Quaternion.Identity (not (0,0,0,0) which is what
+        // `default(RigidbodyState)` would produce). The manager's misprediction
+        // logger calls `.Inverse()` on the predicted rotation, and Godot's
+        // Quaternion.Inverse validates normalisation — a zero quat throws.
+        // Real entities always carry a normalised rotation; this fake must too.
+        return new RigidbodyState
+        {
+            Position = Vector3.Zero,
+            Rotation = Quaternion.Identity,
+            LinearVelocity = Vector3.Zero,
+            AngularVelocity = Vector3.Zero,
+        };
     }
 }

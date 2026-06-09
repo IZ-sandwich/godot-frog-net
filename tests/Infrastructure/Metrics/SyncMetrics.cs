@@ -23,7 +23,13 @@ namespace MonkeNet.Tests.Infrastructure.Metrics;
 ///   <item><b>M7 PostRollbackConvergenceTicks P95</b> — ticks until post-correction error drops below 0.1 m.</item>
 ///   <item><b>M8 entity-count scaling</b> — recorded externally by comparing M5 across scenarios with different body counts.</item>
 ///   <item><b>M9 MissedInputRate</b> — missed-input events ÷ observation ticks.</item>
-///   <item><b>M10 BandwidthKBps</b> — (sent + recv bytes) ÷ duration.</item>
+///   <item><b>M10 BandwidthKBps P50/P95</b> — distribution of per-second kB/s
+///     samples covering both spawn-burst and steady-state. The harness emits
+///     one bucket per wall-second while sampling is armed; the runner records
+///     them via <see cref="AddBandwidthBuckets"/> and the summary reports
+///     P50 (typical) + P95 (tail). A single sample averaged over the whole
+///     scenario was found to vary 24× between back-to-back runs because the
+///     spawn burst dominated short windows — bucketing collapses that noise.</item>
 ///   <item><b>M11 SnapToAuthRate</b> — snap-on-overflow events ÷ observation ticks. Distinct from M3 (mispredict rate): M3 measures prediction quality, M11 measures how often <c>MaxRollbackTicks</c> is binding.</item>
 ///   <item><b>M13 ServerMissedInputRate</b> — server-side missed-input events ÷ observation ticks. Counts (tick × entity) pairs where the server ticked without a fresh stamped input from the owner and fell back to repeat-stale / default. Direct signal for the input-delay tuning loop (Option C).</item>
 /// </list>
@@ -56,9 +62,19 @@ public sealed class SyncMetrics
     private int _missedInputTotal = 0;
     private int _snapToAuthTotal = 0;
     private int _serverMissedInputTotal = 0;
-    private long _bandwidthSentBytes = 0;
-    private long _bandwidthRecvBytes = 0;
-    private double _bandwidthDurationSeconds = 0;
+    private readonly List<float> _bandwidthBuckets = new();
+
+    // M14: visual smoothness. The client buckets every per-render-frame |Δv|²
+    // value (one per render frame, where Δv is the change in visual-mesh
+    // world-space velocity between consecutive frames). Storing the full
+    // distribution rather than just a running sum lets the summary report
+    // BOTH the RMS (tail-sensitive) AND the p50 (typical-frame jerk) — RMS
+    // alone is dominated by snap-overflow spikes and hides whether the
+    // typical frame is smooth. The runner also writes a per-scenario CDF
+    // plot from these samples so a reader can see the full per-condition
+    // distribution. Units of each stored sample are (m/s)²; RMS / p50 /
+    // p95 reported in m/s (via sqrt at summary time).
+    private readonly List<float> _visualSmoothnessDvSquared = new();
 
     /// <summary>Threshold (meters) below which the body is considered converged
     /// after a rollback. Matches Gaffer's "no correction needed" floor — see
@@ -154,15 +170,30 @@ public sealed class SyncMetrics
     /// not sending inputs at the server's tick rate.</summary>
     public void SetServerMissedInputTotal(int total) => _serverMissedInputTotal = total;
 
-    /// <summary>Record one bandwidth-stats sample. <paramref name="durationSeconds"/>
-    /// is the elapsed time since the previous sample (used to compute the rate).
-    /// Pushed by the runner at fixed intervals during the observation window.</summary>
-    public void AddBandwidthSample(int sentBytes, int recvBytes, double durationSeconds)
+    /// <summary>Record the per-second kB/s bucket array returned by the harness
+    /// at the end of the bandwidth observation window. Each entry covers one
+    /// wall-second sample (configured by <c>BandwidthBucketMinMs</c> in the
+    /// harness). M10 reports P50 + P95 of this distribution.</summary>
+    public void AddBandwidthBuckets(IReadOnlyList<float> bucketsKBps)
     {
-        _bandwidthSentBytes += sentBytes;
-        _bandwidthRecvBytes += recvBytes;
-        _bandwidthDurationSeconds += durationSeconds;
+        if (bucketsKBps == null) return;
+        foreach (var v in bucketsKBps) _bandwidthBuckets.Add(v);
     }
+
+    /// <summary>Record the raw |Δv|² samples returned by the harness at the
+    /// end of the scenario. Each entry covers one render frame; values are
+    /// in (m/s)². M14 reports √(mean(samples)) (RMS) and √(p50(samples))
+    /// (typical-frame jerk) and √(p95(samples)) (tail).</summary>
+    public void AddVisualSmoothnessSamples(IReadOnlyList<float> dvSquaredSamples)
+    {
+        if (dvSquaredSamples == null) return;
+        foreach (var v in dvSquaredSamples) _visualSmoothnessDvSquared.Add(v);
+    }
+
+    /// <summary>Raw |Δv|² samples accumulated by the runner for this cell.
+    /// Exposed so the per-scenario CDF writer can fetch the distribution
+    /// after the cell completes.</summary>
+    public IReadOnlyList<float> VisualSmoothnessDvSquaredSamples => _visualSmoothnessDvSquared;
 
     // --- summarisation ---------------------------------------------------
 
@@ -188,14 +219,33 @@ public sealed class SyncMetrics
                 : (float)(_visualErrorSum / _bodyErrorSum),
             M7_PostRollbackConvergenceP95 = Percentile(_postRollbackConvergenceTicks, 0.95),
             M9_MissedInputRatePct = SafeRate(_missedInputTotal),
-            M10_BandwidthKBps = _bandwidthDurationSeconds <= 0
-                ? 0f
-                : (float)((_bandwidthSentBytes + _bandwidthRecvBytes) / 1024.0 / _bandwidthDurationSeconds),
+            M10_BandwidthP50KBps = (float)Percentile(_bandwidthBuckets.Select(x => (double)x).ToList(), 0.50),
+            M10_BandwidthP95KBps = (float)Percentile(_bandwidthBuckets.Select(x => (double)x).ToList(), 0.95),
             M11_SnapToAuthRatePct = SafeRate(_snapToAuthTotal),
             M13_ServerMissedInputRatePct = SafeRate(_serverMissedInputTotal),
+            M14_VisualSmoothnessRmsDeltaV = ComputeVisualSmoothnessRms(),
+            M14_VisualSmoothnessP50DeltaV = ComputeVisualSmoothnessPercentile(0.50),
+            M14_VisualSmoothnessP95DeltaV = ComputeVisualSmoothnessPercentile(0.95),
             ObservationTicks = _observationTicks,
             SampleCount = _positionErrors.Count,
         };
+    }
+
+    private float ComputeVisualSmoothnessRms()
+    {
+        if (_visualSmoothnessDvSquared.Count == 0) return 0f;
+        double sum = 0;
+        foreach (var v in _visualSmoothnessDvSquared) sum += v;
+        return (float)Math.Sqrt(sum / _visualSmoothnessDvSquared.Count);
+    }
+
+    private float ComputeVisualSmoothnessPercentile(double p)
+    {
+        if (_visualSmoothnessDvSquared.Count == 0) return 0f;
+        // Percentile over |Δv|² then sqrt — reporting in m/s keeps the units
+        // identical to RMS so the strip plot can compare them on one axis.
+        double pct = Percentile(_visualSmoothnessDvSquared.Select(x => (double)x).ToList(), p);
+        return (float)Math.Sqrt(pct);
     }
 
     private float ComputeClockRms()
@@ -269,9 +319,13 @@ public sealed class SyncMetrics
         public float M6_VisualSmoothRatio;
         public float M7_PostRollbackConvergenceP95;
         public float M9_MissedInputRatePct;
-        public float M10_BandwidthKBps;
+        public float M10_BandwidthP50KBps;
+        public float M10_BandwidthP95KBps;
         public float M11_SnapToAuthRatePct;
         public float M13_ServerMissedInputRatePct;
+        public float M14_VisualSmoothnessRmsDeltaV;
+        public float M14_VisualSmoothnessP50DeltaV;
+        public float M14_VisualSmoothnessP95DeltaV;
         public long ObservationTicks;
         public int SampleCount;
     }

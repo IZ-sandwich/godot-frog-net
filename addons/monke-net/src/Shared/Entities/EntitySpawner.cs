@@ -173,7 +173,17 @@ public partial class EntitySpawner : Node
         {
             pending.WasFrozenBefore = rb.Freeze;
             rb.Freeze = true;
-            rb.FreezeMode = RigidBody3D.FreezeModeEnum.Kinematic;
+            // STATIC, not Kinematic: a Kinematic-frozen body has Jolt track
+            // its position changes and computes an "implied" linear velocity
+            // from (pos_now − pos_prev) / dt. Spawn handlers (e.g. ServerBall's
+            // OnEntitySpawned teleports to y=10) write Position immediately
+            // after instantiation; Jolt sees that as 10 m of motion in one
+            // tick and stores velocity ≈ 600 m/s. When the body unfreezes a
+            // tick later, it inherits the 600 m/s and launches skyward —
+            // observed as NRB03 endY=230 m after 1 s instead of falling.
+            // STATIC bodies don't track implied velocity, so the spawn-time
+            // position write is a clean teleport.
+            rb.FreezeMode = RigidBody3D.FreezeModeEnum.Static;
         }
         _pendingActivations.Add(pending);
         MonkeLogger.Debug($"[SPAWN-DEACTIVATE] eid={entityId} activationTick={activationTick} held with layer/mask=(0/0), freeze=true");
@@ -202,6 +212,16 @@ public partial class EntitySpawner : Node
             if (pending.Root is RigidBody3D rb)
             {
                 rb.Freeze = pending.WasFrozenBefore;
+                // Belt-and-braces: zero out any phantom velocity / spin Jolt
+                // may have accumulated during the freeze window from spawn-
+                // time position writes. With FreezeMode=Static this should
+                // already be zero, but the Reset is cheap insurance against
+                // future regressions (e.g. someone re-enables Kinematic for
+                // a specific entity type) — the spawn-tick body is supposed
+                // to start at rest unless the spawn handler explicitly says
+                // otherwise.
+                rb.LinearVelocity = Vector3.Zero;
+                rb.AngularVelocity = Vector3.Zero;
             }
             MonkeLogger.Debug($"[SPAWN-ACTIVATE] eid={pending.EntityId} activationTick={pending.ActivationTick} currentTick={currentTick} restored layer={pending.SavedLayer} mask={pending.SavedMask}");
             _pendingActivations.RemoveAt(i);

@@ -64,10 +64,22 @@ public class ListenServerTests
         _client!.Initialize(_clientNet, "127.0.0.1", 7201);
         await _clientRunner.AwaitIdleFrame();
 
-        var sa = AssertSignal(_server);
+        // gdunit4's AssertSignal only starts capturing emissions inside the
+        // awaited IsEmitted() call — if the signal fires synchronously between
+        // AssertSignal() and the await, the emission is missed and the test
+        // times out. Capture emissions on a Godot Connect() handler instead;
+        // it's awake from the moment we attach.
+        int connectedCount = 0;
+        int receivedClientId = -1;
+        _server.ClientConnected += (int cid) => { connectedCount++; receivedClientId = cid; };
         _serverNet.FireClientConnected(peerId: 2);
 
-        await sa.IsEmitted(MonkeNet.Server.ServerManager.SignalName.ClientConnected).WithTimeout(2000);
+        // Spin a few frames so the signal handler has a chance to run.
+        for (int i = 0; i < 5 && connectedCount == 0; i++)
+            await _serverRunner.AwaitIdleFrame();
+
+        AssertThat(connectedCount).IsGreaterEqual(1);
+        AssertThat(receivedClientId).IsEqual(2);
     }
 
     // K-03 ─────────────────────────────────────────────────────────────────────

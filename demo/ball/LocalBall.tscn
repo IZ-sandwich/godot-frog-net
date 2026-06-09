@@ -2,6 +2,7 @@
 
 [ext_resource type="Script" uid="uid://b8b0gwk6gllyg" path="res://demo/LocalRigidPropPrediction.cs" id="2_7vow4"]
 [ext_resource type="Script" uid="uid://o8fwa7kmma11" path="res://addons/monke-net/src/Shared/PredictionRigidbody3D.cs" id="3_predrb"]
+[ext_resource type="Script" uid="uid://rp5ifdkt35gg" path="res://addons/monke-net/src/Shared/PredictionVisualSmoothing3D.cs" id="4_smooth"]
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_blueball"]
 albedo_color = Color(0.18, 0.45, 0.95, 1)
@@ -22,15 +23,32 @@ physics_material_override = SubResource("PhysicsMaterial_ball")
 linear_damp = 0.4
 angular_damp = 0.8
 
-[node name="MeshInstance3D" type="MeshInstance3D" parent="." unique_id=683380154]
+; VisualRoot wraps the mesh as a regular (non-top_level) child so Godot's
+; SceneTreeFTI lerps it in lockstep with the body's other inherited children
+; every render frame. The smoother writes Visual.GlobalPosition = body.GlobalPosition
+; + offset; Godot internally computes the corresponding local Position relative
+; to the body, so the mesh tracks the body's interpolated render-frame pose plus
+; the (decaying) offset. Mirrors LocalCube.tscn's wiring — without this, every
+; PRED-RECONCILE / spawn-catchup / blend-step body motion renders directly,
+; producing the visible jitter observed on balls (eid >= 22) in S7-C2.
+[node name="VisualRoot" type="Node3D" parent="." unique_id=1602080600]
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="VisualRoot" unique_id=683380154]
 mesh = SubResource("SphereMesh_rf2cd")
 
 [node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=2065844183]
 shape = SubResource("SphereShape3D_a814b")
 
-[node name="PredictionRigidbody" type="Node" parent="." unique_id=1602080500 node_paths=PackedStringArray("_body")]
+[node name="PredictionVisualSmoothing" type="Node3D" parent="." unique_id=1602080700 node_paths=PackedStringArray("Body", "Visual")]
+script = ExtResource("4_smooth")
+Body = NodePath("..")
+Visual = NodePath("../VisualRoot")
+metadata/_custom_type_script = "uid://rp5ifdkt35gg"
+
+[node name="PredictionRigidbody" type="Node" parent="." unique_id=1602080500 node_paths=PackedStringArray("_body", "_smoothing")]
 script = ExtResource("3_predrb")
 _body = NodePath("..")
+_smoothing = NodePath("../PredictionVisualSmoothing")
 metadata/_custom_type_script = "uid://o8fwa7kmma11"
 
 [node name="ClientPredictedEntity" type="Node" parent="." unique_id=1958913607 node_paths=PackedStringArray("_predictionRb")]

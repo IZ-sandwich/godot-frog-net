@@ -100,6 +100,10 @@ public sealed class MetricsSummaryCsv
                     "M9_missed_input_pct,M10_bandwidth_p50_kBps,M10_bandwidth_p95_kBps," +
                     "M11_snap_to_auth_pct,M13_server_missed_input_pct," +
                     "M14_visual_smoothness_rms_dv_mps,M14_visual_smoothness_p50_dv_mps,M14_visual_smoothness_p95_dv_mps," +
+                    "M15_freeze_frame_pct,M16_phase_lag_mean_m,M16_phase_lag_p95_m," +
+                    "M17_render_pacing_gap_pct,M18_dir_mismatch_pct," +
+                    "M19_camera_jolt_rms_dv_mps,M19_camera_jolt_p50_dv_mps," +
+                    "M19_camera_jolt_p95_dv_mps,M19_camera_jolt_p99_dv_mps," +
                     "obs_ticks,samples");
         var ci = CultureInfo.InvariantCulture;
         foreach (var r in _rows)
@@ -128,6 +132,15 @@ public sealed class MetricsSummaryCsv
                 r.M14_VisualSmoothnessRmsDeltaV.ToString("0.####", ci),
                 r.M14_VisualSmoothnessP50DeltaV.ToString("0.####", ci),
                 r.M14_VisualSmoothnessP95DeltaV.ToString("0.####", ci),
+                r.M15_FreezeFrameRatioPct.ToString("0.###", ci),
+                r.M16_PhaseLagMeanM.ToString("0.####", ci),
+                r.M16_PhaseLagP95M.ToString("0.####", ci),
+                r.M17_RenderPacingGapPct.ToString("0.###", ci),
+                r.M18_DirectionMismatchPct.ToString("0.###", ci),
+                r.M19_CameraJoltRmsDeltaV.ToString("0.####", ci),
+                r.M19_CameraJoltP50DeltaV.ToString("0.####", ci),
+                r.M19_CameraJoltP95DeltaV.ToString("0.####", ci),
+                r.M19_CameraJoltP99DeltaV.ToString("0.####", ci),
                 r.ObservationTicks.ToString(ci),
                 r.SampleCount.ToString(ci)
             ));

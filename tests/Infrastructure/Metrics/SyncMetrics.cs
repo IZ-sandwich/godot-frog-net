@@ -76,6 +76,29 @@ public sealed class SyncMetrics
     // p95 reported in m/s (via sqrt at summary time).
     private readonly List<float> _visualSmoothnessDvSquared = new();
 
+    // M15-M18: extended visual-quality counters. Each cell aggregates the
+    // raw numerator/denominator pairs (or sample lists) across every
+    // smoother on the client; the summary reports a ratio (M15/M17/M18) or
+    // distribution statistics (M16). Numerators / denominators are kept
+    // separate (rather than pre-divided) so the cross-smoother aggregation
+    // is just a sum on each side — a per-smoother ratio averaged across
+    // bodies would underweight high-motion smoothers (the ones the metric
+    // is meant to describe).
+    private long _freezeFramesTotal;
+    private long _motionFramesTotal;
+    private readonly List<float> _phaseLagSamples = new();
+    private long _renderPacingGapCountTotal;
+    private long _renderFrameCountTotal;
+    private long _dirMismatchFramesTotal;
+    private long _motionPairFramesTotal;
+
+    // M19 — first-person camera jolt. Same |Δv|² accumulator shape as M14
+    // but measuring the eye-attached node's rendered position. Stored as a
+    // raw distribution so RMS / p50 / p95 / p99 can all be reported off the
+    // same pool; p99 is the one that tracks rare camera shocks (the events
+    // that produce motion sickness even at low frequency).
+    private readonly List<float> _cameraJoltDvSquared = new();
+
     /// <summary>Threshold (meters) below which the body is considered converged
     /// after a rollback. Matches Gaffer's "no correction needed" floor — see
     /// plan M7.</summary>
@@ -195,6 +218,59 @@ public sealed class SyncMetrics
     /// after the cell completes.</summary>
     public IReadOnlyList<float> VisualSmoothnessDvSquaredSamples => _visualSmoothnessDvSquared;
 
+    /// <summary>M15 — accumulate freeze-frame counter pair from one smoother.
+    /// Called once per smoother at the end of the scenario; the runner sums
+    /// numerator + denominator across smoothers so the cell-level ratio is
+    /// total freezeFrames / total motionFrames.</summary>
+    public void AddFreezeFrameCounters(long freezeFrames, long motionFrames)
+    {
+        _freezeFramesTotal += freezeFrames;
+        _motionFramesTotal += motionFrames;
+    }
+
+    /// <summary>M16 — accumulate phase-lag samples (per-render-frame
+    /// |visRendered − bodyRaw|, in meters) from one smoother.</summary>
+    public void AddPhaseLagSamples(IReadOnlyList<float> samples)
+    {
+        if (samples == null) return;
+        foreach (var v in samples) _phaseLagSamples.Add(v);
+    }
+
+    /// <summary>M17 — accumulate render-pacing gap counters from one smoother.
+    /// Both numerator (frames with gap ≥3 physics ticks) and denominator
+    /// (total render frames) are aggregated.</summary>
+    public void AddRenderPacingGapCounters(long gapCount, long frameCount)
+    {
+        _renderPacingGapCountTotal += gapCount;
+        _renderFrameCountTotal += frameCount;
+    }
+
+    /// <summary>M18 — accumulate visual-vs-body direction-mismatch counter
+    /// pair from one smoother.</summary>
+    public void AddDirectionMismatchCounters(long mismatchFrames, long motionPairFrames)
+    {
+        _dirMismatchFramesTotal += mismatchFrames;
+        _motionPairFramesTotal += motionPairFrames;
+    }
+
+    /// <summary>M19 — accumulate first-person camera jolt |Δv|² samples
+    /// from one smoother. Called once per smoother at the end of the
+    /// scenario; passive smoothers contribute zero samples.</summary>
+    public void AddCameraJoltSamples(IReadOnlyList<float> dvSquaredSamples)
+    {
+        if (dvSquaredSamples == null) return;
+        foreach (var v in dvSquaredSamples) _cameraJoltDvSquared.Add(v);
+    }
+
+    /// <summary>Raw camera-jolt |Δv|² samples. Exposed for the CDF writer
+    /// to compute the per-condition distribution curve alongside M14.</summary>
+    public IReadOnlyList<float> CameraJoltDvSquaredSamples => _cameraJoltDvSquared;
+
+    /// <summary>Raw phase-lag samples accumulated by the runner for this
+    /// cell. Exposed so any future per-scenario M16 CDF writer can fetch
+    /// the distribution without recomputing.</summary>
+    public IReadOnlyList<float> PhaseLagSamples => _phaseLagSamples;
+
     // --- summarisation ---------------------------------------------------
 
     public Summary ToSummary(string scenario, string condition)
@@ -226,6 +302,25 @@ public sealed class SyncMetrics
             M14_VisualSmoothnessRmsDeltaV = ComputeVisualSmoothnessRms(),
             M14_VisualSmoothnessP50DeltaV = ComputeVisualSmoothnessPercentile(0.50),
             M14_VisualSmoothnessP95DeltaV = ComputeVisualSmoothnessPercentile(0.95),
+            M15_FreezeFrameRatioPct = _motionFramesTotal <= 0
+                ? float.NaN
+                : (float)(100.0 * _freezeFramesTotal / _motionFramesTotal),
+            M16_PhaseLagMeanM = _phaseLagSamples.Count == 0
+                ? float.NaN
+                : (float)(_phaseLagSamples.Sum() / _phaseLagSamples.Count),
+            M16_PhaseLagP95M = _phaseLagSamples.Count == 0
+                ? float.NaN
+                : (float)Percentile(_phaseLagSamples.Select(x => (double)x).ToList(), 0.95),
+            M17_RenderPacingGapPct = _renderFrameCountTotal <= 0
+                ? float.NaN
+                : (float)(100.0 * _renderPacingGapCountTotal / _renderFrameCountTotal),
+            M18_DirectionMismatchPct = _motionPairFramesTotal <= 0
+                ? float.NaN
+                : (float)(100.0 * _dirMismatchFramesTotal / _motionPairFramesTotal),
+            M19_CameraJoltRmsDeltaV  = ComputeCameraJoltRms(),
+            M19_CameraJoltP50DeltaV  = ComputeCameraJoltPercentile(0.50),
+            M19_CameraJoltP95DeltaV  = ComputeCameraJoltPercentile(0.95),
+            M19_CameraJoltP99DeltaV  = ComputeCameraJoltPercentile(0.99),
             ObservationTicks = _observationTicks,
             SampleCount = _positionErrors.Count,
         };
@@ -245,6 +340,21 @@ public sealed class SyncMetrics
         // Percentile over |Δv|² then sqrt — reporting in m/s keeps the units
         // identical to RMS so the strip plot can compare them on one axis.
         double pct = Percentile(_visualSmoothnessDvSquared.Select(x => (double)x).ToList(), p);
+        return (float)Math.Sqrt(pct);
+    }
+
+    private float ComputeCameraJoltRms()
+    {
+        if (_cameraJoltDvSquared.Count == 0) return float.NaN;
+        double sum = 0;
+        foreach (var v in _cameraJoltDvSquared) sum += v;
+        return (float)Math.Sqrt(sum / _cameraJoltDvSquared.Count);
+    }
+
+    private float ComputeCameraJoltPercentile(double p)
+    {
+        if (_cameraJoltDvSquared.Count == 0) return float.NaN;
+        double pct = Percentile(_cameraJoltDvSquared.Select(x => (double)x).ToList(), p);
         return (float)Math.Sqrt(pct);
     }
 
@@ -326,6 +436,25 @@ public sealed class SyncMetrics
         public float M14_VisualSmoothnessRmsDeltaV;
         public float M14_VisualSmoothnessP50DeltaV;
         public float M14_VisualSmoothnessP95DeltaV;
+        // M15-M18 — extended visual-quality metrics describing artefacts
+        // M14 doesn't capture: freeze-then-jump pattern (M15), steady-state
+        // visual lag (M16), engine-tick catch-up frequency (M17), and
+        // smoother overshoot direction-mismatch (M18). See MetricKey.
+        public float M15_FreezeFrameRatioPct;
+        public float M16_PhaseLagMeanM;
+        public float M16_PhaseLagP95M;
+        public float M17_RenderPacingGapPct;
+        public float M18_DirectionMismatchPct;
+        // M19 — first-person camera jolt. Per-render-frame |Δv| of the
+        // FTI-interpolated camera position, in m/s. RMS / p50 / p95 / p99
+        // mirror M14. NaN means the camera wasn't wired up for the
+        // scenario (no first-person player). p99 is the column to watch
+        // for nausea — a rare 10 m/s spike on a clean network produces
+        // the same vestibular shock as a frequent 3 m/s steady jitter.
+        public float M19_CameraJoltRmsDeltaV;
+        public float M19_CameraJoltP50DeltaV;
+        public float M19_CameraJoltP95DeltaV;
+        public float M19_CameraJoltP99DeltaV;
         public long ObservationTicks;
         public int SampleCount;
     }

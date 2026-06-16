@@ -34,12 +34,14 @@ public enum PredictionTier
 public enum InterpolationPolicy
 {
     /// <summary>
-    /// Default. Contact upgrades to Resim for a fixed N-tick window (default
-    /// 15 = 250 ms at 60 Hz); reverts to <see cref="ClientPredictedEntity.BaseTier"/>
-    /// when the counter hits zero. Cheap, no per-body server-ack tracking
-    /// needed; the cost is the arbitrary window length (a prop that's been
-    /// kicked but is still flying may revert to Interpolate while visibly in
-    /// motion).
+    /// Steady state runs local Jolt simulation; on misprediction
+    /// <see cref="ClientPredictedEntity.HandleInterpolateReconciliation"/>
+    /// blends the body toward the snapshot pose. Contact upgrades to Resim
+    /// for a fixed N-tick window (default 15 = 250 ms at 60 Hz); reverts to
+    /// <see cref="ClientPredictedEntity.BaseTier"/> when the counter hits
+    /// zero. Cheap, no per-body server-ack tracking needed; the cost is the
+    /// arbitrary window length (a prop that's been kicked but is still flying
+    /// may revert to Interpolate while visibly in motion).
     /// </summary>
     Hysteresis,
     /// <summary>
@@ -52,6 +54,29 @@ public enum InterpolationPolicy
     /// cost of more rollback work.
     /// </summary>
     AlwaysPredict,
+    /// <summary>
+    /// Default. T2 kinematic-pose-from-snapshot-history model. Body is set
+    /// <c>Freeze=true</c> with <c>FreezeMode=Kinematic</c> in
+    /// <c>OnReadyDeferred</c>; its pose is driven every physics tick by
+    /// <c>OnPostPhysicsTick</c> reading from
+    /// <see cref="ClientPredictionManager.TryGetInterpolatedSnapshot"/>.
+    /// No local Jolt simulation runs, no <c>Reconcile</c> fires, no
+    /// <c>AbsorbBodyTeleport</c> offset accumulates — the visual just
+    /// follows the body which is following the snapshot stream.
+    ///
+    /// <para>On contact the body upgrades to Resim (same hysteresis
+    /// counter as <see cref="Hysteresis"/>), unfreezes, seeds velocity
+    /// from the latest snapshot, and simulates Jolt locally for the
+    /// hysteresis window. When the window expires the body re-freezes
+    /// and a short blend-in lerp brings its pose smoothly back onto the
+    /// snapshot-interp curve.</para>
+    ///
+    /// <para>The "Photon Fusion 2 KinematicInterpolation" pattern in
+    /// monke-net. Best for passive props that need to look smooth (no
+    /// Reconcile-driven freeze-then-sprint artefacts) while still
+    /// reacting physically when the player touches them.</para>
+    /// </summary>
+    KinematicInterpolation,
     // Future:
     // SnapshotGated   — hold Resim until next in-tolerance server snapshot
     //                   (UE5 post_resim_wait_for_update pattern). Replaces
@@ -80,10 +105,27 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     /// <summary>
     /// Selects how <see cref="EffectiveTier"/> transitions on player contact.
     /// See <see cref="InterpolationPolicy"/> for the trade-offs. Default
-    /// <see cref="InterpolationPolicy.Hysteresis"/> matches the original T1
-    /// behaviour.
+    /// <see cref="InterpolationPolicy.KinematicInterpolation"/> — passive props
+    /// are pose-driven from snapshot history (no local Jolt sim, no reconcile
+    /// snaps, no smoother offset to decay) and only unfreeze + run Resim for
+    /// the contact-driven hysteresis window when a Resim entity touches them.
+    /// This is the smoothest default for ambient props; entities that need
+    /// the previous tick-counted blend-only behaviour can opt back into
+    /// <see cref="InterpolationPolicy.Hysteresis"/> in the inspector.
     /// </summary>
-    [Export] public InterpolationPolicy Policy { get; set; } = InterpolationPolicy.Hysteresis;
+    [Export] public InterpolationPolicy Policy { get; set; } = InterpolationPolicy.KinematicInterpolation;
+
+    /// <summary>When true, <see cref="RequestResimUpgrade"/> is a no-op —
+    /// the entity stays in <see cref="PredictionTier.Interpolate"/> forever
+    /// and is reconciled via <see cref="HandleInterpolateReconciliation"/>
+    /// (blend toward auth) on every snapshot instead of being upgraded to
+    /// Resim on contact. Test-only switch flipped by the
+    /// <c>bypass-resim-for-props</c> harness command to compare hybrid
+    /// "predict the player, snap+PVB the props" against the pure
+    /// predict-all and pure no-resim modes. Off by default — the contact-
+    /// upgrade path is what gives the player crisp local physics on the
+    /// bodies they're touching.</summary>
+    public bool BypassResimUpgrade { get; set; } = false;
 
     // Hysteresis countdown for contact-driven upgrades to Resim. When > 0, the
     // entity reports Resim regardless of BaseTier; decremented once per physics
@@ -107,6 +149,12 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     {
         InterpolationPolicy.AlwaysPredict => PredictionTier.Resim,
         InterpolationPolicy.Hysteresis    => _resimUpgradeTicksRemaining > 0 ? PredictionTier.Resim : BaseTier,
+        // KinematicInterpolation reuses the same contact-counter as Hysteresis
+        // — Resim while a fresh contact upgrade is active, otherwise the
+        // BaseTier (typically Interpolate, in which case the body is driven
+        // kinematically from snapshot history; see LocalRigidPropPrediction
+        // OnPostPhysicsTick for the actual pose-write).
+        InterpolationPolicy.KinematicInterpolation => _resimUpgradeTicksRemaining > 0 ? PredictionTier.Resim : BaseTier,
         _                                 => BaseTier,
     };
 
@@ -127,7 +175,18 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     /// Interpolate.</param>
     public void RequestResimUpgrade(int ticks = 15)
     {
-        if (Policy != InterpolationPolicy.Hysteresis) return;
+        // Both Hysteresis and KinematicInterpolation use the contact-driven
+        // upgrade counter — KinematicInterpolation's body is normally kinematic
+        // and pose-driven from snapshot history, but on contact it unfreezes
+        // and runs Resim for the hysteresis window. AlwaysPredict is short-
+        // circuited to Resim (no counter), so this method is a no-op there.
+        if (Policy != InterpolationPolicy.Hysteresis
+            && Policy != InterpolationPolicy.KinematicInterpolation) return;
+        // Bypass: entity stays in Interpolate forever. Used by the
+        // hybrid scenario where the player keeps predicting + rolling back
+        // but props go through HandleInterpolateReconciliation (blend
+        // toward auth) on every snapshot rather than upgrading to Resim.
+        if (BypassResimUpgrade) return;
         var prev = EffectiveTier;
         if (ticks > _resimUpgradeTicksRemaining) _resimUpgradeTicksRemaining = ticks;
         var now = EffectiveTier;
@@ -146,7 +205,8 @@ public partial class ClientPredictedEntity : ClientNetworkBehaviour
     /// </summary>
     public void TickTierHysteresis()
     {
-        if (Policy != InterpolationPolicy.Hysteresis) return;
+        if (Policy != InterpolationPolicy.Hysteresis
+            && Policy != InterpolationPolicy.KinematicInterpolation) return;
         if (_resimUpgradeTicksRemaining <= 0) return;
         var prev = EffectiveTier;
         _resimUpgradeTicksRemaining--;

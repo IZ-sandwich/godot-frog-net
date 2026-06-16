@@ -287,6 +287,18 @@ public partial class MonkeLogger : Node
     }
 
     /// <summary>
+    /// Bypasses <see cref="DebugEnabled"/> and always emits the message at
+    /// DEBUG level (file-only — DEBUG never reaches the editor/console). Used
+    /// for verification log lines that must survive a "disable debug logging"
+    /// run — e.g. SMOOTH-FRAME, which is the marker we use to detect render-
+    /// frame pacing gaps. Caller pre-builds the string, so there is no
+    /// short-circuit on the interpolated-string handler — only call this when
+    /// the message really is needed regardless of the toggle.
+    /// </summary>
+    public static void ForceDebug(string message) =>
+        LogPrebuilt("DEBUG", message, flushAfter: false);
+
+    /// <summary>
     /// Interpolated-string overload of <see cref="Debug(string)"/>. The handler
     /// writes the message into a pooled char[]; we transfer ownership to a
     /// PooledLogEntry and enqueue — no managed string is ever allocated for

@@ -329,6 +329,45 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
                 }
                 metrics.AddVisualSmoothnessSamples(samples);
                 m14DvSquaredSamples = samples;
+
+                // M15 — freeze-frame counter pair. Both numerator and
+                // denominator must be present; older harness builds without
+                // the new payload fall back to "no contribution" via the
+                // TryGetProperty bail-outs below.
+                if (v.TryGetProperty("freezeFrames", out var ffEl)
+                    && v.TryGetProperty("motionFrames", out var mfEl))
+                {
+                    metrics.AddFreezeFrameCounters(ffEl.GetInt64(), mfEl.GetInt64());
+                }
+                // M16 — phase-lag sample list.
+                if (v.TryGetProperty("phaseLag", out var plArr) && plArr.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    var phaseLag = new List<float>(plArr.GetArrayLength());
+                    foreach (var el in plArr.EnumerateArray()) phaseLag.Add(el.GetSingle());
+                    metrics.AddPhaseLagSamples(phaseLag);
+                }
+                // M17 — render pacing gap counter pair.
+                if (v.TryGetProperty("renderGapCount", out var gcEl)
+                    && v.TryGetProperty("renderFrameCount", out var fcEl))
+                {
+                    metrics.AddRenderPacingGapCounters(gcEl.GetInt64(), fcEl.GetInt64());
+                }
+                // M18 — direction-mismatch counter pair.
+                if (v.TryGetProperty("dirMismatchFrames", out var dmEl)
+                    && v.TryGetProperty("motionPairFrames", out var mpEl))
+                {
+                    metrics.AddDirectionMismatchCounters(dmEl.GetInt64(), mpEl.GetInt64());
+                }
+                // M19 — first-person camera jolt samples. Only the local
+                // player smoother contributes; passive props produce empty
+                // lists. NaN propagates downstream when the pool is empty.
+                if (v.TryGetProperty("cameraJoltDvSquared", out var cjArr)
+                    && cjArr.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    var cameraJolt = new List<float>(cjArr.GetArrayLength());
+                    foreach (var el in cjArr.EnumerateArray()) cameraJolt.Add(el.GetSingle());
+                    metrics.AddCameraJoltSamples(cameraJolt);
+                }
             }
             catch (Exception ex) { GD.PrintErr($"[QuantitativeTestBase] visual-smoothness failed: {ex.Message}"); }
         }
@@ -503,6 +542,13 @@ public abstract class QuantitativeTestBase : MultiProcessTestBase
             s.M14_VisualSmoothnessRmsDeltaV = float.NaN;
             s.M14_VisualSmoothnessP50DeltaV = float.NaN;
             s.M14_VisualSmoothnessP95DeltaV = float.NaN;
+        }
+        if ((applicable & MetricKey.M19) == 0)
+        {
+            s.M19_CameraJoltRmsDeltaV = float.NaN;
+            s.M19_CameraJoltP50DeltaV = float.NaN;
+            s.M19_CameraJoltP95DeltaV = float.NaN;
+            s.M19_CameraJoltP99DeltaV = float.NaN;
         }
     }
 

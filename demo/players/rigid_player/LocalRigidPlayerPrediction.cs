@@ -235,6 +235,52 @@ public partial class LocalRigidPlayerPrediction : ClientPredictedEntity
             }
             _lastAdvanceResult = RigidPlayerPhysics.AdvancePhysics(_predictionRb, cmd, phase: "live");
             _hasLastAdvanceResult = true;
+
+            // T2 pre-step proactive contact upgrade. The post-step contact
+            // detection in OnPostPhysicsTick catches contacts AFTER this
+            // tick's SpaceStep has run with the touched prop still in its
+            // Interpolate-tier (kinematic-feeling) state — meaning the
+            // player bounced off an immovable wall instead of pushing the
+            // prop. This pre-step pass flips props the player is ABOUT to
+            // hit to Resim BEFORE the step runs, so contact response
+            // applies to a properly-simulated prop.
+            //
+            // Two-pronged query:
+            //   (a) Velocity-shifted swept volume (margin 0.3 m, ~3 ticks
+            //       at sprint speed) catches head-on approaches.
+            //   (b) Omnidirectional sphere (radius 1.0 m) catches lateral
+            //       contacts, the jump-then-land case (velocity is mostly
+            //       +Y at apex so a velocity-only sweep moves UP and
+            //       never reaches the cube below), and props the player
+            //       is just barely in contact with.
+            //   Radius 1.0 m is one-third lower than T2's 1.5 m default —
+            //   tighter fits the single-cube push window without an
+            //   excess of false-positive upgrades on far-away cubes.
+            //
+            // Only the locally-driven player runs this — observer-side
+            // upgrades a peer-player would otherwise cause cause unowned
+            // cubes to start simulating locally with stale input, producing
+            // multi-hundred mispredicts per push. Authority gate matches
+            // Fusion 2 / UE5's canonical observer-side behaviour where the
+            // remote player visually bounces off the kinematic prop while
+            // the local owner pushes it cleanly.
+            var body = _predictionRb?.Body;
+            if (ownedByMe && body != null)
+            {
+                var preStepContacts = RigidPlayerPhysics.QueryNearbyBodies(body, marginAlongVelocity: 0.3f);
+                foreach (var cb in preStepContacts)
+                {
+                    var cpe = FindOwningPredictedEntity(cb);
+                    if (cpe != null && cpe != this) cpe.RequestResimUpgrade();
+                }
+                var proximityBodies = RigidPlayerPhysics.QueryProximityBodies(body, proximityRadius: 1.0f);
+                foreach (var cb in proximityBodies)
+                {
+                    var cpe = FindOwningPredictedEntity(cb);
+                    if (cpe != null && cpe != this) cpe.RequestResimUpgrade();
+                }
+            }
+
             return;
         }
 

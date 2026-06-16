@@ -5,8 +5,16 @@ using System.IO;
 using System.Text.RegularExpressions;
 using GdUnit4;
 using MonkeNet.Tests.Infrastructure.Artifacts;
+using MonkeNet.Tests.Quantitative;
 
-namespace MonkeNet.Tests.Quantitative;
+// Namespace deliberately differs from MonkeNet.Tests.Quantitative so the
+// substring filter `FullyQualifiedName~MonkeNet.Tests.Quantitative` (the
+// default selector for the matrix run in run-tests.ps1) does NOT match this
+// post-run plot generator — it doesn't run the S7 scenario itself, just
+// reads the most recent C4 client log, but it does take a test slot under
+// gdUnit4. Call by FQN to run intentionally:
+// `run-tests.ps1 QuantFocused.S7PlayerSmoothingPlot.PlotFromMostRecentRun`.
+namespace MonkeNet.Tests.QuantFocused;
 
 // Post-run plot generator for S7 C4. Reads the client log produced by
 // S7C4FocusedSuite, extracts per-CLIENT-TICK rigidbody + visual pose AND

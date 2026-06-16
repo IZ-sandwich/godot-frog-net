@@ -31,6 +31,23 @@ public partial class PredictionRigidbody3D : Node
     /// </summary>
     [Export] private PredictionVisualSmoothing3D _smoothing;
 
+    /// <summary>
+    /// Optional first-person camera smoother. When set,
+    /// <see cref="Client.ClientPredictionManager.RollbackAndResimulate"/>
+    /// forwards each entity's (pre_rollback_body_pos, post_resim_body_pos)
+    /// pair to <see cref="CameraSmoothing3D.CaptureBodyTeleport"/> so the
+    /// eye-attached camera converges to the new pose over its own decay
+    /// window rather than snapping with the body. Only wired on the local
+    /// player's body — every other entity (props, other-client players)
+    /// leaves this null and pays no overhead.
+    /// </summary>
+    [Export] private CameraSmoothing3D _cameraSmoothing;
+
+    /// <summary>Read-only accessor for the wired camera smoother. Used by
+    /// <see cref="Client.ClientPredictionManager"/> to look up the per-
+    /// entity camera smoother during the post-resim phase of rollback.</summary>
+    public CameraSmoothing3D CameraSmoother => _cameraSmoothing;
+
     public RigidBody3D Body => _body;
 
     /// <summary>
@@ -212,8 +229,21 @@ public partial class PredictionRigidbody3D : Node
     /// Restores the body to an authoritative snapshot, clears any pending operations,
     /// and flushes the new transform to the physics server. Call from
     /// <see cref="Client.ClientPredictedEntity.HandleReconciliation"/>.
+    ///
+    /// <para><paramref name="useShortPvb"/>=true routes the smoother handoff
+    /// through a short-window <see cref="PredictionVisualSmoothing3D.StartProjectiveVelocityBlend"/>
+    /// instead of the default <see cref="PredictionVisualSmoothing3D.AbsorbBodyTeleport"/>
+    /// offset-decay path. Used by the Interpolate-tier 3-tick blend-step
+    /// loop where Reconcile is called every physics tick with a small
+    /// position delta — the AbsorbBodyTeleport path pins both ends of the
+    /// past-interp lerp to the absorbed visual position, freezing the
+    /// visual for one render frame per call and producing a saw-tooth
+    /// pattern at the snapshot rate (S7-C0 eid=14 push window, M14 p95
+    /// 0.94 m/s vs ~0.3 for C3/C4). PVB carries forward visual velocity
+    /// across each absorb so the visual slides smoothly through the blend
+    /// rather than freeze-then-jumping.</para>
     /// </summary>
-    public void Reconcile(RigidbodyState authoritative)
+    public void Reconcile(RigidbodyState authoritative, bool useShortPvb = false)
     {
         if (_body == null) return;
 
@@ -259,11 +289,67 @@ public partial class PredictionRigidbody3D : Node
         // point Visual (parented under Body, non-top_level) has already auto-
         // followed the body's new pose for one frame — producing a single-frame
         // visual snap that any sampler/renderer hitting that window observes as
-        // a teleport. The smoother updates its offset, baselines _prevBodyPos
-        // to the post pose so the next capture doesn't double-count, and writes
-        // Visual.GlobalTransform immediately so the visual stays at prePos.
+        // a teleport.
         if (smoothingEnabled)
-            _smoothing.AbsorbBodyTeleport(prePos, preRot, authoritative.Position, authoritative.Rotation);
+        {
+            if (useShortPvb)
+            {
+                // Short-PVB handoff: blend the visual smoothly from its
+                // last-rendered position toward the new body pose over one
+                // snapshot period. Chained calls (e.g. the 3-tick blend
+                // loop firing every physics tick) restart the PVB with
+                // fresh endpoints, producing continuous visual motion that
+                // tracks the body without the AbsorbBodyTeleport saw-tooth.
+                // 50 ms window matches the 20 Hz snapshot rate so the
+                // blend lands exactly when the next snapshot would normally
+                // arrive; under chained reconciles the blend never actually
+                // completes — it just keeps re-anchoring forward.
+                Vector3 oldPos = _smoothing.LastRenderedPosition;
+                _smoothing.StartProjectiveVelocityBlend(
+                    oldPos: oldPos,
+                    oldVel: preVel,
+                    newPos: authoritative.Position,
+                    newVel: authoritative.LinearVelocity,
+                    durationSec: 0.05f);
+            }
+            else
+            {
+                // Original offset-decay path. Used by the rollback Reconcile
+                // (HandleReconciliation called by ClientPredictionManager)
+                // because a resim loop runs after this and moves the body
+                // forward — a PVB started here would blend toward the
+                // pre-resim authoritative pose (stale by N resim ticks) and
+                // need an explicit re-anchor in FixupOffsetAfterResim. The
+                // offset-decay path composes correctly with the existing
+                // FixupOffsetAfterResim re-anchor that re-targets the
+                // smoother against the post_resim_pose.
+                _smoothing.AbsorbBodyTeleport(prePos, preRot, authoritative.Position, authoritative.Rotation);
+            }
+        }
+
+        // First-person camera smoothing for the SNAP-OVERFLOW path only.
+        // ClientPredictionManager.BlendToAuthViaPvb calls
+        // HandleReconciliation → Reconcile and there is no resim loop
+        // afterwards, so the body teleport from prePos → authoritative.Position
+        // IS the full discontinuity the camera sees.
+        //
+        // For the ROLLBACK-AND-RESIM path the camera hook lives in
+        // ClientPredictionManager.RollbackAndResimulate instead: the (prePos,
+        // auth_pose) pair captured here is sub-cm for velocity-only
+        // mispredicts and gets filtered by MinCaptureDistance, while the
+        // (pre_rollback_body_pose, post_resim_body_pose) pair captured at
+        // the end of the rollback is the actual camera-visible jolt (the
+        // resim runs N ticks forward and ResetBodyFtiAfterResim then
+        // collapses FTI to post_resim_pose). To avoid double-capturing on
+        // the rollback path we guard on velocity-only mispredict magnitude
+        // here too — only large body-pose deltas get captured at Reconcile
+        // time; small ones rely on the post-resim hook instead.
+        //
+        // (`useShortPvb` is the Interpolate-tier blend-step path used only
+        // for non-player KI/Hysteresis props; the camera lives on the
+        // player so there's nothing to forward in that branch.)
+        if (!useShortPvb)
+            _cameraSmoothing?.CaptureBodyTeleport(prePos, authoritative.Position);
     }
 
     /// <summary>

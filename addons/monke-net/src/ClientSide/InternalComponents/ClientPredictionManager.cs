@@ -115,6 +115,111 @@ public partial class ClientPredictionManager : InternalClientComponent
     /// keep up with the client's prediction tick.</summary>
     public int MissedInputCount => _missedInputCount;
     private int _missedInputCount = 0;
+
+    // Per-entity snapshot history buffer. Populated from every incoming
+    // GameSnapshotMessage; read by KinematicInterpolation-policy props on
+    // OnPostPhysicsTick to interpolate between the two snapshots bracketing
+    // the current render time. SortedDictionary is keyed by snapshot tick
+    // so bracketing lookup is O(log n) and trimming the oldest is O(1).
+    // Cap of 8 entries × 3-tick snapshot period = 24 ticks ~ 400 ms of
+    // history at 60 Hz physics; well above any practical InterpDelayTicks
+    // setting and the typical 6-tick jitter envelope.
+    private readonly Dictionary<int, SortedDictionary<int, IEntityStateData>> _snapshotHistoryByEid = new();
+    private const int SnapshotHistoryCapPerEntity = 8;
+
+    // Push every received entity state into the per-entity ring. Called
+    // from the snapshot-receive path BEFORE ProcessServerState so the
+    // KinematicInterpolation-policy props' OnPostPhysicsTick lookup sees
+    // the freshest data this tick. Cost: 1 dict-write + 1 trim per state;
+    // a 40-body scene at 20 Hz is ~800 ops/s, negligible.
+    private void CacheSnapshotsFromMessage(GameSnapshotMessage snapshot)
+    {
+        if (snapshot.States == null) return;
+        foreach (var state in snapshot.States)
+        {
+            if (state == null) continue;
+            int eid = state.EntityId;
+            if (!_snapshotHistoryByEid.TryGetValue(eid, out var hist))
+            {
+                hist = new SortedDictionary<int, IEntityStateData>();
+                _snapshotHistoryByEid[eid] = hist;
+            }
+            hist[snapshot.Tick] = state;
+            while (hist.Count > SnapshotHistoryCapPerEntity)
+                hist.Remove(hist.Keys.First());
+        }
+    }
+
+    /// <summary>Render delay (in physics ticks) applied to the snapshot
+    /// interpolation target — keeps the rendered pose just behind the
+    /// latest known snapshot but inside the next-snapshot envelope when it
+    /// arrives. 3 ticks ≈ one 20 Hz snapshot period at 60 Hz physics.</summary>
+    public int InterpDelayTicks => 3;
+
+    /// <summary>The newest snapshot the manager has cached for the given
+    /// entity, ignoring <see cref="InterpDelayTicks"/>. Used when a
+    /// KinematicInterpolation-policy body upgrades to Resim on contact and
+    /// needs the freshest velocity for the unfreeze seed — the
+    /// interpolated (delayed) sample would seed from the pre-hit
+    /// at-rest state.</summary>
+    public IEntityStateData TryGetLatestSnapshot(int eid)
+    {
+        if (!_snapshotHistoryByEid.TryGetValue(eid, out var hist) || hist.Count == 0) return null;
+        return hist[hist.Last().Key];
+    }
+
+    /// <summary>Returns the two snapshots that bracket
+    /// <c>currentTick − <see cref="InterpDelayTicks"/></c> for the given
+    /// entity, plus the lerp alpha between them. Caller uses its own
+    /// <c>ExtractAuthoritative*</c> overrides to read pos/rot/vel from the
+    /// snapshot's <see cref="IEntityStateData"/>.
+    ///
+    /// <para>Output:
+    /// <list type="bullet">
+    /// <item>history empty → returns false (caller should freeze body in place)</item>
+    /// <item>target &lt; oldest → s0 = oldest, s1 = null, alpha = 0</item>
+    /// <item>target &gt; newest → s0 = newest, s1 = null, alpha = (target−newest), <paramref name="extrapolate"/>=true</item>
+    /// <item>inside the buffer → s0, s1 = bracketing entries, alpha ∈ [0, 1]</item>
+    /// </list></para>
+    /// </summary>
+    public bool TryGetInterpolatedSnapshot(
+        int eid,
+        int currentTick,
+        out IEntityStateData s0,
+        out IEntityStateData s1,
+        out float alpha,
+        out bool extrapolate)
+    {
+        s0 = null; s1 = null; alpha = 0f; extrapolate = false;
+        if (!_snapshotHistoryByEid.TryGetValue(eid, out var hist) || hist.Count == 0) return false;
+
+        int targetTick = currentTick - InterpDelayTicks;
+        int t0 = int.MinValue, t1 = int.MinValue;
+        foreach (var k in hist.Keys)
+        {
+            if (k <= targetTick) t0 = k;
+            else { t1 = k; break; }
+        }
+
+        if (t0 == int.MinValue)
+        {
+            var first = hist.First();
+            s0 = first.Value;
+            alpha = 0f;
+            return true;
+        }
+        if (t1 == int.MinValue)
+        {
+            s0 = hist[hist.Last().Key];
+            alpha = (float)(targetTick - hist.Last().Key);
+            extrapolate = true;
+            return true;
+        }
+        s0 = hist[t0];
+        s1 = hist[t1];
+        alpha = Mathf.Clamp((targetTick - t0) / (float)(t1 - t0), 0f, 1f);
+        return true;
+    }
     /// <summary>Cumulative count of snapshots that arrived too old for a forward
     /// resim (depth &gt; <see cref="MaxRollbackTicks"/>) and were corrected by
     /// the PVB-overflow path via <see cref="BlendToAuthViaPvb"/> instead.
@@ -286,6 +391,7 @@ public partial class ClientPredictionManager : InternalClientComponent
                     MonkeLogger.Debug($"[NET-SNAP-RX]   state[{i}]={snapshot.States[i]}");
                 _lastTickReceived = snapshot.Tick;
                 CacheInputsFromSnapshot(snapshot);
+                CacheSnapshotsFromMessage(snapshot);
                 ProcessServerState(snapshot);
             }
             else
@@ -926,20 +1032,40 @@ public partial class ClientPredictionManager : InternalClientComponent
         // See PredictionVisualSmoothing3D.FixupOffsetAfterResim for details
         // (including why only position — not rotation — gets re-anchored).
         Dictionary<ClientPredictedEntity, Vector3> preReconcileVisualPos = null;
+        // Parallel dict capturing the BODY's pre-rollback world position for
+        // each entity. Different from preReconcileVisualPos: the visual dict
+        // is what the smoother was rendering (visual + offset), the body dict
+        // is the simulation's predicted pose at the rollback tick. Used by
+        // CameraSmoothing3D so the first-person camera can decay from the
+        // pre-rollback pose to the POST-RESIM pose (not the auth pose at
+        // rollback tick — that's what PredictionRigidbody3D.Reconcile sees,
+        // which is sub-cm and gets filtered by MinCaptureDistance). The
+        // actual camera-visible jolt is pre_rollback → post_resim because
+        // ResetBodyFtiAfterResim collapses FTI to post_resim, so the camera
+        // renders that pose with no interpolation across the rollback.
+        Dictionary<ClientPredictedEntity, Vector3> preReconcileBodyPos = null;
         foreach (ClientPredictedEntity predictableEntity in predictedStateData.Entities.Keys)
         {
             var smoother = FindSmootherFor(predictableEntity);
-            if (smoother?.Visual == null) continue;
-            preReconcileVisualPos ??= new Dictionary<ClientPredictedEntity, Vector3>();
-            // Use the smoother's own LastRenderedPosition — the position it
-            // wrote to Visual.GlobalPosition on its most recent _Process call
-            // — rather than reading Visual.GlobalPosition here. With the
-            // library-managed interpolation (Visual is top_level, smoother
-            // owns per-render-frame writes) Visual.GlobalPosition reflects
-            // the last render write, which IS the rendered position. Using
-            // the explicit property makes the contract obvious and survives
-            // any future refactor that might decouple them.
-            preReconcileVisualPos[predictableEntity] = smoother.LastRenderedPosition;
+            var rbForCapture = FindRigidbodyFor(predictableEntity);
+            if (smoother?.Visual != null)
+            {
+                preReconcileVisualPos ??= new Dictionary<ClientPredictedEntity, Vector3>();
+                // Use the smoother's own LastRenderedPosition — the position it
+                // wrote to Visual.GlobalPosition on its most recent _Process call
+                // — rather than reading Visual.GlobalPosition here. With the
+                // library-managed interpolation (Visual is top_level, smoother
+                // owns per-render-frame writes) Visual.GlobalPosition reflects
+                // the last render write, which IS the rendered position. Using
+                // the explicit property makes the contract obvious and survives
+                // any future refactor that might decouple them.
+                preReconcileVisualPos[predictableEntity] = smoother.LastRenderedPosition;
+            }
+            if (rbForCapture?.Body != null && rbForCapture.CameraSmoother != null)
+            {
+                preReconcileBodyPos ??= new Dictionary<ClientPredictedEntity, Vector3>();
+                preReconcileBodyPos[predictableEntity] = rbForCapture.Body.GlobalPosition;
+            }
         }
 
         // Set all entities to authoritative state. Critical for the unified-prediction
@@ -1145,6 +1271,26 @@ public partial class ClientPredictionManager : InternalClientComponent
             }
         }
 
+        // Forward the (pre_rollback_body_pose, post_resim_body_pose) pair
+        // to each entity's CameraSmoothing3D. This is the actual camera
+        // jolt the user feels: between the last render before rollback
+        // (camera at pre_rollback_pose via FTI) and the next render after
+        // rollback (camera at post_resim_pose because ResetBodyFtiAfterResim
+        // collapsed FTI). The PredictionRigidbody3D.Reconcile hook fires
+        // earlier with (pre_rollback, auth_pose) which is sub-cm for the
+        // common velocity-only mispredict — filtered by MinCaptureDistance
+        // and producing no camera smoothing. THIS hook is what makes the
+        // smoother actually engage on the rollback path.
+        if (preReconcileBodyPos != null)
+        {
+            foreach (var (predictableEntity, preBodyPos) in preReconcileBodyPos)
+            {
+                var rb = FindRigidbodyFor(predictableEntity);
+                if (rb?.Body == null || rb.CameraSmoother == null) continue;
+                rb.CameraSmoother.CaptureBodyTeleport(preBodyPos, rb.Body.GlobalPosition);
+            }
+        }
+
         MonkeLogger.Debug($"[PRED-ROLLBACK] complete (offline bodies restored)");
     }
 
@@ -1213,7 +1359,51 @@ public partial class ClientPredictionManager : InternalClientComponent
                 // S2-C3 around client tick 895.
                 _initializedEntityIds.Add(cpe.EntityId);
 
-                if (tier == PredictionTier.Interpolate)
+                if (tier == PredictionTier.Interpolate
+                    && cpe.Policy == InterpolationPolicy.KinematicInterpolation)
+                {
+                    // KinematicInterpolation under snap-overflow: snap the body
+                    // straight to auth pose AND start a PVB on the visual
+                    // (Option 3 from the architecture discussion). The
+                    // legacy HandleInterpolateReconciliation path for KI is
+                    // a no-op (the kinematic-pose driver reads from the
+                    // snapshot history buffer that was just populated), but
+                    // under snap-overflow the next snapshot can be many
+                    // ticks ahead of the last cached one — the kinematic
+                    // driver would extrapolate via the stale velocity and
+                    // the smoother would render that extrapolation
+                    // discontinuously when the new snapshot arrives. An
+                    // explicit PVB at snap-overflow time blends the visual
+                    // smoothly through the gap with bounded per-frame |Δv|.
+                    var smoother = FindSmootherFor(cpe);
+                    Vector3 preVisualPos = smoother?.LastRenderedPosition ?? Vector3.Zero;
+                    // KI bodies are kinematic (LinearVelocity=0) but they
+                    // have an EFFECTIVE velocity = derivative of the
+                    // snapshot stream. Approximate with the auth velocity
+                    // (slightly off — the actual visual velocity might
+                    // differ if the visual was decaying an old PVB — but
+                    // good enough to seed the blend).
+                    Vector3 preBodyVel = authVel;
+
+                    // Snap body to auth pose. cpe.HandleReconciliation
+                    // teleports the kinematic body to the auth pose
+                    // (Freeze=true bodies still respect GlobalTransform
+                    // writes); the smoother's AbsorbBodyTeleport call
+                    // inside Reconcile is then explicitly overridden by
+                    // the StartProjectiveVelocityBlend below.
+                    cpe.HandleReconciliation(authState);
+                    cpe.ApplyAuthoritativeNonPoseState(authState);
+
+                    if (smoother?.Body != null)
+                    {
+                        Vector3 postBodyPos = smoother.Body.GlobalPosition;
+                        smoother.StartProjectiveVelocityBlend(
+                            oldPos: preVisualPos, oldVel: preBodyVel,
+                            newPos: postBodyPos, newVel: authVel,
+                            durationSec: 0.25f);
+                    }
+                }
+                else if (tier == PredictionTier.Interpolate)
                 {
                     cpe.HandleInterpolateReconciliation(authState);
                     cpe.ApplyAuthoritativeNonPoseState(authState);

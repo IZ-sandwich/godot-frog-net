@@ -2,9 +2,17 @@ using System.Collections.Generic;
 using GdUnit4;
 using MonkeNet.Tests.Infrastructure;
 using MonkeNet.Tests.Infrastructure.Metrics;
+using MonkeNet.Tests.Quantitative;
 using MonkeNet.Tests.Quantitative.Scenarios;
 
-namespace MonkeNet.Tests.Quantitative;
+// Namespace deliberately differs from MonkeNet.Tests.Quantitative so the
+// substring filter `FullyQualifiedName~MonkeNet.Tests.Quantitative` (the
+// default selector used by the matrix run in run-tests.ps1) does NOT match
+// these focused single-cell wrappers — they re-run the same scenarios the
+// matrix already covers and would otherwise execute redundantly on every
+// quantitative invocation. Call by FQN to run intentionally, e.g.
+// `run-tests.ps1 QuantFocused.S7C4FocusedSuite.RunS7C4`.
+namespace MonkeNet.Tests.QuantFocused;
 
 // Focused single-cell wrapper for S7 × C4 used during snapback-fix verification.
 // Inner-loop-style fast iteration on the same scenario the bug was reproduced

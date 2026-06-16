@@ -50,11 +50,149 @@ public partial class PredictionVisualSmoothing3D : Node3D
 {
     [Export] public Node3D Body { get; set; }
     [Export] public Node3D Visual { get; set; }
+    /// <summary>Optional first-person camera node. When set, the smoother
+    /// samples its rendered (FTI-interpolated) world position each
+    /// <c>_Process</c> and accumulates per-render-frame |Δv|² into
+    /// <see cref="CameraJoltDvSquaredSamples"/>. Reports M19 — the camera-
+    /// motion analogue of M14, measuring what the player's eye actually
+    /// experiences each render frame. Null on third-person-only smoothers
+    /// (passive props, remote players) so they don't pay the sample cost.</summary>
+    [Export] public Node3D Camera { get; set; }
+
+    /// <summary>Decay strategy for the position offset. The rotation path is
+    /// unaffected — rotation captures are always reset to identity in
+    /// <see cref="AbsorbBodyTeleport"/> regardless of mode.</summary>
+    public enum PosDecayMode
+    {
+        /// <summary>Original behaviour. Each tick: <c>posOffset *= exp(-dt /
+        /// DecayTime)</c>. Smooth-looking for one-shot teleports but pathological
+        /// under per-snapshot reconcile streams: the body advances by
+        /// <c>body_velocity * dt</c> each tick while the new correction adds
+        /// <c>-delta</c>; under steady-state push these cancel and the visual
+        /// freezes at <c>body + offset</c>. Between snapshots the offset decays
+        /// exponentially and the visual sprints to catch up. This is the
+        /// freeze-then-sprint M15/M16 artefact observed on S3-SingleCubePush.
+        /// Kept as the default so existing scenes don't change behaviour.</summary>
+        Exponential,
+        /// <summary>Q3 / UE-Linear-mode style. Each tick: <c>posOffset =
+        /// originalOffset * max(0, 1 - elapsed / SmoothingTime)</c>. Produces a
+        /// constant correction velocity (<c>originalOffset / SmoothingTime</c>)
+        /// that ADDS to body velocity instead of fighting it — visual moves at
+        /// <c>body_velocity + correction_velocity</c> through the entire decay
+        /// window. Chained per-snapshot corrections just keep refreshing the
+        /// constant, so the visual continues at a steady catch-up rate rather
+        /// than freezing then sprinting. Recommended for any scenario with
+        /// sustained reconcile streams (continuous push, multi-body chaos).</summary>
+        Linear,
+        /// <summary>
+        /// Magnitude-adaptive linear decay with a per-frame minimum-correction
+        /// floor. Modelled on Photon Fusion 2's
+        /// <c>InterpolatedErrorCorrectionSettings</c> (see Fusion 2 API
+        /// reference — they replaced Fusion 1's pure-exponential with this
+        /// after users reported the same freeze-then-sprint pathology).
+        ///
+        /// <para>Each <c>_PhysicsProcess</c>:
+        /// <code>
+        /// mag  = |posOffset|
+        /// t    = saturate((mag - BlendStart) / (BlendEnd - BlendStart))
+        /// rate = lerp(MinRate, MaxRate, t)                  // Hz
+        /// step = max(mag * rate * dt, MinCorrection)        // floor
+        /// step = min(step, mag)                             // no overshoot
+        /// posOffset -= (posOffset / mag) * step             // toward zero
+        /// </code></para>
+        ///
+        /// <para>Two key behaviours that distinguish this from
+        /// <see cref="Exponential"/>:</para>
+        /// <para>1. <b>Rate adapts to magnitude</b>: tiny errors decay slowly
+        /// (MinRate ≈ 3.3 Hz → ~210 ms half-life), large errors decay fast
+        /// (MaxRate = 10 Hz → ~70 ms half-life). Bursty multi-decimetre
+        /// corrections converge quickly without the small-error visual
+        /// hunting that pure-fast-decay causes.</para>
+        /// <para>2. <b>Minimum-correction floor</b>: even tiny offsets get
+        /// closed by at least <see cref="MagnitudeAdaptiveMinCorrection"/>
+        /// per frame (clamped to actual offset so we never overshoot). This
+        /// is the explicit anti-freeze-then-sprint mechanism — sub-floor
+        /// offsets resolve in 1-3 frames instead of asymptoting forever
+        /// under chained reconciles.</para>
+        ///
+        /// <para>No overshoot, no extrapolation — the correction is always
+        /// strictly toward the body's current pose with a per-frame cap.
+        /// Recommended for production over both Exponential and Linear.</para>
+        /// </summary>
+        MagnitudeAdaptive,
+    }
+
+    /// <summary>Decay strategy for <see cref="_posOffset"/>. See
+    /// <see cref="PosDecayMode"/> for the trade-offs. Default
+    /// <see cref="PosDecayMode.Exponential"/> preserves the pre-existing
+    /// behaviour of every scene that already has this smoother wired up.</summary>
+    [Export] public PosDecayMode PositionDecayMode { get; set; } = PosDecayMode.Exponential;
 
     /// <summary>Time constant (seconds) for exponential offset decay. After
     /// DecayTime seconds the offset has decayed to ~37% of its captured value;
-    /// after 3×DecayTime it is effectively zero.</summary>
+    /// after 3×DecayTime it is effectively zero. Used only when
+    /// <see cref="PositionDecayMode"/> = <see cref="PosDecayMode.Exponential"/>.</summary>
     [Export] public float DecayTime { get; set; } = 0.1f;
+
+    /// <summary>Linear-decay window (seconds). The captured offset reaches
+    /// zero exactly at this elapsed wall-clock time, producing a constant
+    /// correction velocity equal to <c>originalOffset / SmoothingTime</c>.
+    /// Used only when <see cref="PositionDecayMode"/> =
+    /// <see cref="PosDecayMode.Linear"/>. Defaults to the same 0.1 s window
+    /// used by <see cref="DecayTime"/> so the two modes converge to zero in
+    /// the same wall-clock budget; tune per scene if the visible catch-up
+    /// velocity feels too fast (raise it) or too laggy (lower it). Quake 3
+    /// uses ~100 ms by default; Unreal's Linear mode default is ~100 ms.</summary>
+    [Export] public float SmoothingTime { get; set; } = 0.1f;
+
+    // ------------------ MagnitudeAdaptive mode params ------------------
+    // Matches Photon Fusion 2's InterpolatedErrorCorrectionSettings defaults
+    // exactly — Fusion engineers tuned these against shipping projects with
+    // mixed-rigidbody contact workloads, so they're a good starting point.
+    // Override per-smoother if a particular prop's contact regime is
+    // unusual (very fast spinners want a higher MinRate, very slow drifters
+    // a lower one).
+
+    /// <summary>MagnitudeAdaptive — minimum decay rate (Hz). Applied to
+    /// offsets ≤ <see cref="MagnitudeAdaptiveBlendStart"/>. At 3.3 Hz the
+    /// half-life is ~210 ms — slow enough that tiny per-snapshot Jolt
+    /// drift doesn't visibly hunt, fast enough that small offsets resolve
+    /// before the eye registers them as persistent visual lag.</summary>
+    [Export] public float MagnitudeAdaptiveMinRate { get; set; } = 3.3f;
+
+    /// <summary>MagnitudeAdaptive — maximum decay rate (Hz). Applied to
+    /// offsets ≥ <see cref="MagnitudeAdaptiveBlendEnd"/>. At 10 Hz the
+    /// half-life is ~70 ms — fast enough that multi-decimetre rollback
+    /// corrections converge before the next render frame so the visual
+    /// snaps cleanly without sustained rubber-banding.</summary>
+    [Export] public float MagnitudeAdaptiveMaxRate { get; set; } = 10.0f;
+
+    /// <summary>MagnitudeAdaptive — offset magnitude (meters) at or below
+    /// which <see cref="MagnitudeAdaptiveMinRate"/> applies. Between this
+    /// and <see cref="MagnitudeAdaptiveBlendEnd"/> the rate is linearly
+    /// interpolated. Fusion 2's default 0.25 m is a reasonable contact-
+    /// scale boundary — sub-25 cm errors are micro-corrections that should
+    /// resolve gently; above this they're contact / rollback events that
+    /// want a more aggressive catch-up.</summary>
+    [Export] public float MagnitudeAdaptiveBlendStart { get; set; } = 0.25f;
+
+    /// <summary>MagnitudeAdaptive — offset magnitude (meters) at or above
+    /// which <see cref="MagnitudeAdaptiveMaxRate"/> applies. Errors past
+    /// this are large rollback / teleport corrections; they get the
+    /// fastest decay so the visual converges before
+    /// <see cref="TeleportDistance"/> kicks in. Fusion 2 default 1.0 m.</summary>
+    [Export] public float MagnitudeAdaptiveBlendEnd { get; set; } = 1.0f;
+
+    /// <summary>MagnitudeAdaptive — per-frame minimum correction magnitude
+    /// (meters). The CORE anti-freeze-then-sprint mechanism: even when
+    /// <c>mag * rate * dt</c> would round to a sub-mm value, we still close
+    /// the offset by at least this much per render frame (clamped to actual
+    /// offset so we never overshoot). Without this floor the algorithm
+    /// degenerates to exponential decay and produces the same freeze
+    /// pattern. Fusion 2 default 0.025 m — small enough to be sub-perceptual
+    /// per frame, large enough to converge a 0.1 m offset in 4 frames
+    /// instead of asymptoting.</summary>
+    [Export] public float MagnitudeAdaptiveMinCorrection { get; set; } = 0.025f;
 
     /// <summary>Smallest position jump (meters) over a single frame, after
     /// subtracting <c>LinearVelocity * dt</c>, that counts as a teleport. Below
@@ -79,8 +217,43 @@ public partial class PredictionVisualSmoothing3D : Node3D
     /// rotation is fully derived from the body.</summary>
     [Export] public bool SmoothRotation { get; set; } = true;
 
+    /// <summary>Aggression multiplier for the PVB rotation slerp. Murphy's
+    /// canonical PVB uses the same linear blendFactor for both position and
+    /// rotation; here we let rotation catch up faster by scaling the rotation
+    /// blendFactor before clamping to [0,1]. At the default 3.0 the rotation
+    /// slerp reaches body.Quaternion when the position blend is one-third of
+    /// the way through the window, i.e. ~83 ms of rotation convergence for a
+    /// 250 ms PVB position window. Set to 1.0 to recover canonical paired
+    /// behaviour; set higher for snappier rotation tracking on bodies whose
+    /// rotation evolves on a much shorter timescale than their translation
+    /// (cubes mid-spin while being kicked across the floor — position takes
+    /// hundreds of ms to converge but rotation needs to track tens-of-ms
+    /// reconcile cycles or visual lag becomes visible).</summary>
+    [Export] public float RotationBlendAggression { get; set; } = 3.0f;
+
     // World-space position offset between visual and body. Decays toward zero.
     private Vector3 _posOffset;
+    // Linear-decay state (used only when PositionDecayMode = Linear).
+    // _originalPosOffset captures _posOffset immediately after a fresh
+    // AbsorbBodyTeleport / FixupOffsetAfterResim / ClearOffset writes it,
+    // and serves as the baseline for the linear ramp: posOffset(t) =
+    // originalPosOffset * (1 - elapsed/SmoothingTime). Chained captures
+    // restart the ramp by re-snapping the baseline and resetting elapsed —
+    // matching Q3's cg.predictedError model.
+    private Vector3 _originalPosOffset;
+    private float _smoothingElapsed;
+
+    // Rebase the linear-decay state to the current _posOffset value. Called
+    // after every site that writes _posOffset so the next _PhysicsProcess
+    // tick starts the linear ramp from "right now" — chained corrections
+    // restart the ramp instead of stacking. Cheap no-op when PositionDecayMode
+    // is Exponential, but we always update so a mid-scene mode flip doesn't
+    // need to re-initialise the baseline.
+    private void RebaseLinearDecay()
+    {
+        _originalPosOffset = _posOffset;
+        _smoothingElapsed = 0f;
+    }
     // World-space rotation offset: Visual.Quaternion = _rotOffset * Body.Quaternion.
     // Decays toward identity. World-frame (left-multiplied) keeps the teleport
     // capture math symmetric with the position path — body rotates by R in
@@ -148,6 +321,20 @@ public partial class PredictionVisualSmoothing3D : Node3D
     private float _pvbDuration;
     private Vector3 _pvbOldPos, _pvbOldVel;
     private Vector3 _pvbNewPos, _pvbNewVel;
+    // Rotation slerp anchor for the active PVB window. PVB is a position-only
+    // technique in Murphy's "Believable Dead Reckoning for Networked Games"
+    // (Game Engine Gems 2 ch. 22); rotation is handled separately. Standard
+    // practice (Delta3D reference codebase, Glenn Fiedler's snapshot interp,
+    // Unreal Chaos resim) is to slerp the rendered orientation toward the
+    // body's current authoritative rotation using the same blendFactor that
+    // drives the position trajectory blend. Capturing the start orientation
+    // here lets us do the canonical single-target slerp(_pvbStartRot,
+    // body.Quaternion, blendFactor) instead of the previous behaviour of
+    // freezing visRot at _lastRenderedRot for the entire blend window — which
+    // produced the 97° single-tick rotation jerk visible on S7-C3 eid=4
+    // tick=754 when PVB chained across ~540 ms while the body actually
+    // rotated through ~97° of yaw.
+    private Quaternion _pvbStartRot = Quaternion.Identity;
 
     // Visual smoothness tracking. Each render frame in _Process we compute
     // the frame-to-frame visual velocity v_t = (visPos_t − visPos_{t-1}) / dt
@@ -177,6 +364,83 @@ public partial class PredictionVisualSmoothing3D : Node3D
     // smoother per cell (≈8 s × 60 fps) so the in-memory footprint stays
     // small. Cleared by <see cref="ResetSmoothnessAccumulator"/>.
     private readonly System.Collections.Generic.List<float> _smoothnessDvSquared = new();
+
+    // M15 — freeze-frame ratio. Per-render-frame counter pair: the body
+    // moved at least <see cref="FreezeBodyMotionThresholdM"/> since the
+    // previous render frame (the denominator condition: "the body is in
+    // motion this frame") but the rendered visual moved less than
+    // <see cref="FreezeVisMotionThresholdM"/> (the freeze signature: "the
+    // visual stayed put while the body kept going"). Reported as
+    // _freezeFrames / _motionFrames at summary time. Captures the
+    // AbsorbBodyTeleport-pinned-prev/curr saw-tooth which M14 only partially
+    // shows — M14 sees the catch-up jerk after the freeze; this counter
+    // sees the freeze itself.
+    private long _freezeFrames;
+    private long _motionFrames;
+    private Vector3 _lastBodyPosForFreezeCheck;
+    private bool _hasLastBodyPosForFreezeCheck;
+    // Thresholds tuned from the user-reported S7-C0 push trace where freezes
+    // were unambiguous at body-delta > 5 cm / vis-delta < 1 mm. 1 cm body
+    // delta is loose enough to capture slow-push frames; 1 mm vis delta is
+    // tight enough that float-precision residue from the lerp doesn't
+    // count as motion.
+    private const float FreezeBodyMotionThresholdM = 0.01f;
+    private const float FreezeVisMotionThresholdM  = 0.001f;
+
+    // M16 — visual-vs-body phase lag during sustained motion. Each render
+    // frame where |body velocity| > <see cref="PhaseLagMinSpeedMps"/> the
+    // smoother appends <c>|visRendered − bodyRaw|</c> to this list. Distinct
+    // from M5 (server vs client *body* drift); this is purely client-side
+    // "the visual is trailing the rigidbody". Summary reports mean + p95
+    // over the combined cross-smoother pool — the C0 push trace showed
+    // mean 21 cm / peak 38 cm, which is perceptible lag that M14 doesn't
+    // measure at all (M14 catches jerk, not steady-state offset).
+    private readonly System.Collections.Generic.List<float> _phaseLagSamples = new();
+    private const float PhaseLagMinSpeedMps = 1.0f;
+    // Squared form for the comparison in the hot path — avoids a sqrt per
+    // _Process call when the body is stationary.
+    private const float PhaseLagMinSpeedMpsSquared = PhaseLagMinSpeedMps * PhaseLagMinSpeedMps;
+
+    // M17 — render pacing gap ratio. Each render frame the smoother diffs
+    // ClientNetworkClock.GetCurrentTick() against the value from the previous
+    // render frame. Gap ≥3 physics ticks means the engine ran 3+ physics
+    // catch-up steps between this _Process call and the last one (i.e. one
+    // or more physics ticks fired without an intervening render). Captures
+    // the global "all visuals freeze together" pattern caused by heavy
+    // network-callback bursts (rollback/resim) inside _PhysicsProcess.
+    // Reported as _renderGapCount / _renderFrameCount at summary time.
+    private long _renderGapCount;
+    private long _renderFrameCount;
+    private int _lastClientTickForGapCheck = -1;
+    private const int RenderGapPhysicsTicksThreshold = 3;
+
+    // M18 — visual-vs-body direction mismatch ratio. Render frames where
+    // both the visual is moving (|visVel| > min) AND the body is moving
+    // (|bodyVel| > min) but their velocity vectors point in opposite
+    // half-spaces (dot < 0). Captures the "visual is catching up backwards"
+    // artefact when offset decay overshoots — visible to the user as
+    // a momentary backwards-pull on an already-moving body. Reported as
+    // _dirMismatchFrames / _motionPairFrames at summary time.
+    private long _dirMismatchFrames;
+    private long _motionPairFrames;
+    private const float DirMismatchMinSpeedMps = 0.1f;
+    private const float DirMismatchMinSpeedMpsSquared = DirMismatchMinSpeedMps * DirMismatchMinSpeedMps;
+
+    // M19 — first-person camera jolt. Per-render-frame |Δv|² of the camera's
+    // FTI-interpolated world position. Mirrors M14's accumulator shape so
+    // RMS / p50 / p95 / p99 can be reported the same way. Sampled only when
+    // Camera is wired; non-null only on the local player's smoother.
+    // Reading Camera.GetGlobalTransformInterpolated() rather than
+    // Camera.GlobalPosition matters: the camera is FTI'd through its parent
+    // body's prev/curr cache, and the interpolated value is what the
+    // renderer actually shows the player's eye that frame. A raw read
+    // would miss the rollback-reset jolt that ResetBodyFtiAfterResim
+    // collapses the prev→curr lerp across.
+    private readonly System.Collections.Generic.List<float> _cameraJoltDvSquared = new();
+    private Vector3 _lastCameraPos;
+    private Vector3 _lastCameraVel;
+    private bool _hasLastCameraPos;
+    private bool _hasLastCameraVel;
 
     public override void _EnterTree()
     {
@@ -227,13 +491,64 @@ public partial class PredictionVisualSmoothing3D : Node3D
             CaptureUnexplainedJump(bodyPos, bodyRot, dt);
         }
 
-        float alpha = DecayTime > 0f ? Mathf.Exp(-dt / DecayTime) : 0f;
-        _posOffset *= alpha;
-        _rotOffset = Quaternion.Identity.Slerp(_rotOffset.Normalized(), alpha);
+        // Position offset decay — strategy controlled by PositionDecayMode.
+        // Exponential is the legacy default; Linear matches Q3 / UE's Linear
+        // mode and is the recommended choice when reconciles chain (see the
+        // PosDecayMode docstrings). Rotation still uses the exponential slerp
+        // because rotation captures are always reset to identity in
+        // AbsorbBodyTeleport — only the offset->Identity decay rate of any
+        // residual rotation between absorbs is being controlled here.
+        if (PositionDecayMode == PosDecayMode.Linear)
+        {
+            _smoothingElapsed += dt;
+            if (SmoothingTime > 0f)
+            {
+                float t = Mathf.Clamp(_smoothingElapsed / SmoothingTime, 0f, 1f);
+                _posOffset = _originalPosOffset * (1f - t);
+            }
+            else
+            {
+                _posOffset = Vector3.Zero;
+            }
+        }
+        else if (PositionDecayMode == PosDecayMode.MagnitudeAdaptive)
+        {
+            // Fusion 2-style adaptive rate. See PosDecayMode.MagnitudeAdaptive
+            // docstring for the reference algorithm. Operates on _posOffset
+            // directly (no baseline-and-elapsed state needed) — chained
+            // reconciles just see whatever _posOffset they happen to leave
+            // behind and the magnitude-blended rate sorts itself out.
+            float mag = _posOffset.Length();
+            if (mag > 1e-6f)
+            {
+                float blendRange = MagnitudeAdaptiveBlendEnd - MagnitudeAdaptiveBlendStart;
+                float t = blendRange > 1e-6f
+                    ? Mathf.Clamp((mag - MagnitudeAdaptiveBlendStart) / blendRange, 0f, 1f)
+                    : (mag >= MagnitudeAdaptiveBlendEnd ? 1f : 0f);
+                float rate = Mathf.Lerp(MagnitudeAdaptiveMinRate, MagnitudeAdaptiveMaxRate, t);
+                // Per-frame correction magnitude with the anti-freeze floor.
+                // The floor is the entire point of this mode — without it
+                // we degenerate to exponential and reproduce the freeze.
+                float step = Mathf.Max(mag * rate * dt, MagnitudeAdaptiveMinCorrection);
+                step = Mathf.Min(step, mag);  // never overshoot zero
+                _posOffset -= _posOffset / mag * step;
+            }
+        }
+        else
+        {
+            float alpha = DecayTime > 0f ? Mathf.Exp(-dt / DecayTime) : 0f;
+            _posOffset *= alpha;
+        }
+        {
+            float rotAlpha = DecayTime > 0f ? Mathf.Exp(-dt / DecayTime) : 0f;
+            _rotOffset = Quaternion.Identity.Slerp(_rotOffset.Normalized(), rotAlpha);
+        }
 
         if (TeleportDistance > 0f && _posOffset.Length() > TeleportDistance)
         {
             _posOffset = Vector3.Zero;
+            _originalPosOffset = Vector3.Zero;
+            _smoothingElapsed = 0f;
             _rotOffset = Quaternion.Identity;
         }
 
@@ -306,7 +621,24 @@ public partial class PredictionVisualSmoothing3D : Node3D
             Vector3 pOld = _pvbOldPos + _pvbOldVel * t;
             Vector3 pNew = _pvbNewPos + _pvbNewVel * t;
             visPos = pOld.Lerp(pNew, blendFactor);
-            visRot = _lastRenderedRot;
+            // Canonical PVB-rotation pairing: single-target slerp from the
+            // visual rotation captured at PVB start toward the body's current
+            // authoritative rotation, weighted by an aggression-scaled
+            // blendFactor. Murphy's chapter prescribes "slerp the rendered
+            // orientation toward the projected target using the same
+            // blendFactor" — the body's quaternion IS that projected target
+            // because reconciles teleport the body to the auth rotation and
+            // Jolt integrates angular velocity between snapshots, so
+            // body.Quaternion at this instant is the best-known orientation
+            // estimate. RotationBlendAggression scales blendFactor so the
+            // rotation slerp catches up before the (slower) position blend
+            // finishes — e.g. aggression=3 reaches body.Quaternion at 1/3 of
+            // the position window. Chained PVB restarts re-anchor
+            // _pvbStartRot to the in-flight visual rotation so the slerp
+            // continues smoothly from the current visual rather than warping
+            // back to the original anchor.
+            float rotBlend = Mathf.Clamp(blendFactor * RotationBlendAggression, 0f, 1f);
+            visRot = _pvbStartRot.Slerp(Body is Node3D bN ? bN.Quaternion : Quaternion.Identity, rotBlend);
             if (blendFactor >= 1f)
             {
                 _pvbActive = false;
@@ -337,6 +669,7 @@ public partial class PredictionVisualSmoothing3D : Node3D
         // previous render frame — large Δv means the visual jerked (snap-
         // overflow, frame-rate spike, smoother offset reset). The harness
         // reads RMS(|Δv|) as the M14 metric.
+        Vector3 bodyPosNowM = Body.GlobalPosition;
         if (delta > 0 && _hasLastRenderedPos)
         {
             Vector3 currVisVel = (visPos - _lastRenderedPos) / (float)delta;
@@ -347,6 +680,67 @@ public partial class PredictionVisualSmoothing3D : Node3D
             }
             _lastVisVel = currVisVel;
             _hasLastVisVel = true;
+
+            // M18 — visual-vs-body direction mismatch. Only count frames
+            // where BOTH the visual and the body are meaningfully moving
+            // (above DirMismatchMinSpeed); otherwise tiny float-noise
+            // velocity vectors would flip signs randomly and inflate the
+            // ratio. Both must agree on a direction for the metric to
+            // describe a real disagreement.
+            Vector3 bodyVelDir = Body is RigidBody3D rbDir ? rbDir.LinearVelocity : Vector3.Zero;
+            if (currVisVel.LengthSquared() > DirMismatchMinSpeedMpsSquared
+                && bodyVelDir.LengthSquared() > DirMismatchMinSpeedMpsSquared)
+            {
+                _motionPairFrames++;
+                if (currVisVel.Dot(bodyVelDir) < 0f) _dirMismatchFrames++;
+            }
+        }
+
+        // M15 — freeze-frame ratio. Body delta vs visual delta this frame.
+        // Tracked using _lastBodyPosForFreezeCheck (sampled at the START of
+        // each _Process so it lines up with _lastRenderedPos which was
+        // sampled at the END of the previous _Process — i.e. the same
+        // wall-clock interval covers both deltas).
+        if (_hasLastBodyPosForFreezeCheck && _hasLastRenderedPos)
+        {
+            float bodyDeltaMag = (bodyPosNowM - _lastBodyPosForFreezeCheck).Length();
+            float visDeltaMag  = (visPos      - _lastRenderedPos).Length();
+            if (bodyDeltaMag > FreezeBodyMotionThresholdM)
+            {
+                _motionFrames++;
+                if (visDeltaMag < FreezeVisMotionThresholdM) _freezeFrames++;
+            }
+        }
+        _lastBodyPosForFreezeCheck = bodyPosNowM;
+        _hasLastBodyPosForFreezeCheck = true;
+
+        // M16 — phase lag sample. Only collected while the body is in
+        // sustained motion — at-rest frames have zero lag by definition and
+        // would bias the mean downward. PhaseLagMinSpeed = 1 m/s is well
+        // above Jolt micro-twitch but well below a player walk (~3 m/s) or
+        // a kicked cube's mid-flight velocity (~3-5 m/s).
+        Vector3 bodyVelLag = Body is RigidBody3D rbLag ? rbLag.LinearVelocity : Vector3.Zero;
+        if (bodyVelLag.LengthSquared() > PhaseLagMinSpeedMpsSquared)
+        {
+            _phaseLagSamples.Add((visPos - bodyPosNowM).Length());
+        }
+
+        // M17 — render pacing gap. ClientNetworkClock tick advances 1 per
+        // physics tick; if two consecutive _Process calls observe a gap of
+        // ≥3 ticks, the engine ran 3+ catch-up physics steps between them
+        // (and Godot's one-slot FTI history dropped all intermediate poses).
+        int currentClientTick = MonkeNet.Client.ClientManager.Instance?
+            .GetNodeOrNull<MonkeNet.Client.ClientNetworkClock>("ClientNetworkClock")?
+            .GetCurrentTick() ?? -1;
+        if (currentClientTick >= 0)
+        {
+            if (_lastClientTickForGapCheck >= 0)
+            {
+                int gap = currentClientTick - _lastClientTickForGapCheck;
+                _renderFrameCount++;
+                if (gap >= RenderGapPhysicsTicksThreshold) _renderGapCount++;
+            }
+            _lastClientTickForGapCheck = currentClientTick;
         }
 
         if (SmoothRotation)
@@ -364,6 +758,31 @@ public partial class PredictionVisualSmoothing3D : Node3D
         }
         _lastRenderedPos = visPos;
         _hasLastRenderedPos = true;
+
+        // M19 — sample the camera's rendered position, compute its per-frame
+        // velocity and Δv. Mirrors the M14 calc on _lastRenderedPos but
+        // applied to a different node — the one the player's eye attaches
+        // to. GlobalTransformInterpolated returns the FTI-cached pose the
+        // renderer is using for this frame (= what the player sees), which
+        // differs from Camera.GlobalPosition during the rollback frame
+        // where ResetBodyFtiAfterResim collapses prev→curr.
+        if (Camera != null && delta > 0)
+        {
+            Vector3 camPos = Camera.GetGlobalTransformInterpolated().Origin;
+            if (_hasLastCameraPos)
+            {
+                Vector3 currCamVel = (camPos - _lastCameraPos) / (float)delta;
+                if (_hasLastCameraVel)
+                {
+                    Vector3 dvCam = currCamVel - _lastCameraVel;
+                    _cameraJoltDvSquared.Add(dvCam.LengthSquared());
+                }
+                _lastCameraVel = currCamVel;
+                _hasLastCameraVel = true;
+            }
+            _lastCameraPos = camPos;
+            _hasLastCameraPos = true;
+        }
 
         LogSmoothFrame(pif, delta);
     }
@@ -383,7 +802,70 @@ public partial class PredictionVisualSmoothing3D : Node3D
         // ACROSS the reset boundary; we just discard its Δv (because
         // _hasLastVisVel is false) and start fresh from frame 2.
         _smoothnessDvSquared.Clear();
+        // M15 / M16 / M17 / M18 — same reset semantics. Each metric needs
+        // its "first sample post-reset" boundary discarded (the body-delta
+        // / clientTick / velocity diff across the reset is meaningless).
+        _freezeFrames = 0;
+        _motionFrames = 0;
+        _hasLastBodyPosForFreezeCheck = false;
+        _phaseLagSamples.Clear();
+        _renderGapCount = 0;
+        _renderFrameCount = 0;
+        _lastClientTickForGapCheck = -1;
+        _dirMismatchFrames = 0;
+        _motionPairFrames = 0;
+        _cameraJoltDvSquared.Clear();
+        _hasLastCameraPos = false;
+        _hasLastCameraVel = false;
     }
+
+    /// <summary>M15 — number of render frames where the body moved
+    /// &gt;<see cref="FreezeBodyMotionThresholdM"/> but the visual moved
+    /// &lt;<see cref="FreezeVisMotionThresholdM"/>. Use with
+    /// <see cref="MotionFrames"/> as the denominator to compute the
+    /// freeze-frame ratio.</summary>
+    public long FreezeFrames => _freezeFrames;
+
+    /// <summary>M15 denominator — number of render frames where the body
+    /// moved &gt;<see cref="FreezeBodyMotionThresholdM"/> (i.e. the body
+    /// is in motion this frame, so we can meaningfully ask whether the
+    /// visual was frozen).</summary>
+    public long MotionFrames => _motionFrames;
+
+    /// <summary>M16 — per-render-frame |visRendered − bodyRaw| samples (m),
+    /// collected only while the body's speed exceeds
+    /// <see cref="PhaseLagMinSpeedMps"/>. Summary computes mean + p95 over
+    /// the combined pool across all smoothers.</summary>
+    public System.Collections.Generic.IReadOnlyList<float> PhaseLagSamples => _phaseLagSamples;
+
+    /// <summary>M17 — number of render frames whose ClientNetworkClock tick
+    /// advanced ≥<see cref="RenderGapPhysicsTicksThreshold"/> since the
+    /// previous render frame (i.e. the engine ran multiple physics catch-up
+    /// steps between renders, dropping intermediate FTI poses). Use with
+    /// <see cref="RenderFrameCount"/> as the denominator.</summary>
+    public long RenderPacingGapCount => _renderGapCount;
+
+    /// <summary>M17 denominator — number of render frames the smoother has
+    /// observed since the last <see cref="ResetSmoothnessAccumulator"/>.</summary>
+    public long RenderFrameCount => _renderFrameCount;
+
+    /// <summary>M18 — number of render frames where visual velocity and
+    /// body velocity disagreed on direction (dot &lt; 0), both above the
+    /// noise floor <see cref="DirMismatchMinSpeedMps"/>. Use with
+    /// <see cref="MotionPairFrames"/> as the denominator.</summary>
+    public long DirectionMismatchFrames => _dirMismatchFrames;
+
+    /// <summary>M18 denominator — render frames where BOTH the visual and
+    /// the body were meaningfully moving (above the noise floor on each
+    /// side), so the dot-product comparison is well-defined.</summary>
+    public long MotionPairFrames => _motionPairFrames;
+
+    /// <summary>M19 — raw |Δv|² samples of the first-person camera's
+    /// rendered (FTI-interpolated) world position. Empty when
+    /// <see cref="Camera"/> is null. Aggregated by the harness alongside
+    /// M14; the runner reports RMS / p50 / p95 / p99 in m/s.</summary>
+    public System.Collections.Generic.IReadOnlyList<float> CameraJoltDvSquaredSamples
+        => _cameraJoltDvSquared;
 
     /// <summary>Raw |Δv|² samples (units (m/s)²) accumulated since the last
     /// reset, one per render frame. Exposed for the harness's
@@ -417,6 +899,7 @@ public partial class PredictionVisualSmoothing3D : Node3D
         }
 
         Vector3 bodyRaw = Body.GlobalPosition;
+        Quaternion bodyRotRaw = Body is Node3D bN ? bN.Quaternion : Quaternion.Identity;
         Vector3 vel = Body is RigidBody3D rb ? rb.LinearVelocity : Vector3.Zero;
         ulong physFrame = Engine.GetPhysicsFrames();
         int clientTick = MonkeNet.Client.ClientManager.Instance?
@@ -427,10 +910,20 @@ public partial class PredictionVisualSmoothing3D : Node3D
         // wrote Visual.GlobalTransform / GlobalPosition to (visPos, visRot).
         // bodyRendered for a body with FTI off (the recommended config for
         // the body when paired with this smoother) is the same as raw.
-        MonkeLogger.Debug(
+        //
+        // ForceDebug bypasses MonkeLogger.DebugEnabled so this single render-
+        // frame marker survives a "disable debug logging" run — it's how the
+        // log-analysis tools (gap detection, push trace) measure render
+        // pacing. Disabling DebugEnabled globally kills the other ~thousand
+        // log lines per second this smoother used to produce; keeping just
+        // SMOOTH-FRAME (one per render frame per body) gives us enough
+        // signal to detect engine-tick catch-up bursts without re-paying
+        // the per-call log cost on the hot reconcile path.
+        MonkeLogger.ForceDebug(
             $"[SMOOTH-FRAME] body={Body.Name} pf={physFrame} clientTick={clientTick} " +
             $"dt={delta:F5} pif={pif:F3} " +
             $"bodyRaw=({bodyRaw.X:F5},{bodyRaw.Y:F5},{bodyRaw.Z:F5}) " +
+            $"bodyRot=({bodyRotRaw.X:F4},{bodyRotRaw.Y:F4},{bodyRotRaw.Z:F4},{bodyRotRaw.W:F4}) " +
             $"visRendered=({_lastRenderedPos.X:F5},{_lastRenderedPos.Y:F5},{_lastRenderedPos.Z:F5}) " +
             $"visRot=({_lastRenderedRot.X:F4},{_lastRenderedRot.Y:F4},{_lastRenderedRot.Z:F4},{_lastRenderedRot.W:F4}) " +
             $"targetPrev=({_visTargetPrev.X:F5},{_visTargetPrev.Y:F5},{_visTargetPrev.Z:F5}) " +
@@ -461,11 +954,27 @@ public partial class PredictionVisualSmoothing3D : Node3D
     // accumulates only when the engine applied a real impulse / teleport.
     private void CaptureUnexplainedJump(Vector3 bodyPos, Quaternion bodyRot, float dt)
     {
+        // Kinematic-body bail-out (T2 KinematicInterpolation policy support).
+        // When Body.Freeze=true, LocalRigidPropPrediction.OnPostPhysicsTick
+        // writes the body's transform every tick to track the snapshot-interp
+        // pose. Pre-step velocity is 0 (kinematic bodies don't accumulate
+        // velocity), so each per-tick transform write would count here as
+        // an "unexplained jump" and accumulate into _posOffset (observed
+        // pre-fix on this branch: 1-5 m/s induced visual jerk per tick on
+        // KI-mode cubes). For a kinematic body the explicit
+        // AbsorbBodyTeleport calls from LocalRigidPropPrediction's teleport-
+        // detection path are the only legitimate offset captures — the
+        // per-tick smooth motion already follows the body naturally
+        // because the smoother's lerp targets observe it without needing
+        // an offset to track.
+        if (Body is RigidBody3D rbFreeze && rbFreeze.Freeze) return;
+
         Vector3 expectedPosDelta = _prevLinVel * dt;
         Vector3 jumpPos = (bodyPos - _prevBodyPos) - expectedPosDelta;
         if (jumpPos.LengthSquared() > PositionJumpEpsilon * PositionJumpEpsilon)
         {
             _posOffset -= jumpPos;
+            RebaseLinearDecay();
         }
 
         Quaternion expectedRot = AngularDelta(_prevAngVel, dt);
@@ -502,6 +1011,28 @@ public partial class PredictionVisualSmoothing3D : Node3D
     /// at its last-rendered position (preserved by the smoother's
     /// <c>_lastRenderedPos</c>) — the body has warped but the visual hasn't
     /// caught up yet, which is the correct ordering.
+    ///
+    /// Rotation is intentionally NOT captured into <c>_rotOffset</c>. The
+    /// Interpolate-tier per-snapshot blend (HandleInterpolateReconciliation's
+    /// 3-tick BLEND-START path) calls this every ~3 ticks per cube under
+    /// chained snapshots, and the captured rotation offset is the inverse of
+    /// the body's per-blend-tick rotation step. Each new absorb refreshes
+    /// that counter-rotation before the per-frame slerp decay
+    /// (DecayTime=0.1s ≈ 6 ticks) drains the previous one — the offset
+    /// stabilises at the value that exactly cancels the body's rotation in
+    /// <c>newTargetRot = _rotOffset * bodyRot</c>, and the visual freezes
+    /// at a stale orientation for the full duration of the snapshot stream.
+    /// Observed on S7-C3 eid=37 around tick 362: body teleported through
+    /// ~180° of yaw via blend writes while the visual held at +0° for
+    /// 9 ticks (~150 ms) and then snap-caught-up over 1 frame. Position
+    /// offset has the same accumulation shape but the equilibrium is masked
+    /// by snap-to-auth's <c>ClearOffset</c> calls (~40% of frames under C4)
+    /// — rotation has no such clear hook. Resetting <c>_rotOffset</c> to
+    /// identity here matches the established "no rotation smoothing across
+    /// reconciles" design (<see cref="FixupOffsetAfterResim"/> docstring):
+    /// visual rotation tracks the body's actual orientation 1:1, accepting
+    /// a one-frame snap on the rare genuine teleport in exchange for
+    /// faithful rotation rendering during the common contact / blend case.
     /// </summary>
     public void AbsorbBodyTeleport(Vector3 prePos, Quaternion preRot, Vector3 postPos, Quaternion postRot)
     {
@@ -509,14 +1040,16 @@ public partial class PredictionVisualSmoothing3D : Node3D
 
         Vector3 jump = postPos - prePos;
         _posOffset -= jump;
-        Quaternion rotJump = (postRot * preRot.Inverse()).Normalized();
-        _rotOffset = (_rotOffset * rotJump.Inverse()).Normalized();
+        _rotOffset = Quaternion.Identity;
 
         if (TeleportDistance > 0f && _posOffset.Length() > TeleportDistance)
         {
             _posOffset = Vector3.Zero;
-            _rotOffset = Quaternion.Identity;
         }
+        // Rebase the linear-decay baseline AFTER the teleport-distance snap
+        // so the residual+new sum (Q3 style) AND the post-snap zero case
+        // both restart the ramp from the correct value.
+        RebaseLinearDecay();
 
         _prevBodyPos = postPos;
         _prevBodyRot = postRot;
@@ -529,19 +1062,36 @@ public partial class PredictionVisualSmoothing3D : Node3D
         _prevAngVel = Body is RigidBody3D rbA ? rbA.AngularVelocity : Vector3.Zero;
         _hasPrev = true;
 
-        // Pin both lerp endpoints to the post-teleport visual position
-        // (= body.NEW + offset.NEW = body.OLD + offset.OLD by construction
-        // — same as the visual was being rendered at pre-teleport). With
-        // past-interpolation, prev and curr are both observed body positions;
-        // right after a teleport we don't have a "previous frame" body
-        // position that's safe to lerp against (the body just jumped), so
-        // we freeze both ends to the absorbed visual position. The next
-        // _PhysicsProcess will set prev = this frozen value and curr =
-        // body's new observed pose — the lerp resumes normally from there.
+        // Pin only the CURR end of the past-interpolation lerp to the
+        // post-teleport visual position (= body.NEW + offset.NEW = body.OLD
+        // + offset.OLD by construction — same as the visual was being rendered
+        // at pre-teleport). Leaving _visTargetPrev at its previous value (the
+        // body pose from the last _PhysicsProcess) lets the subsequent render
+        // frames lerp from "where the visual just was" toward pinnedVisual
+        // smoothly across pif=[0..1], so the visual continues to slide
+        // forward at the body's effective velocity rather than freezing for
+        // one render frame.
+        //
+        // Pinning BOTH ends (the previous behaviour) wrote the same value
+        // into prev and curr, which collapsed the lerp to a constant for the
+        // remainder of the current tick's render window — visual frozen until
+        // next _PhysicsProcess rotates prev=curr and recomputes curr from
+        // the new body pose. Under continuous-push conditions (S7-C0 eid=14
+        // tick 600-690, body travelling at ~3.4 m/s, snapshot rate 20 Hz)
+        // this produced a freeze-then-jump pattern every ~3 ticks: visDz=0
+        // for one frame, visDz=2× the body's per-frame motion the next frame.
+        // M14 |Δv|² metric reads that saw-tooth as ~3.4 m/s of induced visual
+        // jerk on top of the real push, making C0 (no snap-to-auth, high
+        // movement) the WORST-smoothness condition in the matrix despite
+        // being on a clean network.
+        //
+        // The new behaviour preserves the "absorb the teleport" semantics —
+        // pinnedVisual still equals the pre-teleport rendered position by
+        // construction, so the visual doesn't lurch toward the body's new
+        // pose — but lets it continue moving at the visual velocity it had
+        // before the absorb, decaying into pinnedVisual smoothly.
         Vector3 pinnedVisual = postPos + _posOffset;
         Quaternion pinnedVisualRot = (_rotOffset * postRot).Normalized();
-        _visTargetPrev = pinnedVisual;
-        _visTargetRotPrev = pinnedVisualRot;
         _visTargetCurr = pinnedVisual;
         _visTargetRotCurr = pinnedVisualRot;
 
@@ -582,6 +1132,7 @@ public partial class PredictionVisualSmoothing3D : Node3D
             _posOffset = Vector3.Zero;
             _rotOffset = Quaternion.Identity;
         }
+        RebaseLinearDecay();
 
         _prevBodyPos = postResimBodyPos;
         _prevBodyRot = postResimBodyRot;
@@ -631,6 +1182,7 @@ public partial class PredictionVisualSmoothing3D : Node3D
         if (Body == null || Visual == null) return;
         _posOffset = Vector3.Zero;
         _rotOffset = Quaternion.Identity;
+        RebaseLinearDecay();
         Vector3 bodyPos = Body.GlobalPosition;
         Quaternion bodyRot = Body.Quaternion;
         _visTargetPrev = bodyPos;
@@ -677,11 +1229,22 @@ public partial class PredictionVisualSmoothing3D : Node3D
         _pvbOldVel = oldVel;
         _pvbNewPos = newPos;
         _pvbNewVel = newVel;
+        // Anchor the rotation slerp to the visual's current rendered rotation.
+        // _lastRenderedRot is whatever _Process wrote to Visual.Quaternion on
+        // the previous render frame (or Identity on a cold start before any
+        // frame has rendered). For a chained restart mid-blend this equals
+        // the in-flight slerp output from the previous frame, so the new
+        // slerp(_pvbStartRot, body.Quaternion, blendFactor=0) starts at that
+        // exact rotation — no warping back to the original anchor.
+        _pvbStartRot = _lastRenderedRot;
         // Zero the legacy offset state — the past-interp buffer is suspended
         // for the blend window and we'll re-derive _posOffset on completion.
         _posOffset = Vector3.Zero;
         _rotOffset = Quaternion.Identity;
-        MonkeLogger.Debug($"[SMOOTH-PVB-START] body={Body.Name} oldPos=({oldPos.X:F3},{oldPos.Y:F3},{oldPos.Z:F3}) oldVel=({oldVel.X:F3},{oldVel.Y:F3},{oldVel.Z:F3}) newPos=({newPos.X:F3},{newPos.Y:F3},{newPos.Z:F3}) newVel=({newVel.X:F3},{newVel.Y:F3},{newVel.Z:F3}) dur={_pvbDuration:F3}");
+        RebaseLinearDecay();
+        Quaternion bodyRotSnap = Body is Node3D bN0 ? bN0.Quaternion : Quaternion.Identity;
+        float rotJumpDeg = Mathf.RadToDeg(_pvbStartRot.AngleTo(bodyRotSnap));
+        MonkeLogger.Debug($"[SMOOTH-PVB-START] body={Body.Name} oldPos=({oldPos.X:F3},{oldPos.Y:F3},{oldPos.Z:F3}) oldVel=({oldVel.X:F3},{oldVel.Y:F3},{oldVel.Z:F3}) newPos=({newPos.X:F3},{newPos.Y:F3},{newPos.Z:F3}) newVel=({newVel.X:F3},{newVel.Y:F3},{newVel.Z:F3}) dur={_pvbDuration:F3} startRot=({_pvbStartRot.X:F4},{_pvbStartRot.Y:F4},{_pvbStartRot.Z:F4},{_pvbStartRot.W:F4}) bodyRot=({bodyRotSnap.X:F4},{bodyRotSnap.Y:F4},{bodyRotSnap.Z:F4},{bodyRotSnap.W:F4}) rotJump={rotJumpDeg:F2}deg");
     }
 
     /// <summary>True while the visual is meaningfully offset from the body.</summary>

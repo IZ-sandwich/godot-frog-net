@@ -264,6 +264,112 @@ public static class RigidPlayerPhysics
         return hits;
     }
 
+    /// <summary>
+    /// Velocity-shifted swept-volume query — same as
+    /// <see cref="QueryContactBodies"/> but with the query shape shifted
+    /// forward along the body's linear velocity by
+    /// <paramref name="marginAlongVelocity"/> metres. Used by the T2 pre-step
+    /// proactive contact upgrade on
+    /// <see cref="LocalRigidPlayerPrediction"/>: it catches props the player
+    /// is ABOUT to hit on the next SpaceStep so they can be upgraded to
+    /// Resim BEFORE contact response runs — preventing the player from
+    /// bouncing off a still-kinematic prop.
+    /// </summary>
+    internal static System.Collections.Generic.List<RigidBody3D> QueryNearbyBodies(RigidBody3D body, float marginAlongVelocity)
+    {
+        var hits = new System.Collections.Generic.List<RigidBody3D>();
+        if (body == null) return hits;
+        var space = body.GetWorld3D()?.DirectSpaceState;
+        if (space == null) return hits;
+
+        Node collisionShapeNode = null;
+        foreach (Node child in body.GetChildren())
+        {
+            if (child is CollisionShape3D cs && cs.Shape != null)
+            {
+                collisionShapeNode = cs;
+                break;
+            }
+        }
+        if (collisionShapeNode is not CollisionShape3D shapeNode) return hits;
+
+        Transform3D xform = shapeNode.GlobalTransform;
+        if (marginAlongVelocity > 0f)
+        {
+            // Shift the query shape forward along the body's velocity so
+            // bodies inside the swept volume up to marginAlongVelocity
+            // metres ahead are reported. Doesn't widen the shape sideways
+            // — that would catch unrelated nearby cubes the player isn't
+            // about to hit.
+            Vector3 vel = body.LinearVelocity;
+            float speed = vel.Length();
+            if (speed > 0.01f)
+                xform.Origin += vel / speed * marginAlongVelocity;
+        }
+
+        var query = new PhysicsShapeQueryParameters3D
+        {
+            Shape = shapeNode.Shape,
+            Transform = xform,
+            CollisionMask = body.CollisionMask,
+            CollideWithBodies = true,
+            CollideWithAreas = false,
+            Exclude = new Godot.Collections.Array<Rid> { body.GetRid() },
+        };
+
+        var results = space.IntersectShape(query, maxResults: 8);
+        foreach (var hit in results)
+        {
+            if (hit.TryGetValue("collider", out var cv) && cv.AsGodotObject() is RigidBody3D rb)
+                hits.Add(rb);
+        }
+        return hits;
+    }
+
+    /// <summary>
+    /// Omnidirectional proximity query — every rigid body within
+    /// <paramref name="proximityRadius"/> metres of the body's centre,
+    /// regardless of velocity direction. Catches lateral contacts and the
+    /// jump-then-land case (velocity is mostly +Y at the apex of a jump so
+    /// the velocity-direction sweep moves UP and never reaches the cube
+    /// directly below). Used by the T2 pre-step contact upgrade alongside
+    /// <see cref="QueryNearbyBodies"/> for full coverage.
+    /// </summary>
+    internal static System.Collections.Generic.List<RigidBody3D> QueryProximityBodies(RigidBody3D body, float proximityRadius)
+    {
+        var hits = new System.Collections.Generic.List<RigidBody3D>();
+        if (body == null || proximityRadius <= 0f) return hits;
+        var space = body.GetWorld3D()?.DirectSpaceState;
+        if (space == null) return hits;
+
+        // Use a sphere sized to proximityRadius for the omnidirectional check
+        // — simpler than inflating the body's actual collision shape (which
+        // would need per-shape-type math for capsules vs boxes vs spheres),
+        // and the false-positive cost is tiny (a few extra
+        // RequestResimUpgrade calls on already-Resim or trivially-Resim
+        // neighbours).
+        var sphere = new SphereShape3D { Radius = proximityRadius };
+        var xform = new Transform3D(Basis.Identity, body.GlobalPosition);
+
+        var query = new PhysicsShapeQueryParameters3D
+        {
+            Shape = sphere,
+            Transform = xform,
+            CollisionMask = body.CollisionMask,
+            CollideWithBodies = true,
+            CollideWithAreas = false,
+            Exclude = new Godot.Collections.Array<Rid> { body.GetRid() },
+        };
+
+        var results = space.IntersectShape(query, maxResults: 16);
+        foreach (var hit in results)
+        {
+            if (hit.TryGetValue("collider", out var cv) && cv.AsGodotObject() is RigidBody3D rb)
+                hits.Add(rb);
+        }
+        return hits;
+    }
+
     // Shape query against the body's own collision mask, excluding itself, to find what
     // it's currently overlapping. Equivalent in spirit to CharacterBody3D's slide
     // collisions, but read pre-step (slides are only resolved during SpaceStep on a

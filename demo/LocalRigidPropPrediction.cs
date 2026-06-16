@@ -113,6 +113,60 @@ public partial class LocalRigidPropPrediction : ClientPredictedEntity
         // previous OnProcessTick-driven version sidestepped this because the
         // first tick fires AFTER all _Readys complete.
         CallDeferred(MethodName.RefreshTierIcon);
+        // KinematicInterpolation steady state is frozen-kinematic — the
+        // body's pose is driven by OnPostPhysicsTick reading snapshot
+        // history. Other policies leave the body as authored (dynamic).
+        CallDeferred(MethodName.MaybeBecomeKinematic);
+    }
+
+    /// <summary>Apply the body-freeze state that corresponds to the current
+    /// <see cref="ClientPredictedEntity.Policy"/>. Idempotent — calling it
+    /// when the body is already in the right state is a no-op. Used by both
+    /// the deferred _Ready path and the runtime
+    /// <c>set-policy-for-props</c> harness command so a mid-scenario policy
+    /// flip takes effect immediately.</summary>
+    public void MaybeBecomeKinematic()
+    {
+        var body = _predictionRb?.Body;
+        if (body == null) return;
+        if (Policy == InterpolationPolicy.KinematicInterpolation
+            && BaseTier == PredictionTier.Interpolate
+            && EffectiveTier == PredictionTier.Interpolate)
+        {
+            BecomeKinematic();
+        }
+        else if (Policy != InterpolationPolicy.KinematicInterpolation
+            && body.Freeze)
+        {
+            // Policy was flipped AWAY from KinematicInterpolation; release
+            // the freeze so the body resumes dynamic simulation.
+            BecomeSimulated();
+        }
+    }
+
+    // Freeze the body into kinematic mode. Jolt treats it as immovable
+    // from the solver's perspective — gravity is suppressed, integration is
+    // skipped — but the body still participates in collision and we can
+    // write its transform every tick to drive it from the snapshot history.
+    // This is the KinematicInterpolation steady state.
+    private void BecomeKinematic()
+    {
+        var body = _predictionRb?.Body;
+        if (body == null) return;
+        body.FreezeMode = RigidBody3D.FreezeModeEnum.Kinematic;
+        body.Freeze = true;
+        body.LinearVelocity = Vector3.Zero;
+        body.AngularVelocity = Vector3.Zero;
+    }
+
+    // Unfreeze the body so Jolt resumes simulating it. Caller has already
+    // written LinearVelocity/AngularVelocity for the unfreeze tick (see
+    // OnEffectiveTierChanged Interpolate→Resim branch below).
+    private void BecomeSimulated()
+    {
+        var body = _predictionRb?.Body;
+        if (body == null) return;
+        body.Freeze = false;
     }
 
     public override void _ExitTree()
@@ -177,11 +231,174 @@ public partial class LocalRigidPropPrediction : ClientPredictedEntity
 
     protected override void OnEffectiveTierChanged(PredictionTier from, PredictionTier to)
     {
+        if (Policy == InterpolationPolicy.KinematicInterpolation)
+        {
+            var body = _predictionRb?.Body;
+            if (body != null)
+            {
+                if (from == PredictionTier.Interpolate && to == PredictionTier.Resim)
+                {
+                    // Upgrade: seed velocity from the freshest snapshot — the
+                    // contact that triggered this upgrade just happened
+                    // locally, so the server's counterpart was hit a few ticks
+                    // ago and its most recent snapshot already reflects the
+                    // post-hit velocity. Reading the delayed (interpolated)
+                    // sample would seed from the pre-hit at-rest pose and
+                    // produce a one-tick velocity gap on the first sim step.
+                    var mgr = MonkeNet.Client.ClientManager.Instance?
+                        .GetNodeOrNull<ClientPredictionManager>("PredictionManager");
+                    if (mgr != null)
+                    {
+                        var latest = mgr.TryGetLatestSnapshot(EntityId);
+                        if (latest != null)
+                        {
+                            var em = (EntityStateMessage)latest;
+                            // Clamp the seed to anti-divergence ceilings.
+                            Vector3 vel = em.Velocity;
+                            Vector3 angVel = em.AngularVelocity;
+                            const float MaxUpgradeVelocity = 12.0f;
+                            const float MaxUpgradeAngularVelocity = 30.0f;
+                            if (vel.LengthSquared() > MaxUpgradeVelocity * MaxUpgradeVelocity)
+                                vel = vel.Normalized() * MaxUpgradeVelocity;
+                            if (angVel.LengthSquared() > MaxUpgradeAngularVelocity * MaxUpgradeAngularVelocity)
+                                angVel = angVel.Normalized() * MaxUpgradeAngularVelocity;
+                            body.LinearVelocity = vel;
+                            body.AngularVelocity = angVel;
+                        }
+                    }
+                    BecomeSimulated();
+                }
+                else if (from == PredictionTier.Resim && to == PredictionTier.Interpolate)
+                {
+                    // Demote: freeze the body at its current sim pose; the
+                    // OnPostPhysicsTick kinematic driver below blends from
+                    // that pose toward the snapshot-interp pose over
+                    // BlendInDurationTicks so the body doesn't teleport
+                    // backwards in time to the delayed snapshot pose.
+                    BecomeKinematic();
+                    _interpBlendinTicksRemaining = BlendInDurationTicks;
+                }
+            }
+        }
         RefreshTierIcon();
+    }
+
+    // KinematicInterpolation: blend-in window after a Resim → Interpolate
+    // demote. Body is kinematic but its OnPostPhysicsTick writes lerp from
+    // current sim-end pose toward the snapshot-interp pose over this many
+    // ticks rather than snapping there. Linear 1/N decay closes the full
+    // remaining gap by the final tick.
+    private int _interpBlendinTicksRemaining;
+    private const int BlendInDurationTicks = 6;
+
+    // Per-tick kinematic-write delta above which the write is treated as a
+    // teleport and the smoother is explicitly told via AbsorbBodyTeleport.
+    // 0.1 m² = (~32 cm)² — comfortably exceeds a 5 m/s body's 8 cm/tick
+    // smooth motion while catching the meaningful snap-stream jumps.
+    private const float KinematicTeleportThresholdSq = 0.1f;
+
+    // Maximum extrapolation distance (ticks) past the newest snapshot. Under
+    // bad-network conditions (C3/C4) the snapshot stream can fall 20+ ticks
+    // behind the client clock; without a cap the kinematic driver would
+    // happily extrapolate a falling cube straight through the floor (the
+    // S3-CubeStackPushT2KI.C3 tick-594 incident — body extrapolated 22 ticks
+    // along a -4.7 m/s velocity, landing 1.7 m below floor before the next
+    // snapshot snapped it back). Capping at 3 ticks = one snapshot period
+    // means the visual freezes at the last known pose during long dropouts
+    // rather than diverging unboundedly; when the next snapshot finally
+    // arrives the snap-overflow PVB blends it smoothly back to the truth.
+    private const int MaxExtrapolationTicks = 3;
+
+    private void ResolveLerpedPose(
+        IEntityStateData s0, IEntityStateData s1, float alpha, bool extrapolate,
+        out Vector3 pos, out Quaternion rot, out Vector3 vel)
+    {
+        var m0 = (EntityStateMessage)s0;
+        if (s1 == null)
+        {
+            if (extrapolate)
+            {
+                // Cap the extrapolation window so a stale snapshot stream
+                // doesn't drive the kinematic body arbitrarily far along
+                // its last-known velocity. Beyond MaxExtrapolationTicks the
+                // body just freezes at the projected pose until the next
+                // snapshot arrives.
+                float clampedAlpha = Mathf.Min(alpha, MaxExtrapolationTicks);
+                float dtExtrap = clampedAlpha * (1f / 60f);
+                pos = m0.Position + m0.Velocity * dtExtrap;
+            }
+            else
+            {
+                pos = m0.Position;
+            }
+            rot = m0.Rotation;
+            vel = m0.Velocity;
+            return;
+        }
+        var m1 = (EntityStateMessage)s1;
+        pos = m0.Position.Lerp(m1.Position, alpha);
+        rot = m0.Rotation.Slerp(m1.Rotation, alpha);
+        vel = m0.Velocity.Lerp(m1.Velocity, alpha);
+    }
+
+    public override void OnPostPhysicsTick(int tick, IPackableElement input)
+    {
+        if (Policy != InterpolationPolicy.KinematicInterpolation) return;
+        if (EffectiveTier != PredictionTier.Interpolate) return;
+        var body = _predictionRb?.Body;
+        if (body == null) return;
+
+        var mgr = MonkeNet.Client.ClientManager.Instance?
+                        .GetNodeOrNull<ClientPredictionManager>("PredictionManager");
+        if (mgr == null) return;
+        if (!mgr.TryGetInterpolatedSnapshot(EntityId, tick, out var s0, out var s1, out float alpha, out bool extrapolate))
+            return;
+        ResolveLerpedPose(s0, s1, alpha, extrapolate, out var pos, out var rot, out _);
+
+        // Blend-in window after a Resim → Interpolate demote. Linear 1/N
+        // decay closes the full remaining gap by the final tick; then pure
+        // snapshot-driven from there.
+        if (_interpBlendinTicksRemaining > 0)
+        {
+            float t = 1f / _interpBlendinTicksRemaining;
+            pos = body.GlobalPosition.Lerp(pos, t);
+            rot = body.Quaternion.Slerp(rot, t);
+            _interpBlendinTicksRemaining--;
+        }
+
+        // Smoother-aware teleport detection. CaptureUnexplainedJump in the
+        // smoother bails out on Freeze=true so it won't accumulate offset
+        // from per-tick kinematic writes, but genuine snap-stream teleports
+        // still want a smoother handoff so the visual doesn't jump with
+        // the body.
+        Vector3 currentPos = body.GlobalPosition;
+        Quaternion currentRot = body.Quaternion;
+        if ((pos - currentPos).LengthSquared() > KinematicTeleportThresholdSq)
+        {
+            var smoother = _predictionRb?.Smoothing;
+            if (smoother?.Visual != null)
+                smoother.AbsorbBodyTeleport(currentPos, currentRot, pos, rot);
+        }
+
+        body.GlobalTransform = new Transform3D(new Basis(rot.Normalized()), pos);
+        // Push the new pose into the physics server BEFORE the next
+        // SpaceStep so awake Resim bodies that collide with this kinematic
+        // prop see the up-to-date pose.
+        body.ForceUpdateTransform();
     }
 
     public override void OnProcessTick(int tick, IPackableElement input)
     {
+        // KinematicInterpolation drives the body via the kinematic-pose
+        // driver in OnPostPhysicsTick (reading from snapshot history),
+        // NOT via the per-snapshot blend-step Reconcile loop. Running both
+        // produces double-writes per tick — the blend-step's Reconcile
+        // teleports the kinematic body via PredictionRigidbody3D.Reconcile
+        // and then OnPostPhysicsTick overwrites it from the snapshot lerp.
+        // Each Reconcile also fires a short PVB on the smoother, which is
+        // exactly the AbsorbBodyTeleport-driven freeze-then-sprint pattern
+        // KinematicInterpolation was meant to avoid.
+        if (Policy == InterpolationPolicy.KinematicInterpolation) return;
         if (!_blendActive) return;
 
         var body = _predictionRb?.Body;
@@ -198,13 +415,19 @@ public partial class LocalRigidPropPrediction : ClientPredictedEntity
         Quaternion newRot = cur.Rotation.Slerp(_blendTargetRot, t);
         Vector3 newLin = cur.LinearVelocity.Lerp(_blendTargetLinVel, t);
         Vector3 newAng = cur.AngularVelocity.Lerp(_blendTargetAngVel, t);
+        // useShortPvb=true: each blend tick restarts a 50 ms PVB instead of
+        // capturing a position offset that freezes the visual for one render
+        // frame per call. Under continuous-push scenarios (S7-C0 eid=14)
+        // this kills the 20 Hz saw-tooth pattern that the AbsorbBodyTeleport
+        // path produces; the visual slides through the body's motion at the
+        // blended velocity instead of catching up in single-frame jumps.
         _predictionRb.Reconcile(new RigidbodyState
         {
             Position = newPos,
             Rotation = newRot,
             LinearVelocity = newLin,
             AngularVelocity = newAng,
-        });
+        }, useShortPvb: true);
 
         _blendTicksRemaining--;
         if (_blendTicksRemaining <= 0)
@@ -216,6 +439,13 @@ public partial class LocalRigidPropPrediction : ClientPredictedEntity
 
     public override void HandleInterpolateReconciliation(IEntityStateData receivedState)
     {
+        // KinematicInterpolation policy: the kinematic-pose driver in
+        // OnPostPhysicsTick already reads the per-tick interpolated pose
+        // from the snapshot-history buffer (which the manager populates on
+        // every snapshot receive via CacheSnapshotsFromMessage). Arming
+        // the legacy blend here would produce a competing per-tick Reconcile
+        // chain that fights the kinematic driver.
+        if (Policy == InterpolationPolicy.KinematicInterpolation) return;
         var state = (EntityStateMessage)receivedState;
         // Re-arm the blend with the latest snapshot pose. If a blend is
         // already in progress the new target supersedes the old one and the

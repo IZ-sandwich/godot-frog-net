@@ -509,6 +509,10 @@ public partial class MultiClientHarness : Node
                 "bandwidth-reset" => BandwidthReset(),
                 "visual-smoothness" => VisualSmoothness(),
                 "visual-smoothness-reset" => VisualSmoothnessReset(),
+                "smoother-decay-mode" => SmootherDecayMode(doc.RootElement),
+                "max-rollback-ticks" => MaxRollbackTicksCmd(doc.RootElement),
+                "bypass-resim-for-props" => BypassResimForProps(doc.RootElement),
+                "set-policy-for-props" => SetPolicyForProps(doc.RootElement),
                 "server-peer-count" => ServerPeerCount(),
                 "pending-reclaim-for" => PendingReclaimFor(doc.RootElement),
                 "sample-state" => SampleState(),
@@ -1311,6 +1315,141 @@ public partial class MultiClientHarness : Node
     /// PredictionVisualSmoothing3D smoothness accumulator. Called by the
     /// runner right after scenario.Setup so the spawn-fall / warm-up phase
     /// doesn't bias the M14 measurement.</summary>
+    /// <summary>Walk every smoother on this client and set its position-decay
+    /// mode. Test-only knob used by scenarios that want to compare
+    /// PosDecayMode.Exponential (legacy) vs PosDecayMode.Linear (Q3/UE-Linear
+    /// style) side-by-side in one matrix run.
+    ///
+    /// <para>Payload:
+    /// <c>{ cmd: "smoother-decay-mode", mode: "Linear"|"Exponential",
+    /// smoothingTime?: 0.1, decayTime?: 0.1 }</c>. Optional time fields override
+    /// the per-smoother defaults (0.1 s for both); omit to leave them at
+    /// whatever the scene file set.</para></summary>
+    private string SmootherDecayMode(System.Text.Json.JsonElement payload)
+    {
+        if (_role != "client") return Err("smoother-decay-mode is client-only");
+        if (!payload.TryGetProperty("mode", out var modeEl)) return Err("mode required");
+        string mode = modeEl.GetString();
+        PredictionVisualSmoothing3D.PosDecayMode targetMode = mode switch
+        {
+            "Linear" => PredictionVisualSmoothing3D.PosDecayMode.Linear,
+            "Exponential" => PredictionVisualSmoothing3D.PosDecayMode.Exponential,
+            "MagnitudeAdaptive" => PredictionVisualSmoothing3D.PosDecayMode.MagnitudeAdaptive,
+            _ => throw new System.Exception("unknown mode " + mode),
+        };
+        float? smoothingTime = payload.TryGetProperty("smoothingTime", out var stEl) ? stEl.GetSingle() : (float?)null;
+        float? decayTime = payload.TryGetProperty("decayTime", out var dtEl) ? dtEl.GetSingle() : (float?)null;
+        int n = 0;
+        if (EntitySpawner.Instance != null)
+        {
+            foreach (var entity in EntitySpawner.Instance.ClientEntities)
+            {
+                var root = entity?.GetParent();
+                if (root == null) continue;
+                foreach (var node in root.GetChildren())
+                {
+                    if (node is PredictionVisualSmoothing3D smoother)
+                    {
+                        smoother.PositionDecayMode = targetMode;
+                        if (smoothingTime.HasValue) smoother.SmoothingTime = smoothingTime.Value;
+                        if (decayTime.HasValue) smoother.DecayTime = decayTime.Value;
+                        n++;
+                    }
+                }
+            }
+        }
+        return Ok(new { updated = n, mode = mode });
+    }
+
+    /// <summary>Override the client's <c>MaxRollbackTicks</c> at runtime.
+    /// Used by the "no-resim" comparison scenarios: setting it to 0 trims
+    /// the prediction buffer to empty, so every incoming snapshot is older
+    /// than the (non-existent) oldest entry and routes through
+    /// <c>BlendToAuthViaPvb</c> instead of <c>RollbackAndResimulate</c>.
+    /// Effectively turns prediction off and runs everything as
+    /// snap-and-PVB on each snapshot.</summary>
+    private string MaxRollbackTicksCmd(System.Text.Json.JsonElement payload)
+    {
+        if (_role != "client") return Err("max-rollback-ticks is client-only");
+        if (!payload.TryGetProperty("ticks", out var ticksEl)) return Err("ticks required");
+        int ticks = ticksEl.GetInt32();
+        var cm = MonkeNet.Client.ClientManager.Instance;
+        if (cm == null) return Err("ClientManager not found");
+        var pm = FindChildOfType<ClientPredictionManager>(cm);
+        if (pm == null) return Err("ClientPredictionManager not found");
+        pm.MaxRollbackTicks = ticks;
+        return Ok(new { ticks = ticks });
+    }
+
+    /// <summary>Flip <c>ClientPredictedEntity.BypassResimUpgrade</c> on
+    /// every entity whose Authority differs from this client's net id
+    /// (i.e. every "prop" — everything except this client's own player /
+    /// vehicle). Those entities stay in Interpolate tier forever and get
+    /// HandleInterpolateReconciliation (blend toward auth) on each
+    /// snapshot, while the player continues to predict + rollback
+    /// normally. Used by the hybrid comparison scenario.</summary>
+    private string BypassResimForProps(System.Text.Json.JsonElement payload)
+    {
+        if (_role != "client") return Err("bypass-resim-for-props is client-only");
+        bool enabled = !payload.TryGetProperty("enabled", out var e) || e.GetBoolean();
+        int myNetId = MonkeNet.Client.ClientManager.Instance?.GetNetworkId() ?? 0;
+        int affected = 0;
+        if (EntitySpawner.Instance != null)
+        {
+            foreach (var entity in EntitySpawner.Instance.ClientEntities)
+            {
+                if (entity == null) continue;
+                var cpe = entity.GetComponent<ClientPredictedEntity>();
+                if (cpe == null) continue;
+                if (cpe.Authority == myNetId) continue;  // skip my own player/vehicle
+                cpe.BypassResimUpgrade = enabled;
+                affected++;
+            }
+        }
+        return Ok(new { affected = affected, enabled = enabled });
+    }
+
+    /// <summary>Set <c>ClientPredictedEntity.Policy</c> on every prop
+    /// (Authority != my net id). Used by the hybrid scenarios to switch
+    /// props to InterpolationPolicy.KinematicInterpolation while keeping
+    /// the player on the default Hysteresis.</summary>
+    private string SetPolicyForProps(System.Text.Json.JsonElement payload)
+    {
+        if (_role != "client") return Err("set-policy-for-props is client-only");
+        if (!payload.TryGetProperty("policy", out var polEl)) return Err("policy required");
+        string pol = polEl.GetString();
+        InterpolationPolicy targetPolicy = pol switch
+        {
+            "Hysteresis" => InterpolationPolicy.Hysteresis,
+            "AlwaysPredict" => InterpolationPolicy.AlwaysPredict,
+            "KinematicInterpolation" => InterpolationPolicy.KinematicInterpolation,
+            _ => throw new System.Exception("unknown policy " + pol),
+        };
+        int myNetId = MonkeNet.Client.ClientManager.Instance?.GetNetworkId() ?? 0;
+        int affected = 0;
+        if (EntitySpawner.Instance != null)
+        {
+            foreach (var entity in EntitySpawner.Instance.ClientEntities)
+            {
+                if (entity == null) continue;
+                var cpe = entity.GetComponent<ClientPredictedEntity>();
+                if (cpe == null) continue;
+                if (cpe.Authority == myNetId) continue;
+                // Cache prior policy for transition logic — for the
+                // KinematicInterpolation switch we need to freeze the body
+                // immediately so it stops simulating Jolt locally.
+                cpe.Policy = targetPolicy;
+                // Apply policy-driven body state (freeze/unfreeze for the
+                // KinematicInterpolation transition) immediately so the
+                // next physics tick uses the right path.
+                if (cpe is LocalRigidPropPrediction prop)
+                    prop.MaybeBecomeKinematic();
+                affected++;
+            }
+        }
+        return Ok(new { affected = affected, policy = pol });
+    }
+
     private string VisualSmoothnessReset()
     {
         if (_role != "client") return Err("visual-smoothness-reset is client-only");
@@ -1333,6 +1472,15 @@ public partial class MultiClientHarness : Node
                         smoother.ResetSmoothnessAccumulator();
                         reset++;
                     }
+                    // Reset the camera smoother too — spawn-time captures
+                    // (player falling onto the floor produces a ~1.5 m
+                    // Y-axis prediction error on the first auth snapshot)
+                    // would otherwise decay into the M19 sampling window
+                    // and inflate p99 for several hundred ms post-reset.
+                    if (node is CameraSmoothing3D camSmoother)
+                    {
+                        camSmoother.Reset();
+                    }
                 }
             }
         }
@@ -1348,6 +1496,11 @@ public partial class MultiClientHarness : Node
     {
         if (_role != "client") return Err("visual-smoothness is client-only");
         var dvSquared = new List<float>();
+        var phaseLag = new List<float>();
+        var cameraJoltDvSquared = new List<float>();
+        long freezeFrames = 0, motionFrames = 0;
+        long renderGapCount = 0, renderFrameCount = 0;
+        long dirMismatchFrames = 0, motionPairFrames = 0;
         int entitiesObserved = 0;
         if (EntitySpawner.Instance != null)
         {
@@ -1360,10 +1513,31 @@ public partial class MultiClientHarness : Node
                 if (root == null) continue;
                 foreach (var node in root.GetChildren())
                 {
-                    if (node is PredictionVisualSmoothing3D smoother && smoother.SmoothnessDvSquaredSamples.Count > 0)
+                    if (node is PredictionVisualSmoothing3D smoother)
                     {
-                        dvSquared.AddRange(smoother.SmoothnessDvSquaredSamples);
-                        entitiesObserved++;
+                        if (smoother.SmoothnessDvSquaredSamples.Count > 0)
+                        {
+                            dvSquared.AddRange(smoother.SmoothnessDvSquaredSamples);
+                            entitiesObserved++;
+                        }
+                        // M15-M18 — aggregate the per-smoother counter pairs
+                        // and the phase-lag sample list into the cross-
+                        // smoother pool. Includes smoothers whose M14
+                        // sample list is empty (a body that was at rest
+                        // the whole scenario still has motion frames for
+                        // the M17 render-pacing-gap denominator).
+                        phaseLag.AddRange(smoother.PhaseLagSamples);
+                        freezeFrames += smoother.FreezeFrames;
+                        motionFrames += smoother.MotionFrames;
+                        renderGapCount += smoother.RenderPacingGapCount;
+                        renderFrameCount += smoother.RenderFrameCount;
+                        dirMismatchFrames += smoother.DirectionMismatchFrames;
+                        motionPairFrames += smoother.MotionPairFrames;
+                        // M19 — camera-jolt samples. Only the local player's
+                        // smoother has Camera wired up, so this list is empty
+                        // on every other entity (no contribution).
+                        if (smoother.CameraJoltDvSquaredSamples.Count > 0)
+                            cameraJoltDvSquared.AddRange(smoother.CameraJoltDvSquaredSamples);
                     }
                 }
             }
@@ -1379,6 +1553,22 @@ public partial class MultiClientHarness : Node
             dvSquared = dvSquared,
             sampleCount = dvSquared.Count,
             entitiesObserved = entitiesObserved,
+            // M15-M18 extended visual-quality data. Counter pairs ship
+            // separately so the cell aggregator can sum numerator +
+            // denominator across cells. phaseLag is a full sample list so
+            // the runner can compute mean + p95 (and a future CDF) over
+            // the cross-smoother pool the same way it does for M14.
+            freezeFrames = freezeFrames,
+            motionFrames = motionFrames,
+            phaseLag = phaseLag,
+            renderGapCount = renderGapCount,
+            renderFrameCount = renderFrameCount,
+            dirMismatchFrames = dirMismatchFrames,
+            motionPairFrames = motionPairFrames,
+            // M19 — first-person camera-jolt sample distribution. Same
+            // (m/s)² unit convention as dvSquared so the runner can apply
+            // sqrt-of-percentile uniformly.
+            cameraJoltDvSquared = cameraJoltDvSquared,
         });
     }
 
